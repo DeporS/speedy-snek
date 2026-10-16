@@ -150,8 +150,13 @@ def test_wrapper_gains_no_new_public_attributes():
         return a + b
 
     wrapped = snekit(add)
-    # ``_jit_state`` is private diagnostic state (see test_jit_compile.py).
-    assert vars(wrapped).keys() == {"__wrapped__", "call_count", "_jit_state"}
+    assert {name for name in dir(wrapped) if not name.startswith("_")} == {"call_count"}
+    # The wrapper is a native object, not a function, so the metadata that
+    # ``functools.wraps`` copies lives in its ``__dict__``. ``call_count`` is
+    # a property. ``_jit_state`` is private diagnostic state (see
+    # test_jit_compile.py).
+    copied = {"__module__", "__name__", "__qualname__", "__doc__", "__type_params__"}
+    assert vars(wrapped).keys() == copied | {"__wrapped__", "_jit_state"}
     assert wrapped.__wrapped__ is add
 
 

@@ -53,8 +53,9 @@ A :class:`CompiledI64` has two ways to run its code:
   ``None`` for any call the native tier cannot run. A guard miss raises
   nothing.
 
-:func:`speedysnek.snekit` compiles a hot function here once and caches its
-:attr:`~CompiledI64.fast_call`. It runs the original Python function
+:func:`speedysnek.snekit` compiles a hot function here once and runs its
+fast path (the same Rust code as :attr:`~CompiledI64.fast_call`, called
+directly from the native wrapper). It runs the original Python function
 instead when :class:`UnsupportedProgramError` is raised at compile time
 (from then on) or ``fast_call`` returns ``None`` (for that call only). The
 backend is not part of the public API.
@@ -247,6 +248,15 @@ class CompiledI64:
     def instructions(self) -> tuple[Instruction, ...]:
         """The normalized instructions this code was compiled from."""
         return self._instructions
+
+    @property
+    def function(self) -> _native.I64Function:
+        """The native ``I64Function`` that owns the machine code.
+
+        ``@snekit``'s native wrapper calls its fast path directly, without
+        going through :attr:`fast_call`.
+        """
+        return self._function
 
     @property
     def fast_call(self) -> Callable[[tuple[object, ...]], int | None]:

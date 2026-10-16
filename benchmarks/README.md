@@ -85,8 +85,8 @@ python benchmarks/report.py results/runtime.json results/compilation.json \
     -o results/RESULTS.md
 ```
 
-The report gives the environment, a ratio table, a breakdown of the
-warmed `@snekit` call, a separate table for the diagnostic path, a fixed
+The report gives the environment, a ratio table, `@snekit` next to the
+native fast call, a separate table for the diagnostic path, a fixed
 versus per-operation fit with the estimated crossover, fallback
 overhead, compilation costs, break-even estimates and stability
 warnings. A *Key measurements* section is generated from the data.
@@ -94,6 +94,23 @@ warnings. A *Key measurements* section is generated from the data.
 `--compare LABEL FILE...` (repeatable) adds a before/after table against
 earlier results, including plain-Python rows that show how much the
 machine itself differs between the runs.
+
+How `@snekit` and the native fast call are presented depends on which
+wrapper was measured. The harness records it as the `speedysnek_wrapper`
+metadata, read from the object `snekit` returns:
+
+- **`native`**: the current `NativeWrapper`. The two are shown side by
+  side as separate call paths, never subtracted or given as shares of one
+  call.
+- **`python_closure`**: the earlier Python closure around exactly one
+  `fast_call`. The report shows the nested breakdown into decorator
+  overhead and fast call.
+
+Result files from before this metadata existed do not record it. The
+report then says the architecture is not recorded and omits the
+breakdown, unless `--assume-wrapper python_closure` (or `native`) states
+it. The flag applies only to files that do not record a value, including
+`--compare` inputs. Every committed baseline is `python_closure`.
 
 **Ratios are `layer time / Python time`. Below 1.0 the measured JIT path
 is faster; above 1.0 it is slower.**
@@ -121,6 +138,7 @@ python benchmarks/report.py \
     --compare "Stage 6 baseline (historical)" \
         benchmarks/baseline/stage6/runtime.json.gz \
         benchmarks/baseline/stage6/compilation.json.gz \
+    --assume-wrapper python_closure \
     --command "..." --interpretation benchmarks/interpretation.md \
     -o benchmarks/RESULTS.md
 ```
@@ -157,14 +175,14 @@ inside signed i64. The tests check the operation counts, the absence of
 folding, the absence of overflow, and that all layers agree.
 
 Each workload is timed at five layers. The first three are the public
-path, outermost first; a warmed `@snekit` call is exactly the wrapper
-around one `fast_call`:
+path, outermost first; a warmed `@snekit` call is the native wrapper
+around one run of the fast path that `fast_call` exposes:
 
 | Layer | Timed statement | What it includes |
 |---|---|---|
 | `python` | `f(a, b, c, d)` | The plain function: CPython call plus bytecode arithmetic. |
-| `snekit` | `f(a, b, c, d)` | The public wrapper: `*args`/`**kwargs` packing, `call_count`, state, `__code__`, keyword and arity checks, the `try`, the `None` check, then `fast_call`. |
-| `fast_call` | `fast_call(args)` | The wrapper's own cached bound `I64Function.try_call` on a **prebuilt** tuple: what `@snekit` runs below the decorator. |
+| `snekit` | `f(a, b, c, d)` | The public wrapper, a Rust `NativeWrapper` (a Python closure in the committed baseline): argument tuple, `call_count`, state, `__code__`, keyword and arity checks, then the fast path, called directly in Rust. |
+| `fast_call` | `fast_call(args)` | The specialization's bound `I64Function.try_call` on a **prebuilt** tuple: the same Rust fast path, called through Python. |
 
 The other two are the diagnostic path. `@snekit` no longer runs it; it is
 measured to show what the decorator stopped paying, and for direct
@@ -184,26 +202,32 @@ cache. `native_call` does the same work, but its conversion raises for
 rejected arguments, it always allocates a `Vec`, and it builds a
 `(status, value)` tuple. Neither layer rebuilds the arguments per call.
 
-Do not add the layers up. Only `snekit − fast_call` is a nested
-difference; `compiled_i64` and `native_call` are a separate path, and
-the report shows them in their own table.
+Do not add the layers up. With the native wrapper, `snekit` and
+`fast_call` are **separate call paths**: the wrapper runs the fast path's
+Rust code directly, while `fast_call` adds a Python method call that a
+warmed `@snekit` call never makes. Their difference is therefore not the
+wrapper's overhead. Only with the Python closure that `@snekit` used to
+return (the committed baseline) was `snekit − fast_call` a nested
+difference. `compiled_i64` and `native_call` are a separate path in
+either case, and the report shows them in their own table.
 
 Before anything is timed, `workloads.prepare_layers` runs in every pyperf
 worker:
 
 1. It makes the 8 warmup calls and the compiling call, outside timing.
 2. It asserts that the wrapper is `COMPILED`.
-3. It proves, with `sys.setprofile`, that the next call makes exactly one
-   C call to a bound `I64Function.try_call` and enters neither
-   `CompiledI64.__call__` nor any frame of the original function. This
-   check is the same technique the main test suite uses, and it means
-   the benchmark cannot silently measure a fallback or the diagnostic
-   path.
+3. It proves that the next call makes exactly one native fast call
+   (counted by the compiled function's `I64Function.try_calls`, because a
+   call from Rust is invisible to `sys.setprofile`) and enters neither
+   `CompiledI64.__call__` nor any frame of the original function (counted
+   with `sys.setprofile`). This check is the same technique the main
+   test suite uses, and it means the benchmark cannot silently measure a
+   fallback or the diagnostic path.
 4. It checks that all five layers return the same value.
 
-`fast_call` is the very bound method cached in the wrapper's
-specialization, and `compiled_i64` and `native_call` use the exact
-`CompiledI64` object behind it; no second compilation is made.
+`fast_call` is the bound method of the very `I64Function` the wrapper
+runs, and `compiled_i64` and `native_call` use the exact `CompiledI64`
+object behind it; no second compilation is made.
 
 Each statement is repeated 10 times per loop iteration (pyperf's
 `duplicate`), so the timing loop adds well under 1 ns per call.
@@ -282,6 +306,7 @@ that are not part of the pyperf suite and do not update the baseline:
 | Experiment | Conclusion |
 |---|---|
 | [`wrapper_overhead`](experiments/wrapper_overhead.md) | A wrapper generated for the function's positional signature does not make warmed `@snekit` calls cheaper; not adopted. Also attributes the wrapper's remaining cost. |
+| [`native_wrapper`](experiments/native_wrapper.md) | Moving the wrapper's per-call logic into a PyO3 callable makes warmed calls 0.58–0.66× as long and guard misses about 0.55×, with no slower case; adopted. Lists the observable differences of a non-function wrapper. |
 
 `benchmarks/tests/test_wrapper_experiment.py` keeps the experiment's
 prototype honest against the production wrapper.

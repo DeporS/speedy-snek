@@ -8,10 +8,27 @@ Usage::
         --compare "Old code" old/runtime.json.gz old/compilation.json.gz \\
         -o benchmarks/RESULTS.md
 
-``--command``, ``--interpretation`` and ``--compare`` are optional;
-``benchmarks/README.md`` has the exact commands used for the committed
-baseline. Each ``--compare LABEL FILE...`` adds a before/after comparison
-with earlier results.
+``--command``, ``--interpretation``, ``--compare`` and ``--assume-wrapper``
+are optional; ``benchmarks/README.md`` has the exact commands used for the
+committed baseline. Each ``--compare LABEL FILE...`` adds a before/after
+comparison with earlier results.
+
+**Wrapper architecture.** How ``@snekit`` relates to the separately timed
+``fast_call`` depends on which wrapper was measured, recorded by the
+harness as the ``speedysnek_wrapper`` metadata:
+
+- ``"python_closure"``: a warmed call is the Python closure around exactly
+  one ``fast_call``, so ``snekit − fast_call`` is the wrapper's overhead,
+  and the report shows that nested breakdown.
+- ``"native"``: the ``NativeWrapper`` runs the fast path's Rust code
+  directly, without the Python method call that ``fast_call`` includes.
+  The two are separate call paths, shown side by side and never
+  subtracted.
+
+Older result files do not record it. They are reported as *not recorded*,
+with no breakdown, unless ``--assume-wrapper`` states their architecture
+(all of the committed baselines are ``python_closure``). A recorded value
+always wins over the assumption.
 
 Every time is pyperf's mean (with its standard deviation) of one call or
 one compilation. Ratios are ``layer / Python``: below 1.0 means the measured
@@ -36,6 +53,14 @@ from pathlib import Path
 import workloads
 
 NO_BREAK_EVEN = "No break-even with the current hot path."
+
+# Values of the ``speedysnek_wrapper`` metadata (see the module docstring).
+PYTHON_CLOSURE = "python_closure"
+NATIVE = "native"
+WRAPPERS = {
+    PYTHON_CLOSURE: "Python closure around one `fast_call`",
+    NATIVE: "native `NativeWrapper` (runs the fast path directly)",
+}
 
 LAYER_TITLES = {
     "python": "Python",
@@ -90,6 +115,12 @@ class Results:
     shape: str | None = None
     # Every ``git_commit`` recorded by any run, in first-seen order.
     commits: list[str] = field(default_factory=list)
+    # ``(file, wrapper, how)`` for every file with call benchmarks
+    # (``runtime.*`` or ``fallback.*``): ``how`` is ``"recorded"``,
+    # ``"assumed"`` (``--assume-wrapper``) or ``"missing"`` (``wrapper`` is
+    # then ``None``). Files with only compilation or import benchmarks do
+    # not depend on the wrapper and are not listed.
+    wrapper_sources: list[tuple[str, str | None, str]] = field(default_factory=list)
 
     def get(self, name: str) -> Stats | None:
         return self.benchmarks.get(name)
@@ -99,16 +130,30 @@ class Results:
         return None if stats is None else stats.mean
 
 
-def load(paths: Iterable[str | Path]) -> Results:
-    """Read pyperf JSON (or ``.json.gz``) files into :class:`Results`."""
+def load(paths: Iterable[str | Path], assume_wrapper: str | None = None) -> Results:
+    """Read pyperf JSON (or ``.json.gz``) files into :class:`Results`.
+
+    ``assume_wrapper`` is the wrapper architecture of files that do not
+    record ``speedysnek_wrapper``; without it, such files leave it unknown.
+    """
     import pyperf
 
+    if assume_wrapper is not None and assume_wrapper not in WRAPPERS:
+        raise ValueError(f"unknown wrapper architecture {assume_wrapper!r}")
     results = Results()
     starts, ends, shapes = [], [], set()
     for path in paths:
         suite = pyperf.BenchmarkSuite.load(str(path))
-        for key, value in suite.get_metadata().items():
+        metadata = suite.get_metadata()
+        for key, value in metadata.items():
             results.metadata.setdefault(key, value)
+        if any(
+            name.startswith(("runtime.", "fallback."))
+            for name in suite.get_benchmark_names()
+        ):
+            results.wrapper_sources.append(
+                _wrapper_source(Path(path).name, metadata, assume_wrapper)
+            )
         for bench in suite.get_benchmarks():
             runs = [run for run in bench.get_runs() if run.values]
             for run in runs:
@@ -147,6 +192,53 @@ def load(paths: Iterable[str | Path]) -> Results:
             for processes, values, warmups in sorted(shapes)
         )
     return results
+
+
+def _wrapper_source(
+    name: str, metadata: dict[str, object], assume_wrapper: str | None
+) -> tuple[str, str | None, str]:
+    recorded = metadata.get("speedysnek_wrapper")
+    if recorded is not None:
+        # An unrecognized value is kept, so it is shown, but never used.
+        return name, str(recorded), "recorded"
+    if assume_wrapper is not None:
+        return name, assume_wrapper, "assumed"
+    return name, None, "missing"
+
+
+def wrapper(results: Results) -> str | None:
+    """The wrapper architecture of the call benchmarks, or ``None``.
+
+    ``None`` unless every file with call benchmarks agrees on one known
+    architecture: a missing, unrecognized or conflicting value means the
+    report must not assume how ``snekit`` and ``fast_call`` relate.
+    """
+    values = {value for _, value, _ in results.wrapper_sources}
+    if len(values) == 1:
+        (value,) = values
+        if value in WRAPPERS:
+            return value
+    return None
+
+
+def describe_wrapper(results: Results) -> str:
+    """The wrapper architecture as the report states it."""
+    sources = results.wrapper_sources
+    if not sources:
+        return "not applicable (no call benchmarks)"
+    value = wrapper(results)
+    if value is not None:
+        text = WRAPPERS[value]
+        if any(how == "assumed" for _, _, how in sources):
+            text += " (assumed with `--assume-wrapper`, not recorded in the results)"
+        return text
+    if all(how == "missing" for _, _, how in sources):
+        return "not recorded in the results"
+    parts = ", ".join(
+        f"{name}: {value if value is not None else 'not recorded'}"
+        for name, value, _ in sources
+    )
+    return f"unknown or mixed ({parts})"
 
 
 # --- Calculations -------------------------------------------------------
@@ -349,6 +441,7 @@ def _environment(
         ("speedysnek native build", build),
         ("speedysnek commit", _commits(results)),
         ("`@snekit` warmup calls", meta.get("speedysnek_warmup_calls", "unknown")),
+        ("`@snekit` wrapper", describe_wrapper(results)),
     ]
     lines = ["## Environment", ""]
     lines += _table(
@@ -363,6 +456,20 @@ def _environment(
         if key in meta:
             lines.append(f"- **{title}:** {meta[key]}")
     return lines
+
+
+_FAST_CALL_DESCRIPTIONS = {
+    PYTHON_CLOSURE: "`I64Function.try_call(args)` on a prebuilt tuple, the "
+    "one native call a warmed `@snekit` call makes.",
+    NATIVE: "`I64Function.try_call(args)` called from Python on a prebuilt "
+    "tuple. A warmed `@snekit` call runs the same Rust fast path directly "
+    "from its native wrapper, without this Python method call, so the two "
+    "columns are **separate measurements of separate call paths**: neither "
+    "contains the other.",
+    None: "`I64Function.try_call(args)` called from Python on a prebuilt "
+    "tuple. These results do not record which `@snekit` wrapper was "
+    "measured, so how this relates to the `@snekit` column is not stated.",
+}
 
 
 def _runtime(results: Results) -> list[str]:
@@ -392,8 +499,7 @@ def _runtime(results: Results) -> list[str]:
         "**below 1.0 means the JIT path is faster, above 1.0 means it is "
         "slower.**",
         "",
-        "- **native fast call**: `I64Function.try_call(args)` on a prebuilt "
-        "tuple, the one native call a warmed `@snekit` call makes.",
+        "- **native fast call**: " + _FAST_CALL_DESCRIPTIONS[wrapper(results)],
         "- **diagnostic** layers: `CompiledI64.__call__` and the "
         "`I64Function.call` it wraps. They report *why* a call misses and are "
         "**not part of the warmed `@snekit` path**.",
@@ -431,9 +537,13 @@ def _runtime(results: Results) -> list[str]:
 def breakdown(results: Results, ops: int) -> dict[str, float] | None:
     """Split one warmed ``@snekit`` call into its nested parts, in seconds.
 
-    A warmed call is the decorator wrapper around exactly one native fast
-    call, so only those two layers are subtracted.
+    Only for the Python closure wrapper, where a warmed call is the
+    decorator wrapper around exactly one native fast call, so only those
+    two layers are subtracted. ``None`` for the native wrapper (the two are
+    separate call paths) and when the architecture is not known.
     """
+    if wrapper(results) != PYTHON_CLOSURE:
+        return None
     prefix = f"runtime.ops_{ops:03d}."
     snekit = results.mean(prefix + "snekit")
     fast_call = results.mean(prefix + "fast_call")
@@ -478,8 +588,63 @@ def _shares(parts: dict[str, float], components: dict[str, str]) -> list[str]:
     ]
 
 
+def _separate_paths(results: Results) -> list[str]:
+    """The native wrapper: ``@snekit`` and ``fast_call`` side by side."""
+    rows = [
+        (
+            _workload(ops),
+            format_stat(results.get(f"runtime.ops_{ops:03d}.snekit")),
+            format_stat(results.get(f"runtime.ops_{ops:03d}.fast_call")),
+        )
+        for ops in workloads.OP_COUNTS
+        if results.get(f"runtime.ops_{ops:03d}.snekit")
+        and results.get(f"runtime.ops_{ops:03d}.fast_call")
+    ]
+    if not rows:
+        return []
+    lines = [
+        "## `@snekit` and the native fast call",
+        "",
+        "Nanoseconds per call (mean ± std dev). The native wrapper runs the "
+        "fast path's Rust code directly. `fast_call` reaches the same code "
+        "through a Python method call (vectorcall into PyO3 and the "
+        "exact-tuple check), which a warmed `@snekit` call does not make. "
+        "They are **two separate call paths, not a call and one of its "
+        "parts**: their difference is not the wrapper's overhead, and "
+        "neither is a share of the other.",
+        "",
+    ]
+    lines += _table(("Workload", "`@snekit`", "native fast call (from Python)"), rows)
+    return lines
+
+
+def _unknown_wrapper(results: Results) -> list[str]:
+    if not any(
+        results.get(f"runtime.ops_{ops:03d}.{layer}")
+        for ops in workloads.OP_COUNTS
+        for layer in ("snekit", "fast_call")
+    ):
+        return []
+    return [
+        "## Where a warmed `@snekit` call spends its time",
+        "",
+        "Not computed: the `@snekit` wrapper architecture is "
+        f"{describe_wrapper(results)}. With the Python closure wrapper, "
+        "`@snekit` − native fast call was the wrapper's overhead; with the "
+        "native wrapper the two are separate call paths and must not be "
+        "subtracted. Result files from before the architecture was recorded "
+        "can state it with `report.py --assume-wrapper`.",
+    ]
+
+
 def _breakdown(results: Results) -> list[str]:
-    lines = []
+    architecture = wrapper(results)
+    if architecture == NATIVE:
+        lines = _separate_paths(results)
+    elif architecture is None:
+        lines = _unknown_wrapper(results)
+    else:
+        lines = []
     rows = [
         (_workload(ops), *_shares(parts, COMPONENTS))
         for ops in workloads.OP_COUNTS
@@ -518,8 +683,8 @@ def _breakdown(results: Results) -> list[str]:
             "and tests: it raises `NativeGuardFailure` with the exact reason "
             "for a miss. It checks the arguments in Python, then "
             "`I64Function.call` checks them again in Rust and returns "
-            "`(status, value)`. These numbers are **not a component of the "
-            "`@snekit` total above**; they show what the decorator no longer "
+            "`(status, value)`. These numbers are **not a component of a "
+            "warmed `@snekit` call**; they show what the decorator no longer "
             "pays.",
             "",
         ]
@@ -586,6 +751,22 @@ def format_ops(operations: float | None) -> str:
     return f"≈ {operations:,.0f} operations"
 
 
+_NATIVE_MISS = {
+    PYTHON_CLOSURE: "A guard miss is reported by the native fast call "
+    "returning `None`, not by an exception. **native miss** times that "
+    "native call alone (part of the overhead);",
+    NATIVE: "A guard miss is reported by the native fast path without an "
+    "exception. **native miss** times the same fast path called from Python on "
+    "a prebuilt tuple, returning `None`; the native wrapper runs it "
+    "directly, so this is a separate measurement, not a part of the "
+    "overhead.",
+    None: "A guard miss is reported by the native fast path without an "
+    "exception. **native miss** times `try_call` called from Python on a "
+    "prebuilt tuple, returning `None`; the wrapper architecture is not "
+    "recorded, so it is not stated whether this is a part of the overhead.",
+}
+
+
 def _fallback(results: Results) -> list[str]:
     rows = []
     descriptions = _fallback_descriptions()
@@ -619,10 +800,11 @@ def _fallback(results: Results) -> list[str]:
         "Nanoseconds per call. Each `@snekit` row runs the original function; "
         "its Python baseline is an undecorated copy of that same function "
         "called with the same arguments, so the overhead column is the cost "
-        "of the wrapper alone. A guard miss is reported by the native fast "
-        "call returning `None`, not by an exception. **native miss** times "
-        "that native call alone (part of the overhead); it is not attempted "
-        "when the wrapper falls back before any native code.",
+        "of the wrapper alone. "
+        + _NATIVE_MISS[wrapper(results)]
+        + (" it" if wrapper(results) == PYTHON_CLOSURE else " It")
+        + " is not attempted when the wrapper falls back before any native "
+        "code.",
         "",
     ]
     lines += _table(
@@ -819,15 +1001,21 @@ def key_measurements(results: Results) -> list[str]:
             f"`@snekit` / Python ranges from {min(ratios):.2f}× to {max(ratios):.2f}×."
         )
         native_faster = [ops for ops, python, _, native in runtime if native < python]
+        # Only with the closure is the fast call a part of `@snekit`.
+        fast_call = (
+            "the native fast call alone"
+            if wrapper(results) == PYTHON_CLOSURE
+            else "the native fast call (`try_call` from Python)"
+        )
         if native_faster:
             bullets.append(
-                "The native fast call alone is faster than the Python function "
-                "for " + ", ".join(_workload(ops) for ops in native_faster) + "."
+                f"{fast_call[0].upper()}{fast_call[1:]} is faster than the Python "
+                "function for "
+                + ", ".join(_workload(ops) for ops in native_faster)
+                + "."
             )
         else:
-            bullets.append(
-                "Even the native fast call alone is slower than Python everywhere."
-            )
+            bullets.append(f"Even {fast_call} is slower than Python everywhere.")
 
     for ops in (workloads.OP_COUNTS[0], workloads.OP_COUNTS[-1]):
         parts = breakdown(results, ops)
@@ -978,8 +1166,10 @@ def _comparison(label: str, previous: Results, current: Results) -> list[str]:
         "",
         f"Previous results: commit {_commits(previous)}, measured "
         + (" to ".join(previous.dates) if previous.dates else "on an unknown date")
-        + ". Change is current / previous: **below 1.0× is faster or "
-        "fewer calls.** Both runs are means with 10–25% noise; compare "
+        + f"; `@snekit` wrapper: {describe_wrapper(previous)}. "
+        + "Each `@snekit` row is a complete public call, comparable across "
+        "wrapper architectures. Change is current / previous: **below 1.0× "
+        "is faster or fewer calls.** Both runs are means with 10–25% noise; compare "
         "large changes only. The plain Python rows do not depend on "
         "speedy-snek and show how much the machine itself differs between "
         "the runs.",
@@ -1076,13 +1266,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="compare against earlier pyperf results: a label, then their "
         "files (repeatable)",
     )
+    parser.add_argument(
+        "--assume-wrapper",
+        choices=sorted(WRAPPERS),
+        help="the @snekit wrapper architecture of result files that do not "
+        "record it (files from before it was recorded); applies to every "
+        "input, including --compare. Recorded values always win.",
+    )
     args = parser.parse_args(argv)
-    results = load(args.results)
+    results = load(args.results, args.assume_wrapper)
     comparisons = []
     for label, *files in args.compare:
         if not files:
             parser.error(f"--compare {label!r} needs at least one file")
-        comparisons.append((label, load(files)))
+        comparisons.append((label, load(files, args.assume_wrapper)))
     interpretation = (
         Path(args.interpretation).read_text(encoding="utf-8")
         if args.interpretation

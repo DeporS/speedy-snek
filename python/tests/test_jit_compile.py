@@ -1,11 +1,13 @@
 """Tests for ``@snekit``: warmup, compilation, guards and fallback.
 
-Native execution is proven with ``sys.setprofile``, never inferred from an
-equal result. A warmed native call makes exactly one C call to the
-specialization's bound ``I64Function.try_call`` and enters no frame of the
-original function and no frame of ``CompiledI64.__call__`` (the diagnostic
-path, which the decorator never uses). A Python call runs exactly one
-frame of the original function.
+Execution paths are proven, never inferred from an equal result. The
+native wrapper runs the compiled function's fast path from Rust, which
+``sys.setprofile`` cannot see, so native calls are counted with the
+compiled function's ``I64Function.try_calls`` counter, and Python frames
+with ``sys.setprofile``. A warmed native call makes exactly one native
+fast call and enters no frame of the original function and no frame of
+``CompiledI64.__call__`` (the diagnostic path, which the decorator never
+uses). A Python call runs exactly one frame of the original function.
 """
 
 import asyncio
@@ -35,7 +37,7 @@ from speedysnek._frontend import RejectionReason, analyze
 from speedysnek._interpreter import execute
 
 # Keys of the counter that ``recording`` fills.
-FAST_CALL = "I64Function.try_call"
+FAST_CALL = "native fast call"
 RAW_CALL = "I64Function.call"
 LEGACY_CALL = CompiledI64.__call__.__code__
 
@@ -52,12 +54,24 @@ def native_method(callable_):
     return None
 
 
+def native_calls(f):
+    """How many native fast calls ``f`` has made so far.
+
+    The wrapper enters its compiled function's fast path from Rust, which
+    emits no ``sys.setprofile`` event; the function counts the entries.
+    """
+    compiled = state_of(f).compiled
+    return 0 if compiled is None else compiled.function.try_calls
+
+
 @contextlib.contextmanager
-def recording():
-    """Count, in this thread, the Python frames entered (by code object)
-    and the calls to native ``I64Function`` methods (by ``FAST_CALL`` and
-    ``RAW_CALL``)."""
+def recording(f=None):
+    """Count, in this thread, the Python frames entered (by code object),
+    the calls to native ``I64Function`` methods made from Python (by name,
+    such as ``RAW_CALL``) and, if ``f`` is given, its native fast calls
+    (by ``FAST_CALL``)."""
     calls = collections.Counter()
+    before = 0 if f is None else native_calls(f)
 
     def profiler(frame, event, arg):
         if event == "call":
@@ -73,6 +87,8 @@ def recording():
         yield calls
     finally:
         sys.setprofile(previous)
+        if f is not None:
+            calls[FAST_CALL] += native_calls(f) - before
 
 
 def traced(f, *args, **kwargs):
@@ -81,10 +97,12 @@ def traced(f, *args, **kwargs):
     Also checks that the decorator never takes the diagnostic path.
     """
     original = f.__wrapped__.__code__
-    with recording() as calls:
+    with recording(f) as calls:
         result = f(*args, **kwargs)
     assert calls[LEGACY_CALL] == 0
     assert calls[RAW_CALL] == 0
+    # The wrapper never calls a Python-level fast call either.
+    assert calls["I64Function.try_call"] == 0
     return result, calls[original], calls[FAST_CALL]
 
 
@@ -393,7 +411,7 @@ def test_guard_failures_that_raise_in_python(args):
     add = compiled(make_add(), 1, 2)
     with pytest.raises(TypeError) as expected:
         add.__wrapped__(*args)
-    with recording() as calls:
+    with recording(add) as calls:
         with pytest.raises(TypeError) as actual:
             add(*args)
     assert str(actual.value) == str(expected.value)
@@ -545,7 +563,7 @@ def test_wrong_arity_preserves_cpython_type_error(args):
     add = compiled(make_add(), 1, 2)
     with pytest.raises(TypeError) as expected:
         add.__wrapped__(*args)
-    with recording() as calls:
+    with recording(add) as calls:
         with pytest.raises(TypeError) as actual:
             add(*args)
     assert str(actual.value) == str(expected.value)
@@ -790,6 +808,8 @@ class BrokenNative:
     """Stands in for a ``CompiledI64`` whose fast call raises."""
 
     arg_count = 2
+    # Not an ``I64Function``, so the wrapper calls ``fast_call`` instead.
+    function = None
 
     def __init__(self, error):
         self.error = error
@@ -823,6 +843,7 @@ def test_real_native_errors_disable_and_fall_back():
     add = compiled(make_add(), 1, 2)
     state = state_of(add)
     real = state.specialization
+    real.function = None  # Make the wrapper use ``fast_call``.
     real.fast_call = lambda args: state.compiled._function.try_call(list(args))
     assert add(1, 2) == 3
     assert state.disabled_reason is _DisabledReason.NATIVE_ERROR
@@ -877,31 +898,29 @@ def test_warmed_calls_never_enter_compiled_i64(monkeypatch):
     assert state_of(add).status is _Status.COMPILED
 
 
-def test_the_specialization_caches_the_bound_fast_call():
+def test_the_wrapper_runs_the_specializations_function_directly():
     add = compiled(make_add(), 1, 2)
     state = state_of(add)
     spec = state.specialization
-    fast_call = spec.fast_call
-    assert type(fast_call) is BuiltinMethodType
-    assert fast_call.__self__ is state.compiled._function
-    assert fast_call.__name__ == "try_call"
+    assert spec.function is state.compiled._function
     assert spec.arg_count == state.compiled.arg_count == 2
-    # Every call uses this very object; nothing is looked up per call.
-    seen = []
-
-    def profiler(frame, event, arg):
-        if event == "c_call" and native_method(arg) == FAST_CALL:
-            seen.append(arg)
-
-    sys.setprofile(profiler)
-    try:
-        for i in range(5):
-            add(i, i)
-        add(0.5, 1)
-    finally:
-        sys.setprofile(None)
-    assert len(seen) == 6
-    assert all(arg is fast_call for arg in seen)
+    # ``fast_call`` stays the bound ``try_call`` of the same function, for
+    # benchmarks; the wrapper does not call it.
+    assert type(spec.fast_call) is BuiltinMethodType
+    assert spec.fast_call.__self__ is spec.function
+    assert spec.fast_call.__name__ == "try_call"
+    # A canary function that returns a constant proves that the wrapper
+    # runs exactly ``spec.function``'s machine code, with no Python frame.
+    canary = _native.compile_i64(
+        ((_native.OP_LOAD_CONST, 424242), (_native.OP_RETURN,)), 2
+    )
+    spec.function = canary
+    with recording() as calls:
+        results = [add(i, i) for i in range(5)] + [add(0.5, 1)]
+    assert results == [424242] * 5 + [1.5]
+    assert canary.try_calls == 6
+    assert calls[add.__wrapped__.__code__] == 1
+    assert calls["I64Function.try_call"] == 0
     assert state.specialization is spec
 
 
@@ -983,7 +1002,7 @@ def test_code_replaced_during_compilation_is_not_used(monkeypatch):
 
     monkeypatch.setattr(_compiler, "compile_i64", racing)
     warm(add, 1, 2)
-    with recording() as calls:
+    with recording(add) as calls:
         assert add(6, 7) == 42
     assert calls[multiply.__code__] == 1
     assert calls[FAST_CALL] == 0
@@ -1115,6 +1134,7 @@ def add(a, b):
 def divide(a, b):
     return a / b
 
+report["decorated"] = loaded()
 for _ in range(WARMUP):
     add(1, 2)
     divide(1, 2)
@@ -1135,9 +1155,12 @@ def test_compilation_modules_are_imported_lazily():
     )
     report = json.loads(result.stdout)
     assert report["import"] == []
-    assert report["warm"] == []
-    # A rejected function never loads the native backend.
-    assert report["rejected"] == ["speedysnek._frontend"]
+    # The wrapper is a ``NativeWrapper``, so decorating loads the extension
+    # module, but nothing that compiles.
+    assert report["decorated"] == ["speedysnek._native"]
+    assert report["warm"] == ["speedysnek._native"]
+    # A rejected function never loads the compiler.
+    assert report["rejected"] == ["speedysnek._frontend", "speedysnek._native"]
     assert "speedysnek._compiler" in report["compiled"]
     assert "speedysnek._native" in report["compiled"]
     assert report["status"] == ["compiled", "disabled"]

@@ -1,6 +1,7 @@
 """Type stubs for the private Rust extension module."""
 
-from typing import final
+from collections.abc import Callable
+from typing import Any, final
 
 # Wire-format opcodes for ``compile_i64`` programs (see ``src/program.rs``).
 OP_LOAD_ARG: int
@@ -31,6 +32,11 @@ class I64Function:
 
     @property
     def arg_count(self) -> int: ...
+    @property
+    def try_calls(self) -> int:
+        """How many fast calls this function has handled, guard misses
+        included: through ``try_call`` or directly from a ``NativeWrapper``.
+        A diagnostic for tests and benchmarks."""
     def call(self, args: tuple[int, ...], /) -> tuple[int, int]:
         """Run the code; return ``(status, value)`` from the native ABI.
 
@@ -46,6 +52,26 @@ class I64Function:
         the arguments. ``args`` must be an exact tuple (``TypeError``
         otherwise); any exception means a bug, not a guard miss.
         """
+
+@final
+class NativeWrapper:
+    """The callable ``@snekit`` returns; its per-call logic is in Rust.
+
+    Metadata copied by ``functools.update_wrapper`` lives in the instance
+    ``__dict__``; ``__annotate__`` and ``__annotations__`` behave like a
+    function's. Binds as a method like a function (``__get__``).
+    """
+
+    call_count: int
+    """Calls so far, raising ones included: exact, with no upper bound.
+    Setting it accepts anything ``operator.index`` accepts."""
+    __annotate__: Callable[[int], dict[str, Any]] | None
+    __annotations__: dict[str, Any]
+    def __init__(
+        self, func: Callable[..., Any], state: object, cold: object, /
+    ) -> None: ...
+    def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
+    def __get__(self, instance: object, owner: type | None = None, /) -> Any: ...
 
 def compile_i64(program: tuple[tuple[int, ...], ...], arg_count: int, /) -> I64Function:
     """Compile a serialized program for exactly ``arg_count`` arguments."""

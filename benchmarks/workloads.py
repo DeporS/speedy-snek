@@ -20,7 +20,7 @@ products of arguments (``a + b * c + c * d - d * 4 ...``), so:
 
 :func:`prepare_layers` produces the same workload at every execution layer
 the runtime benchmark measures, and checks that all of them return the same
-value and that the decorator really runs native code through its fast call.
+value and that the decorator really runs native code through its fast path.
 
 Fallback cases
 --------------
@@ -38,7 +38,7 @@ import contextlib
 import sys
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from types import BuiltinMethodType, FunctionType
+from types import FunctionType
 from typing import Any
 
 from speedysnek import _native, snekit
@@ -57,7 +57,8 @@ ARGS = (1234, -567, 89, -1011)
 
 # Execution layers measured by ``bench_runtime.py``. ``python``, ``snekit``
 # and ``fast_call`` are the public path, outermost first: a warmed
-# ``@snekit`` call makes exactly one ``fast_call``. ``compiled_i64`` and
+# ``@snekit`` call runs the same Rust fast path as ``fast_call`` once,
+# called directly instead of through the bound method. ``compiled_i64`` and
 # ``native_call`` are the diagnostic path (``CompiledI64.__call__`` and the
 # ``I64Function.call`` it wraps), which ``@snekit`` no longer uses.
 LAYERS = ("python", "snekit", "fast_call", "compiled_i64", "native_call")
@@ -180,30 +181,29 @@ def fits_i64(value: int) -> bool:
 # --- Proving which path a call takes ------------------------------------
 
 
-_FAST_CALL = "fast_call"
 _DIAGNOSTIC_CALL = CompiledI64.__call__.__code__
 
 
-def _is_fast_call(callable_: object) -> bool:
-    """Whether ``callable_`` is a bound ``I64Function.try_call``."""
-    return (
-        type(callable_) is BuiltinMethodType
-        and type(callable_.__self__) is _native.I64Function
-        and callable_.__name__ == "try_call"
-    )
+def _native_calls(wrapper: Callable[..., Any]) -> int:
+    """How many native fast calls ``wrapper`` has made so far.
+
+    ``@snekit``'s native wrapper enters its compiled function's fast path
+    from Rust, which emits no ``sys.setprofile`` event.
+    ``I64Function.try_calls`` counts every entry, from Rust or through a
+    Python-level ``try_call``.
+    """
+    compiled = wrapper._jit_state.compiled
+    return 0 if compiled is None else compiled.function.try_calls
 
 
 @contextlib.contextmanager
-def _recording() -> Iterator[collections.Counter]:
-    """Count, in this thread, the Python frames entered (by code object)
-    and the native fast calls (under ``_FAST_CALL``)."""
+def _frames() -> Iterator[collections.Counter]:
+    """Count, in this thread, the Python frames entered, by code object."""
     calls: collections.Counter = collections.Counter()
 
     def profiler(frame, event, arg):
         if event == "call":
             calls[frame.f_code] += 1
-        elif event == "c_call" and _is_fast_call(arg):
-            calls[_FAST_CALL] += 1
 
     previous = sys.getprofile()
     sys.setprofile(profiler)
@@ -218,16 +218,18 @@ def call_path(wrapper: Callable[..., Any], *args: Any, **kwargs: Any) -> str:
 
     - ``"native"``: one native fast call and no frame of the original
       function.
-    - ``"guard_miss"``: one native fast call that returned ``None``, then
-      the original function once.
+    - ``"guard_miss"``: one native fast call that missed, then the original
+      function once.
     - ``"python"``: the original function once, no native call.
 
     The diagnostic ``CompiledI64.__call__`` must never run.
     """
     original = wrapper.__wrapped__.__code__
-    with _recording() as calls:
+    before = _native_calls(wrapper)
+    with _frames() as frames:
         wrapper(*args, **kwargs)
-    observed = (calls[original], calls[_FAST_CALL], calls[_DIAGNOSTIC_CALL])
+    native = _native_calls(wrapper) - before
+    observed = (frames[original], native, frames[_DIAGNOSTIC_CALL])
     paths = {(0, 1, 0): "native", (1, 1, 0): "guard_miss", (1, 0, 0): "python"}
     if observed in paths:
         return paths[observed]
@@ -330,7 +332,10 @@ def prepare_layers(ops: int, args: tuple[int, ...] = ARGS) -> Layers:
     # The exact objects the wrapper uses, not a second compilation.
     specialization = wrapper._jit_state.specialization
     compiled = specialization.native
-    if specialization.fast_call.__self__ is not compiled._function:
+    if not (
+        specialization.function is compiled._function
+        and specialization.fast_call.__self__ is compiled._function
+    ):
         raise BenchmarkSetupError(f"ops_{ops:03d}: fast call of another function")
     layers = Layers(
         ops=ops,

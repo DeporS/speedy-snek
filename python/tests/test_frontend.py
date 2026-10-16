@@ -261,8 +261,9 @@ def test_analyzing_a_jit_wrapper_does_not_call_it():
     def add(a, b):
         return a + b
 
-    # The wrapper is a closure over ``func``, so it is rejected as a whole.
-    assert_rejected(add, RejectionReason.CLOSURE)
+    # The wrapper is a native object, not a function, so it is rejected as
+    # a whole.
+    assert_rejected(add, RejectionReason.NOT_A_FUNCTION)
     assert_supported(add.__wrapped__, [LOAD_ARG_0, LOAD_ARG_1, ADD, RETURN])
     assert add.call_count == 0
 
