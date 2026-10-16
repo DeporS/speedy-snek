@@ -11,7 +11,10 @@ Variants
 --------
 
 ``production``
-    ``speedysnek.snekit`` as shipped: ``wrapper(*args, **kwargs)``.
+    The Python ``wrapper(*args, **kwargs)`` closure that ``snekit``
+    returned when this experiment ran. ``snekit`` now returns a native
+    wrapper (see ``native_wrapper.md``), so this is the verbatim copy kept
+    in ``native_wrapper.py``.
 
 ``positional``
     The prototype. For a plain function with ``1 <= co_argcount <=
@@ -70,6 +73,10 @@ from types import FunctionType
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from native_wrapper import python_wrapper  # noqa: E402
 
 import workloads  # noqa: E402
 from speedysnek import _native, snekit  # noqa: E402
@@ -147,12 +154,12 @@ def _positional_source(count: int) -> str:
 
 
 def positional(func: Callable[..., Any]) -> Callable[..., Any]:
-    """The signature-specific prototype; ``snekit`` outside its subset."""
+    """The signature-specific prototype; ``production`` outside its subset."""
     if not isinstance(func, FunctionType):
-        return snekit(func)
+        return python_wrapper(func)
     count = func.__code__.co_argcount
     if not 1 <= count <= _native.MAX_ARGS:
-        return snekit(func)
+        return python_wrapper(func)
     namespace: dict[str, Any] = {}
     exec(_positional_source(count), namespace)
     state = _JitState(func)
@@ -286,7 +293,7 @@ def exact_signature(func: Callable[..., Any]) -> Callable[..., Any]:
 
 
 VARIANTS: dict[str, Callable[[Callable[..., Any]], Callable[..., Any]]] = {
-    "production": snekit,
+    "production": python_wrapper,
     "positional": positional,
     "exact_signature": exact_signature,
     "no_arity_check": no_arity_check,

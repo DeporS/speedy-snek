@@ -191,7 +191,9 @@ def test_call_path_rejects_the_diagnostic_path():
 
     workloads.warm_up(add, 1, 2)
     compiled = add._jit_state.compiled
-    # Simulate a decorator that calls CompiledI64.__call__ again.
+    # Simulate a decorator that calls CompiledI64.__call__ again: without an
+    # ``I64Function``, the wrapper calls ``fast_call``.
+    add._jit_state.specialization.function = None
     add._jit_state.specialization.fast_call = lambda args: compiled(*args)
     with pytest.raises(BenchmarkSetupError, match="CompiledI64"):
         call_path(add, 1, 2)

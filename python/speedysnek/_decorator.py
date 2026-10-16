@@ -30,29 +30,36 @@ machine with three states (:class:`_Status`):
   unexpectedly, or ``__code__`` was replaced after compilation. Every later
   call runs the original function.
 
-A warmed, eligible call makes one native call, with no Python frame in
-between::
+The wrapper is a :class:`speedysnek._native.NativeWrapper`: the per-call
+logic runs in Rust, so a call through it enters no Python frame. It
+holds the original function and its ``_JitState``. Compilation and every
+state transition stay in Python: the wrapper only reads
+``state.specialization`` and ``state.status`` and calls the state's
+``cold_call``, ``invalidate`` and ``native_failed`` methods, in the same
+places the earlier Python closure did. A warmed, eligible call runs no
+Python code at all::
 
-    wrapper(*args)
-        -> spec.fast_call(args)         (I64Function.try_call, in Rust)
+    wrapper(*args)                      (NativeWrapper.__call__, in Rust)
+        -> check __code__, keywords and arity
+        -> spec.function's fast path    (the same Rust code as try_call)
             -> validate every argument once: exact int, in i64
             -> run the machine code, which checks every operation for overflow
-            -> return the result int, or None for a guard miss
-        -> original function, only if the result was None
+            -> the result int, or a guard miss
+        -> original function, only for a guard miss
 
-Guard misses are expected, so they are reported with the ``None``
-sentinel instead of an exception. Only an unexpected native error (an
-``Exception`` from ``fast_call``) disables the specialization.
-``CompiledI64.__call__``, which explains each guard miss with a
-``NativeGuardFailure``, is not on this path.
+Guard misses are expected, so they are reported without an exception.
+Only an unexpected native error (an ``Exception`` from the fast path)
+disables the specialization. ``CompiledI64.__call__``, which explains each
+guard miss with a ``NativeGuardFailure``, is not on this path.
 
 The only correctness rule is that ``@snekit`` never changes what a call
 returns or raises. Whenever native execution does not apply, the original
 function is called exactly once with the original arguments, and whatever
 it returns or raises is passed through unchanged.
 
-The compilation modules are imported lazily, on the first compilation
-attempt, so ``import speedysnek`` stays cheap.
+The extension module is loaded on the first decoration, which needs its
+``NativeWrapper`` type, and the compilation modules on the first
+compilation attempt, so ``import speedysnek`` stays cheap.
 """
 
 from __future__ import annotations
@@ -104,7 +111,7 @@ class _Specialization:
     hot path needs is resolved here, once.
     """
 
-    __slots__ = ("arg_count", "code", "fast_call", "native")
+    __slots__ = ("arg_count", "code", "fast_call", "function", "native")
 
     def __init__(self, code: CodeType, native: Any) -> None:
         self.code = code
@@ -112,9 +119,14 @@ class _Specialization:
         self.native = native
         self.arg_count = native.arg_count
         # The bound ``I64Function.try_call``: ``fast_call(args)`` returns
-        # the result ``int``, or ``None`` for a guard miss. It also keeps
-        # the machine code alive while a call is using it.
+        # the result ``int``, or ``None`` for a guard miss. The wrapper only
+        # calls it when ``function`` is not an ``I64Function``; benchmarks
+        # time it as the fast path seen from Python.
         self.fast_call = native.fast_call
+        # The ``I64Function`` itself: the wrapper runs its fast path
+        # directly, in Rust. Any other value (only test doubles use one)
+        # makes the wrapper call ``fast_call`` instead.
+        self.function = native.function
 
 
 class _JitState:
@@ -244,13 +256,18 @@ def snekit[F: Callable[..., Any]](func: F) -> F:
 
     The returned wrapper behaves exactly like ``func``: same results, same
     exceptions, same metadata (via :func:`functools.wraps`, so the original
-    function is ``__wrapped__``). After a short warmup it tries, once, to
-    compile ``func`` to signed 64-bit machine code. Calls that the compiled
-    code cannot handle, and functions that cannot be compiled at all, simply
-    run ``func``.
+    function is ``__wrapped__``), and it binds as a method like a function.
+    After a short warmup it tries, once, to compile ``func`` to signed
+    64-bit machine code. Calls that the compiled code cannot handle, and
+    functions that cannot be compiled at all, simply run ``func``.
+
+    The wrapper is a native callable object, not a Python function: it has
+    no ``__code__``, ``__defaults__`` or ``__globals__`` of its own, and
+    :func:`inspect.isfunction` is false for it.
 
     The wrapper exposes ``call_count``: the number of times it has been
-    called, including calls that raised.
+    called, including calls that raised. It can be set to any ``int`` in
+    the signed 64-bit range.
 
     >>> @snekit
     ... def expression(a, b):
@@ -264,40 +281,13 @@ def snekit[F: Callable[..., Any]](func: F) -> F:
     """
     if not callable(func):
         raise TypeError(f"snekit expected a callable, got {type(func).__name__}")
+    # Loads the extension module, but not the compiler.
+    from ._native import NativeWrapper
 
     state = _JitState(func)
-    cold = _Status.COLD
-
-    @functools.wraps(func)
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        wrapper.call_count += 1
-        spec = state.specialization
-        if spec is None:
-            if state.status is not cold:
-                return func(*args, **kwargs)
-            spec = state.cold_call()
-            if spec is None:
-                return func(*args, **kwargs)
-        if func.__code__ is not spec.code:
-            # Never run machine code compiled from a stale code object.
-            state.invalidate()
-        elif not kwargs and len(args) == spec.arg_count:
-            try:
-                result = spec.fast_call(args)
-            except Exception as error:
-                # Unexpected: guard misses return None. A BaseException
-                # such as KeyboardInterrupt propagates.
-                state.native_failed(error)
-            else:
-                if result is not None:
-                    return result
-        # Called outside the ``except`` block, so an exception raised by
-        # ``func`` gets no ``__context__`` from the native attempt.
-        return func(*args, **kwargs)
-
-    # Set after functools.wraps, which copies func.__dict__ onto the wrapper.
-    wrapper.call_count = 0
-    # Private diagnostics only; the wrapper uses its closure, not this.
+    wrapper = NativeWrapper(func, state, _Status.COLD)
+    functools.update_wrapper(wrapper, func)
+    # Private diagnostics only; the wrapper holds ``state`` itself.
     wrapper._jit_state = state
     return wrapper  # type: ignore[return-value]
 

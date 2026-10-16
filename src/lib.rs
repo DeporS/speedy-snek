@@ -12,18 +12,28 @@ mod program;
 /// - `call(args)` returns the native ABI's `(status, value)` and raises for
 ///   arguments that are not exact i64 ints. `CompiledI64.__call__` builds
 ///   its detailed `NativeGuardFailure` diagnostics on top of it.
-/// - `try_call(args)` is the decorator's hot path. It validates the
-///   arguments once and returns the result `int`, or `None` for any call
-///   the i64 specialization cannot handle, without raising.
+/// - `try_call(args)` is the fast path. It validates the arguments once
+///   and returns the result `int`, or `None` for any call the i64
+///   specialization cannot handle, without raising.
+///
+/// `NativeWrapper` is the object `@snekit` returns. It runs the fast path's
+/// Rust code directly, without calling `try_call` through Python.
 #[pymodule]
 mod _native {
     use std::ffi::c_int;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
     use pyo3::create_exception;
-    use pyo3::exceptions::{PyOverflowError, PyRuntimeError, PyTypeError, PyValueError};
+    use pyo3::exceptions::{
+        PyException, PyOverflowError, PyRuntimeError, PyTypeError, PyValueError,
+    };
     use pyo3::ffi;
+    use pyo3::intern;
     use pyo3::prelude::*;
-    use pyo3::types::{PyInt, PyTuple};
+    use pyo3::sync::PyOnceLock;
+    use pyo3::types::{PyDict, PyInt, PyTuple, PyType};
+    use pyo3::{PyTraverseError, PyVisit};
 
     use crate::codegen::{NativeCode, STATUS_BAD_ARITY, STATUS_OK, STATUS_OVERFLOW};
     use crate::program::{
@@ -68,6 +78,8 @@ mod _native {
     #[pyclass(frozen, module = "speedysnek._native")]
     struct I64Function {
         code: NativeCode,
+        /// Diagnostics: how many times `try_call_tuple` ran.
+        try_calls: AtomicU64,
     }
 
     #[pymethods]
@@ -76,6 +88,15 @@ mod _native {
         #[getter]
         fn arg_count(&self) -> usize {
             self.code.arg_count()
+        }
+
+        /// How many fast calls this function has handled, through
+        /// `try_call` or directly from a `NativeWrapper`: guard misses
+        /// included. Tests and benchmarks use it to prove which path a call
+        /// took, because a call from Rust is invisible to `sys.setprofile`.
+        #[getter]
+        fn try_calls(&self) -> u64 {
+            self.try_calls.load(Ordering::Relaxed)
         }
 
         /// Run the code with a tuple of exact ints that fit in i64.
@@ -125,6 +146,19 @@ mod _native {
             let args = args
                 .cast_exact::<PyTuple>()
                 .map_err(|_| PyTypeError::new_err("args must be a tuple"))?;
+            self.try_call_tuple(args)
+        }
+    }
+
+    impl I64Function {
+        /// The body of `try_call`, shared with `NativeWrapper`, which calls
+        /// it directly instead of through the Python method.
+        fn try_call_tuple(&self, args: &Bound<'_, PyTuple>) -> PyResult<Option<i64>> {
+            // Not a locked read-modify-write: callers hold the GIL, which
+            // serializes them, and this counter is only for diagnostics.
+            let try_calls = self.try_calls.load(Ordering::Relaxed);
+            self.try_calls
+                .store(try_calls.wrapping_add(1), Ordering::Relaxed);
             let arg_count = self.code.arg_count();
             if args.len() != arg_count {
                 return Ok(None);
@@ -156,6 +190,284 @@ mod _native {
         }
     }
 
+    /// `types.MethodType`, used to bind a `NativeWrapper` like a function.
+    static METHOD_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+
+    /// The callable that `@snekit` returns (see `speedysnek._decorator`).
+    ///
+    /// It runs the decorator's per-call logic without a Python frame.
+    /// Compilation and every state transition stay in the Python
+    /// `_JitState`; this object only reads `state.specialization` and
+    /// `state.status` and calls the state's `cold_call`, `invalidate` and
+    /// `native_failed` methods. It binds as a method like a function.
+    ///
+    /// Metadata copied by `functools.update_wrapper` lives in the instance
+    /// `__dict__`, except `__annotate__` and `__annotations__`, which behave
+    /// like a function's: computed lazily, cached, and kept consistent.
+    #[pyclass(frozen, dict, weakref, module = "speedysnek._native")]
+    struct NativeWrapper {
+        func: Py<PyAny>,
+        state: Py<PyAny>,
+        /// `_Status.COLD`.
+        cold: Py<PyAny>,
+        call_count: AtomicI64,
+        annotations: Mutex<Annotations>,
+    }
+
+    /// A function's `__annotate__` and its cached `__annotations__`.
+    #[derive(Default)]
+    struct Annotations {
+        annotate: Option<Py<PyAny>>,
+        cached: Option<Py<PyAny>>,
+    }
+
+    #[pymethods]
+    impl NativeWrapper {
+        #[new]
+        fn new(func: Py<PyAny>, state: Py<PyAny>, cold: Py<PyAny>) -> Self {
+            NativeWrapper {
+                func,
+                state,
+                cold,
+                call_count: AtomicI64::new(0),
+                annotations: Mutex::default(),
+            }
+        }
+
+        /// The number of calls, including calls that raised.
+        #[getter]
+        fn get_call_count(&self) -> i64 {
+            self.call_count.load(Ordering::Relaxed)
+        }
+
+        #[setter]
+        fn set_call_count(&self, value: i64) {
+            self.call_count.store(value, Ordering::Relaxed);
+        }
+
+        /// The same logic, line for line, as the Python closure `@snekit`
+        /// returned before (kept in `benchmarks/experiments/native_wrapper.py`).
+        #[pyo3(signature = (*args, **kwargs))]
+        fn __call__<'py>(
+            &self,
+            py: Python<'py>,
+            args: &Bound<'py, PyTuple>,
+            kwargs: Option<&Bound<'py, PyDict>>,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            self.call_count.fetch_add(1, Ordering::Relaxed);
+            let func = self.func.bind(py);
+            let state = self.state.bind(py);
+            let mut spec = state.getattr(intern!(py, "specialization"))?;
+            if spec.is_none() {
+                if !state.getattr(intern!(py, "status"))?.is(&self.cold) {
+                    return func.call(args, kwargs);
+                }
+                spec = state.call_method0(intern!(py, "cold_call"))?;
+                if spec.is_none() {
+                    return func.call(args, kwargs);
+                }
+            }
+            let code = spec.getattr(intern!(py, "code"))?;
+            if !func.getattr(intern!(py, "__code__"))?.is(&code) {
+                // Never run machine code compiled from a stale code object.
+                state.call_method0(intern!(py, "invalidate"))?;
+            } else if kwargs.is_none_or(|kwargs| kwargs.is_empty()) {
+                match native_call(&spec, args) {
+                    Ok(Some(result)) => return Ok(result),
+                    // A guard miss.
+                    Ok(None) => {}
+                    // Unexpected: disable, then fall back.
+                    Err(error) if error.is_instance_of::<PyException>(py) => {
+                        state
+                            .call_method1(intern!(py, "native_failed"), (error.into_value(py),))?;
+                    }
+                    // A BaseException such as KeyboardInterrupt propagates.
+                    Err(error) => return Err(error),
+                }
+            }
+            // No exception is being handled here, so an exception raised by
+            // `func` gets no `__context__` from the native attempt.
+            func.call(args, kwargs)
+        }
+
+        /// Bind like a function: `MethodType(self, instance)`, or `self`
+        /// when accessed through the class.
+        fn __get__<'py>(
+            slf: Bound<'py, Self>,
+            instance: Option<Bound<'py, PyAny>>,
+            _owner: Option<Bound<'py, PyAny>>,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            match instance {
+                Some(instance) if !instance.is_none() => {
+                    let py = slf.py();
+                    METHOD_TYPE
+                        .import(py, "types", "MethodType")?
+                        .call1((slf, instance))
+                }
+                _ => Ok(slf.into_any()),
+            }
+        }
+
+        /// Like a function's `__annotate__`: a callable or `None`.
+        #[getter(__annotate__)]
+        fn get_annotate(&self, py: Python<'_>) -> Py<PyAny> {
+            let annotations = self.annotations.lock().unwrap();
+            annotations
+                .annotate
+                .as_ref()
+                .map_or_else(|| py.None(), |annotate| annotate.clone_ref(py))
+        }
+
+        /// Setting a callable discards the cached `__annotations__`.
+        #[setter(__annotate__)]
+        fn set_annotate(&self, value: Bound<'_, PyAny>) -> PyResult<()> {
+            let old = if value.is_none() {
+                (self.annotations.lock().unwrap().annotate.take(), None)
+            } else if value.is_callable() {
+                let mut annotations = self.annotations.lock().unwrap();
+                let cached = annotations.cached.take();
+                (annotations.annotate.replace(value.unbind()), cached)
+            } else {
+                return Err(PyTypeError::new_err(
+                    "__annotate__ must be callable or None",
+                ));
+            };
+            // Dropped without the lock held: a decref can run Python code.
+            drop(old);
+            Ok(())
+        }
+
+        #[deleter(__annotate__)]
+        fn delete_annotate(&self) -> PyResult<()> {
+            Err(PyTypeError::new_err("__annotate__ cannot be deleted"))
+        }
+
+        /// Like a function's: computed from `__annotate__` on first use,
+        /// then cached.
+        #[getter(__annotations__)]
+        fn get_annotations<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+            let annotate = {
+                let annotations = self.annotations.lock().unwrap();
+                if let Some(cached) = &annotations.cached {
+                    return Ok(cached.bind(py).clone());
+                }
+                annotations.annotate.as_ref().map(|a| a.clone_ref(py))
+            };
+            let value = match annotate {
+                // `annotationlib.Format.VALUE`; run without the lock held.
+                Some(annotate) => {
+                    let value = annotate.bind(py).call1((1,))?;
+                    if !value.is_instance_of::<PyDict>() {
+                        return Err(PyTypeError::new_err(format!(
+                            "__annotate__ returned non-dict of type '{}'",
+                            value.get_type().name()?
+                        )));
+                    }
+                    value
+                }
+                None => PyDict::new(py).into_any(),
+            };
+            let mut annotations = self.annotations.lock().unwrap();
+            // Another thread may have computed them while `__annotate__` ran.
+            Ok(annotations
+                .cached
+                .get_or_insert_with(|| value.unbind())
+                .bind(py)
+                .clone())
+        }
+
+        /// A dict or `None`; either clears `__annotate__`.
+        #[setter(__annotations__)]
+        fn set_annotations(&self, value: Bound<'_, PyAny>) -> PyResult<()> {
+            if value.is_none() {
+                return self.replace_annotations(None);
+            }
+            if !value.is_instance_of::<PyDict>() {
+                return Err(PyTypeError::new_err(
+                    "__annotations__ must be set to a dict object",
+                ));
+            }
+            self.replace_annotations(Some(value.unbind()))
+        }
+
+        #[deleter(__annotations__)]
+        fn delete_annotations(&self) -> PyResult<()> {
+            self.replace_annotations(None)
+        }
+
+        fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+            Ok(format!(
+                "<snekit wrapper of {}>",
+                self.func.bind(py).repr()?
+            ))
+        }
+
+        /// Pickle and copy by reference, like a function.
+        fn __reduce__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
+            slf.getattr(intern!(slf.py(), "__qualname__"))
+        }
+
+        fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+            visit.call(&self.func)?;
+            visit.call(&self.state)?;
+            visit.call(&self.cold)?;
+            // Never contended: the lock is only taken with the GIL held,
+            // and never across a call into Python.
+            if let Ok(annotations) = self.annotations.try_lock() {
+                visit.call(&annotations.annotate)?;
+                visit.call(&annotations.cached)?;
+            }
+            Ok(())
+        }
+    }
+
+    impl NativeWrapper {
+        fn replace_annotations(&self, value: Option<Py<PyAny>>) -> PyResult<()> {
+            let old = {
+                let mut annotations = self.annotations.lock().unwrap();
+                let cached = std::mem::replace(&mut annotations.cached, value);
+                (cached, annotations.annotate.take())
+            };
+            // Dropped without the lock held: a decref can run Python code.
+            drop(old);
+            Ok(())
+        }
+    }
+
+    /// The native attempt: `Some(result)`, or `None` for a guard miss or a
+    /// call with another arity.
+    ///
+    /// A real specialization's `function` is an `I64Function`, run through
+    /// the same helper as `try_call`. `function` is a strong reference, so
+    /// the machine code stays alive for the whole call even if the
+    /// specialization is replaced meanwhile. Any other `function` (only test
+    /// doubles use one) means: call `spec.fast_call`, which has `try_call`'s
+    /// contract.
+    fn native_call<'py>(
+        spec: &Bound<'py, PyAny>,
+        args: &Bound<'py, PyTuple>,
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let py = spec.py();
+        let function = spec.getattr(intern!(py, "function"))?;
+        if let Ok(function) = function.cast::<I64Function>() {
+            let function = function.get();
+            // As in the Python wrapper, a call with another arity (an
+            // omitted default) makes no native call at all.
+            if args.len() != function.code.arg_count() {
+                return Ok(None);
+            }
+            return match function.try_call_tuple(args)? {
+                Some(value) => Ok(Some(value.into_pyobject(py)?.into_any())),
+                None => Ok(None),
+            };
+        }
+        if args.len() != spec.getattr(intern!(py, "arg_count"))?.extract::<usize>()? {
+            return Ok(None);
+        }
+        let result = spec.getattr(intern!(py, "fast_call"))?.call1((args,))?;
+        Ok((!result.is_none()).then_some(result))
+    }
+
     /// Arguments that `try_call` passes without a heap allocation.
     const INLINE_ARGS: usize = 8;
 
@@ -184,7 +496,10 @@ mod _native {
         // `NativeCode::compile` validates again; this gives a clear error.
         crate::program::validate(&ops, arg_count).map_err(PyValueError::new_err)?;
         let code = NativeCode::compile(&ops, arg_count).map_err(CodegenError::new_err)?;
-        Ok(I64Function { code })
+        Ok(I64Function {
+            code,
+            try_calls: AtomicU64::new(0),
+        })
     }
 
     enum IntError {

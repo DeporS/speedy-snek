@@ -12,9 +12,9 @@ Benchmark names:
   - ``python``: the plain, undecorated function.
   - ``snekit``: the public wrapper, warmed up and verified to make one
     native fast call (and no ``CompiledI64.__call__``) before timing.
-  - ``fast_call``: that same bound ``I64Function.try_call`` method, called
-    directly on a prebuilt argument tuple. It is everything a warmed
-    ``@snekit`` call does below the decorator.
+  - ``fast_call``: the bound ``I64Function.try_call`` of the function the
+    wrapper runs, called on a prebuilt argument tuple. It is the same Rust
+    fast path that a warmed ``@snekit`` call runs directly.
 
   The diagnostic path, which ``@snekit`` no longer uses:
 

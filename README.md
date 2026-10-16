@@ -47,9 +47,14 @@ use `@snekit`.
 function with `functools.wraps` (so `__name__`, `__qualname__`, `__doc__`,
 `__module__`, `__annotations__` and `__wrapped__` are preserved, and methods
 bind normally) and exposes `call_count`: the number of times the wrapper has
-been called, including calls that raised. `call_count` is a plain attribute
-and its increments are not atomic, so concurrent calls from several threads
-can occasionally be undercounted.
+been called, including calls that raised. Its increments are atomic, and it
+can be set to any `int` in the signed 64-bit range.
+
+The wrapper is a native callable object, not a Python function: it has no
+`__code__`, `__defaults__` or `__globals__` of its own,
+`inspect.isfunction` is false for it, and tracebacks and profilers show no
+wrapper frame. The full list of differences is in
+[`benchmarks/experiments/native_wrapper.md`](benchmarks/experiments/native_wrapper.md#observable-differences).
 
 ### Runtime pipeline
 
@@ -63,12 +68,12 @@ decorated function
     → original CPython function otherwise
 ```
 
-Once compiled, a call that fits makes exactly one native call, with no
-Python code in between:
+Once compiled, a call that fits runs no Python code at all: the wrapper
+itself is written in Rust.
 
 ```
-@snekit wrapper
-    → native fast call (Rust)
+@snekit wrapper (Rust)
+    → native fast path (Rust)
         → validate every argument once: exact int, inside signed 64-bit
         → run the machine code, which checks every operation for overflow
         → return the result int, or None for a guard miss
@@ -213,9 +218,10 @@ compiled(10, 20)  # 60, computed by generated machine code
     an exact `int`, outside i64, or overflow at a given instruction). It
     checks the arguments in Python, then again in Rust. Tests and direct
     users of the compiler rely on it.
-  - `compiled.fast_call(args)`, the **fast** path that `@snekit` uses,
-    checks the arguments once, in Rust, and returns the result `int`, or
-    `None` for any miss, without raising and without saying why.
+  - `compiled.fast_call(args)`, the **fast** path, checks the arguments
+    once, in Rust, and returns the result `int`, or `None` for any miss,
+    without raising and without saying why. `@snekit`'s native wrapper
+    runs the same Rust code directly.
 - Every generated function has the same internal ABI,
   `status = f(args_ptr, args_len, result_ptr)`, with overflow handled by
   explicit branches rather than traps.
@@ -275,7 +281,12 @@ same session as a controlled comparison. On that machine:
   machine).
 
 The [interpretation](benchmarks/RESULTS.md#interpretation) recommends
-making the wrapper cheaper next.
+making the wrapper cheaper next. Since that baseline, the wrapper has moved
+into Rust: a short A/B run measured warmed calls 0.58–0.66× as long as with
+the Python wrapper (about 90–100 ns less per call) and guard misses about
+0.55×, with no slower case
+([experiment](benchmarks/experiments/native_wrapper.md)). The committed
+baseline predates this change.
 
 [`benchmarks/README.md`](benchmarks/README.md) explains the methodology,
 how to get more stable numbers, and how to update the baseline.
