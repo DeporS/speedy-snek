@@ -3,8 +3,8 @@
 Because Python doesn’t have to be a slow snek 🐍
 
 SpeedySnek is a small educational JIT compiler experiment for CPython 3.14.
-It is at Stage 2: the first bytecode frontend. **No decorated Python
-function is compiled or optimized yet.**
+It is at Stage 3: a bytecode frontend plus a reference interpreter. **No
+decorated Python function is compiled or optimized yet.**
 
 ## Usage
 
@@ -31,6 +31,7 @@ Native Rust code lives in the private `speedysnek._native` extension module.
 Python function
     → CPython 3.14 bytecode
     → SpeedySnek normalized instructions
+    → Python reference interpreter
     → native code (future)
 ```
 
@@ -64,6 +65,37 @@ Current status:
 - The frontend is **not connected to `@jit`** and is not public API.
 - All CPython 3.14-specific handling lives in
   `python/speedysnek/_frontend/cpython314.py`.
+
+### Reference interpreter
+
+The private `speedysnek._interpreter` module executes normalized
+instructions directly, without the original function:
+
+```python
+from speedysnek._frontend import Instruction, Op
+from speedysnek._interpreter import execute
+
+program = (
+    Instruction(Op.LOAD_ARG, 0),
+    Instruction(Op.LOAD_CONST, 2),
+    Instruction(Op.MULTIPLY),
+    Instruction(Op.RETURN),
+)
+execute(program, args=(5,))  # 10
+```
+
+- It is a **correctness oracle**, not a performance optimization: the future
+  native backend must produce exactly the same results.
+- It executes only **exact-`int` arithmetic**. Every argument the program
+  reads must satisfy `type(value) is int` (so `bool`, `float`, `str` and
+  `int` subclasses are rejected); otherwise it raises `GuardFailure`, which a
+  future JIT will handle by falling back to CPython.
+- The whole program is validated before it runs. Malformed instructions
+  (empty program, stack underflow, missing or misplaced `RETURN`, leftover
+  stack values, …) raise `InvalidProgramError`, which means a compiler bug.
+- Arithmetic uses Python `int`, so **arbitrary precision is intentional**:
+  `2**63 + 1` is not wrapped to a 64-bit value.
+- It is **not connected to `@jit`** and is not public API.
 
 ## Development
 

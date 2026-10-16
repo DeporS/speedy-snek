@@ -5,6 +5,7 @@ This is the first stage of the compiler pipeline::
     Python function
         -> CPython 3.14 bytecode
         -> SpeedySnek normalized instructions  (this package)
+        -> Python reference interpreter  (``speedysnek._interpreter``)
         -> native code (future)
 
 Only straight-line functions of positional arguments, ``int`` constants,
