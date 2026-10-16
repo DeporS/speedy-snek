@@ -394,7 +394,34 @@ class MyInt(int):
 def test_non_exact_int_arguments_are_rejected(value):
     compiled = compile_i64(binary(ADD))
     failure = assert_guard(compiled, (1, value), GuardReason.NOT_EXACT_INT, arg_index=1)
-    assert type(value).__name__ in str(failure)
+    assert str(failure) == "argument 1 must be an exact int"
+
+
+class RecordingMeta(type):
+    """Records, then refuses, any attribute lookup on its classes."""
+
+    lookups = []
+
+    def __getattribute__(cls, name):
+        RecordingMeta.lookups.append(name)
+        raise RuntimeError(f"metaclass hook ran for {name!r}")
+
+
+class Opaque(metaclass=RecordingMeta):
+    pass
+
+
+def test_guards_do_not_touch_the_rejected_type():
+    # Reading ``type(value).__name__`` (or any class attribute) would run
+    # the metaclass hook, which raises instead of a NativeGuardFailure.
+    value = Opaque()
+    RecordingMeta.lookups.clear()
+    compiled = compile_i64((arg(0), arg(1), arg(2), ADD, ADD, RETURN))
+    failure = assert_guard(
+        compiled, (1, 2, value), GuardReason.NOT_EXACT_INT, arg_index=2
+    )
+    assert str(failure) == "argument 2 must be an exact int"
+    assert RecordingMeta.lookups == []
 
 
 def test_guards_run_no_user_code():

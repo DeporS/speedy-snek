@@ -244,9 +244,12 @@ class CompiledI64:
         for index, value in enumerate(args):
             # The exact type check comes first and calls nothing on the
             # value; after it, the comparisons are between builtin ints.
+            # The message deliberately does not name the rejected type:
+            # reading ``type(value).__name__`` can run a metaclass's
+            # ``__getattribute__``.
             if type(value) is not int:
                 raise NativeGuardFailure(
-                    f"argument {index} is a {type(value).__name__}, not an int",
+                    f"argument {index} must be an exact int",
                     GuardReason.NOT_EXACT_INT,
                     arg_index=index,
                 )
