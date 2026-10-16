@@ -1,0 +1,103 @@
+name: Build wheels
+
+# Manual only. Builds release wheels for standard (GIL-enabled) CPython
+# 3.14, installs each one into a fresh virtual environment, checks it, and
+# uploads only the wheels that passed as workflow artifacts. Nothing is
+# published and no credentials are used. README.md#installing-a-prebuilt-wheel
+# explains how to download and install them.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wheel:
+    name: wheel (${{ matrix.artifact }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            python-architecture: x64
+            tag: cp314-cp314-win_amd64
+            artifact: speedysnek-cp314-windows-x86_64
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            python-architecture: x64
+            # Built inside the pypa manylinux_2_28 container, so the
+            # extension links against glibc 2.28. setup-python does not
+            # reach into the container: this is the container's
+            # GIL-enabled CPython 3.14, not the free-threaded cp314t one.
+            manylinux: "2_28"
+            interpreter: /opt/python/cp314-cp314/bin/python
+            tag: cp314-cp314-manylinux_2_28_x86_64
+            artifact: speedysnek-cp314-linux-x86_64
+          - os: macos-15 # native arm64 runner
+            target: aarch64-apple-darwin
+            python-architecture: arm64
+            tag: cp314-cp314-macosx_11_0_arm64
+            artifact: speedysnek-cp314-macos-arm64
+    env:
+      # Only read for macOS targets. 11.0 is Rust's minimum for
+      # aarch64-apple-darwin; no dependency (Cranelift's JIT memory and
+      # icache handling, PyO3) needs a newer macOS API.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        id: python
+        with:
+          python-version: "3.14"
+          architecture: ${{ matrix.python-architecture }}
+
+      # Cranelift 0.136 needs Rust 1.96. The manylinux build installs the
+      # stable toolchain inside its container instead.
+      - uses: dtolnay/rust-toolchain@stable
+        if: runner.os != 'Linux'
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: v1.15.0
+          command: build
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: >-
+            --release --locked --out dist
+            --interpreter ${{ matrix.interpreter || steps.python.outputs.python-path }}
+
+      - name: Install auditwheel
+        if: runner.os == 'Linux'
+        run: |
+          python -m venv "$RUNNER_TEMP/auditwheel"
+          "$RUNNER_TEMP/auditwheel/bin/python" -m pip install auditwheel==6.8.2
+
+      # Installs the wheel from dist/ into a new virtual environment and runs
+      # the checks from a temporary directory. No Cargo, no Maturin, and
+      # nothing from the checkout is importable.
+      - name: Validate the installed wheel
+        shell: bash
+        env:
+          PYTHON: ${{ steps.python.outputs.python-path }}
+          EXPECTED_TAG: ${{ matrix.tag }}
+        run: |
+          args=(--wheel-dir dist --expect-tag "$EXPECTED_TAG")
+          if [ "$RUNNER_OS" = Linux ]; then
+            args+=(--auditwheel "$RUNNER_TEMP/auditwheel/bin/auditwheel")
+          fi
+          "$PYTHON" -I .github/scripts/validate_wheel.py "${args[@]}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*.whl
+          if-no-files-found: error

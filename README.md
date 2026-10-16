@@ -20,6 +20,84 @@ one-operation function and 1.4× slower at 20 operations. It is faster from
 about 30 operations up: 0.61× at 50, 0.16× at 250. See
 [Benchmarks](#benchmarks) and [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md).
 
+## Installing a prebuilt wheel
+
+SpeedySnek is **not on PyPI yet**, so `pip install speedysnek` does not
+work. Prebuilt wheels can be built on demand by a manual GitHub Actions
+workflow and downloaded from it. A prebuilt wheel contains the compiled
+extension, so it needs **no Rust, Cargo, Visual Studio Build Tools or any
+other C/C++ compiler**.
+
+A wheel only installs on the exact CPython version, operating system and
+architecture it was built for. Wheels are built only for standard
+(GIL-enabled) **CPython 3.14**; other Python versions and the free-threaded
+build (`python3.14t`) are not supported:
+
+| Platform | Artifact to download | Wheel tag |
+| --- | --- | --- |
+| Windows x86_64 (64-bit) | `speedysnek-cp314-windows-x86_64` | `cp314-cp314-win_amd64` |
+| Linux x86_64, glibc 2.28 or newer (not musl/Alpine) | `speedysnek-cp314-linux-x86_64` | `cp314-cp314-manylinux_2_28_x86_64` |
+| macOS 11 or newer on Apple silicon (arm64) | `speedysnek-cp314-macos-arm64` | `cp314-cp314-macosx_11_0_arm64` |
+
+If pip says the wheel "is not a supported wheel on this platform", the
+Python version, OS or architecture does not match.
+
+**Run the workflow.** On GitHub, open the repository's **Actions** tab,
+select **Build wheels**, click **Run workflow**, pick a branch (usually
+`main`) and confirm. This needs write access to the repository. Each job
+builds one wheel, installs it into a fresh virtual environment and checks
+that `@snekit` compiles and runs native code; only wheels that pass are
+uploaded.
+
+**Download.** When the run has finished, open it and download the
+artifact for your platform from the **Artifacts** section at the bottom of
+the run's summary page (you must be signed in to GitHub). GitHub delivers
+each artifact as a ZIP file containing one `.whl` file. Artifacts expire
+after the repository's retention period (90 days by default).
+
+**Install on Windows (PowerShell, CPython 3.14 x64).** Check that
+`py -3.14` is 64-bit CPython 3.14: the following prints `AMD64`.
+
+```powershell
+py -3.14 -c "import platform; print(platform.machine())"
+Expand-Archive .\speedysnek-cp314-windows-x86_64.zip -DestinationPath .\speedysnek-wheel
+Get-ChildItem .\speedysnek-wheel\*.whl       # shows the wheel's actual file name
+py -3.14 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+cd .\speedysnek-wheel
+python -m pip install .\ACTUAL_WHEEL_FILENAME.whl
+```
+
+`ACTUAL_WHEEL_FILENAME.whl` is a **placeholder**: use the file name
+`Get-ChildItem` printed, which looks like
+`speedysnek-0.1.0-cp314-cp314-win_amd64.whl` (illustrative only; the
+version may differ). If PowerShell refuses to run `Activate.ps1`, run
+`Set-ExecutionPolicy -Scope Process RemoteSigned` first, or skip activation
+and use `.\.venv\Scripts\python.exe` instead of `python`.
+
+**Install on Linux or macOS.** Some macOS browsers extract the ZIP
+automatically; in that case skip `unzip`.
+
+```sh
+unzip speedysnek-cp314-linux-x86_64.zip -d speedysnek-wheel   # or ...-macos-arm64.zip
+python3.14 -m venv .venv
+source .venv/bin/activate
+python -m pip install speedysnek-wheel/*.whl
+```
+
+**Try it.**
+
+```python
+from speedysnek import snekit
+
+@snekit
+def expression(a, b):
+    return (a + b) * 2
+
+print([expression(10, 20) for _ in range(10)][-1])  # 60, compiled after warmup
+print(expression(2**62, 2**62))                      # 18446744073709551616, by Python
+```
+
 ## Usage
 
 ```python
@@ -294,7 +372,9 @@ how to get more stable numbers, and how to update the baseline.
 
 ## Development
 
-Requires CPython 3.14 and a Rust toolchain.
+Building from source requires CPython 3.14 and a Rust toolchain (on
+Windows also the Visual Studio C++ Build Tools). To use SpeedySnek without
+them, install a [prebuilt wheel](#installing-a-prebuilt-wheel).
 
 ```sh
 python -m venv .venv && source .venv/bin/activate
