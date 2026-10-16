@@ -1,4 +1,7 @@
-
-.venv
+.venv/
+target/
+__pycache__/
+*.py[cod]
+*.pyd
 
 test.md
