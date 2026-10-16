@@ -1,3 +1,7 @@
+import asyncio
+import subprocess
+import sys
+
 import pytest
 
 import speedysnek
@@ -109,3 +113,39 @@ def test_works_as_method():
 def test_rejects_non_callable():
     with pytest.raises(TypeError):
         jit(42)
+
+
+def test_wrapper_gains_no_new_attributes():
+    def add(a, b):
+        return a + b
+
+    wrapped = jit(add)
+    assert vars(wrapped).keys() == {"__wrapped__", "call_count"}
+    assert wrapped.__wrapped__ is add
+
+
+def test_functions_the_frontend_rejects_still_work():
+    @jit
+    def divide(a, b):
+        return a / b
+
+    @jit
+    def gen(n):
+        yield from range(n)
+
+    @jit
+    async def coro(a, b):
+        return a + b
+
+    assert divide(1, 4) == 0.25
+    assert list(gen(3)) == [0, 1, 2]
+    assert asyncio.run(coro(1, 2)) == 3
+    assert (divide.call_count, gen.call_count, coro.call_count) == (1, 1, 1)
+
+
+def test_importing_speedysnek_does_not_load_the_frontend():
+    code = "import sys, speedysnek; print('speedysnek._frontend' in sys.modules)"
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True
+    )
+    assert result.stdout.strip() == "False"
