@@ -260,13 +260,21 @@ def _write_suite(path, benchmarks):
     pyperf = pytest.importorskip("pyperf")
     suite = None
     for name, values in benchmarks.items():
-        run = pyperf.Run(
-            values,
-            warmups=[(1, values[0])],
-            metadata={"name": name, "loops": 1000, "unit": "second"},
-            collect_metadata=False,
-        )
-        bench = pyperf.Benchmark([run, run])
+        runs = [
+            pyperf.Run(
+                values,
+                warmups=[(1, values[0])],
+                metadata={
+                    "name": name,
+                    "loops": 1000,
+                    "unit": "second",
+                    "git_commit": commit,
+                },
+                collect_metadata=False,
+            )
+            for commit in ("abc1234", "abc1234-dirty")
+        ]
+        bench = pyperf.Benchmark(runs)
         if suite is None:
             suite = pyperf.BenchmarkSuite([bench])
         else:
@@ -291,6 +299,9 @@ def test_load_reads_pyperf_json(tmp_path):
     assert python.shortest_raw == pytest.approx(0.9e-7 * 1000)
     assert results.shape == "2 worker processes × 3 values (+ 1 warmup)"
     assert math.isclose(results.mean("runtime.ops_001.snekit"), 5e-7)
+    # Metadata that differs between runs is kept, not silently dropped.
+    assert results.commits == ["abc1234", "abc1234-dirty"]
+    assert "abc1234, abc1234-dirty (differs between runs)" in render(results)
 
 
 def test_main_writes_markdown(tmp_path):

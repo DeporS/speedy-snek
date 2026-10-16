@@ -84,6 +84,8 @@ class Results:
     metadata: dict[str, object] = field(default_factory=dict)
     dates: tuple[str, str] | None = None
     shape: str | None = None
+    # Every ``git_commit`` recorded by any run, in first-seen order.
+    commits: list[str] = field(default_factory=list)
 
     def get(self, name: str) -> Stats | None:
         return self.benchmarks.get(name)
@@ -105,6 +107,10 @@ def load(paths: Iterable[str | Path]) -> Results:
             results.metadata.setdefault(key, value)
         for bench in suite.get_benchmarks():
             runs = [run for run in bench.get_runs() if run.values]
+            for run in runs:
+                commit = run.get_metadata().get("git_commit")
+                if commit and commit not in results.commits:
+                    results.commits.append(commit)
             raw = [
                 value * run.get_total_loops() for run in runs for value in run.values
             ]
@@ -282,6 +288,15 @@ def _workload(ops: int) -> str:
 # --- Report sections ----------------------------------------------------
 
 
+def _commits(results: Results) -> str:
+    if len(results.commits) > 1:
+        # pyperf drops metadata that differs between runs; show all of it.
+        return ", ".join(results.commits) + " (differs between runs)"
+    if results.commits:
+        return results.commits[0]
+    return str(results.metadata.get("git_commit", "unknown"))
+
+
 def _python_description(meta: dict[str, object]) -> str:
     implementation = meta.get("python_implementation", "")
     version = meta.get("python_version", "")
@@ -305,7 +320,7 @@ def _environment(
         ("CPython's own JIT", meta.get("cpython_jit", "unknown")),
         ("Rust", meta.get("rustc_version", "not available")),
         ("speedysnek native build", build),
-        ("speedysnek commit", meta.get("git_commit", "unknown")),
+        ("speedysnek commit", _commits(results)),
         ("`@snekit` warmup calls", meta.get("speedysnek_warmup_calls", "unknown")),
     ]
     lines = ["## Environment", ""]

@@ -48,7 +48,7 @@ python benchmarks/bench_compilation.py -o results/compilation.json
 
 With pyperf's defaults (20 worker processes × 3 values, 1 warmup value
 each, loops calibrated to about 100 ms per value) the two scripts took
-about 15 minutes on the 4-vCPU baseline machine. pyperf refuses to
+about 13 and 9 minutes on the 4-vCPU baseline machine. pyperf refuses to
 overwrite an existing `-o` file; delete it first or pass `--append`.
 
 Both scripts accept every pyperf option:
@@ -114,6 +114,9 @@ committed numbers. Rewrite it whenever the baseline changes. The raw
 pyperf files in [`baseline/`](baseline) let anyone regenerate or
 re-analyze the report, for example with
 `python -m pyperf stats benchmarks/baseline/runtime.json.gz`.
+`baseline/repeat-ops100-250.json.gz` is a separate CPU-pinned repeat of
+the two workloads closest to parity. The interpretation uses it as a
+reproducibility check, and it is not part of the report's tables.
 
 ## What is measured
 
