@@ -231,9 +231,24 @@ def test_comparison_with_a_previous_baseline():
     assert "break-even, `ops_250`" in labels
     row = dict((label, rest) for label, *rest in rows)["warmed `@snekit`, `ops_001`"]
     assert row == ["1.0 µs", "400.0 ns", "0.40× (−60%)"]
-    text = render(current, previous=previous)
-    assert "## Comparison with the previous baseline" in text
+    text = render(current, comparisons=[("Old code", previous), ("Older", previous)])
+    assert "## Comparison: Old code" in text
+    assert "## Comparison: Older" in text
     assert "## Comparison" not in render(current)
+
+
+def test_main_compares_against_labelled_results(tmp_path):
+    old, new = tmp_path / "old.json", tmp_path / "new.json"
+    _write_suite(old, {"runtime.ops_001.snekit": [1e-6, 1e-6, 1e-6]})
+    _write_suite(new, {"runtime.ops_001.snekit": [4e-7, 4e-7, 4e-7]})
+    output = tmp_path / "RESULTS.md"
+    args = [str(new), "-o", str(output), "--compare", "Old code", str(old)]
+    assert report.main(args) == 0
+    text = output.read_text(encoding="utf-8")
+    assert "## Comparison: Old code" in text
+    assert "0.40× (−60%)" in text
+    with pytest.raises(SystemExit):
+        report.main([str(new), "--compare", "label only"])
 
 
 def test_render_reports_the_crossover():

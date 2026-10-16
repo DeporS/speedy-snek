@@ -5,13 +5,13 @@ Usage::
     python benchmarks/report.py results/runtime.json results/compilation.json \\
         --command "<the benchmark commands you ran>" \\
         --interpretation benchmarks/interpretation.md \\
-        --baseline old/runtime.json.gz --baseline old/compilation.json.gz \\
+        --compare "Old code" old/runtime.json.gz old/compilation.json.gz \\
         -o benchmarks/RESULTS.md
 
-``--command``, ``--interpretation`` and ``--baseline`` are optional;
+``--command``, ``--interpretation`` and ``--compare`` are optional;
 ``benchmarks/README.md`` has the exact commands used for the committed
-baseline. ``--baseline`` adds a before/after comparison with earlier
-results.
+baseline. Each ``--compare LABEL FILE...`` adds a before/after comparison
+with earlier results.
 
 Every time is pyperf's mean (with its standard deviation) of one call or
 one compilation. Ratios are ``layer / Python``: below 1.0 means the measured
@@ -905,6 +905,15 @@ def comparison_rows(
             return
         rows.append((label, fmt(old), fmt(new), change(old, new) if old > 0 else "—"))
 
+    # Unchanged by speedy-snek: shows how much the machine itself differs.
+    add(
+        "plain Python call, `noop(a, b, c, d)`",
+        previous.mean("reference.python_noop"),
+        current.mean("reference.python_noop"),
+    )
+    for ops in (workloads.OP_COUNTS[0], workloads.OP_COUNTS[-1]):
+        name = f"runtime.ops_{ops:03d}.python"
+        add(f"plain Python, {_workload(ops)}", previous.mean(name), current.mean(name))
     for ops in workloads.OP_COUNTS:
         name = f"runtime.ops_{ops:03d}.snekit"
         add(
@@ -960,20 +969,20 @@ def comparison_rows(
     return rows
 
 
-def _comparison(previous: Results | None, current: Results) -> list[str]:
-    if previous is None:
-        return []
+def _comparison(label: str, previous: Results, current: Results) -> list[str]:
     rows = comparison_rows(previous, current)
     if not rows:
         return []
     lines = [
-        "## Comparison with the previous baseline",
+        f"## Comparison: {label}",
         "",
         f"Previous results: commit {_commits(previous)}, measured "
         + (" to ".join(previous.dates) if previous.dates else "on an unknown date")
         + ". Change is current / previous: **below 1.0× is faster or "
         "fewer calls.** Both runs are means with 10–25% noise; compare "
-        "large changes only.",
+        "large changes only. The plain Python rows do not depend on "
+        "speedy-snek and show how much the machine itself differs between "
+        "the runs.",
         "",
     ]
     lines += _table(("Measurement", "previous", "current", "change"), rows)
@@ -1004,7 +1013,7 @@ def render(
     commands: Sequence[str] = (),
     interpretation: str | None = None,
     generated: str | None = None,
-    previous: Results | None = None,
+    comparisons: Sequence[tuple[str, Results]] = (),
 ) -> str:
     generated = generated or datetime.datetime.now(datetime.UTC).strftime(
         "%Y-%m-%d %H:%M UTC"
@@ -1027,7 +1036,7 @@ def render(
     sections = [
         _environment(results, commands, generated),
         ["## Key measurements", ""] + [f"- {b}" for b in key_measurements(results)],
-        _comparison(previous, results),
+        *(_comparison(label, previous, results) for label, previous in comparisons),
         _runtime(results),
         _breakdown(results),
         _scaling(results),
@@ -1059,21 +1068,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Markdown file appended as the report's Interpretation section",
     )
     parser.add_argument(
-        "--baseline",
+        "--compare",
         action="append",
         default=[],
-        metavar="FILE",
-        help="earlier pyperf results to compare against (repeatable)",
+        nargs="+",
+        metavar=("LABEL", "FILE"),
+        help="compare against earlier pyperf results: a label, then their "
+        "files (repeatable)",
     )
     args = parser.parse_args(argv)
     results = load(args.results)
-    previous = load(args.baseline) if args.baseline else None
+    comparisons = []
+    for label, *files in args.compare:
+        if not files:
+            parser.error(f"--compare {label!r} needs at least one file")
+        comparisons.append((label, load(files)))
     interpretation = (
         Path(args.interpretation).read_text(encoding="utf-8")
         if args.interpretation
         else None
     )
-    text = render(results, args.command, interpretation, previous=previous)
+    text = render(results, args.command, interpretation, comparisons=comparisons)
     if args.output:
         Path(args.output).write_text(text, encoding="utf-8")
     else:
