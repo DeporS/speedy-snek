@@ -32,7 +32,20 @@ class I64Function:
     @property
     def arg_count(self) -> int: ...
     def call(self, args: tuple[int, ...], /) -> tuple[int, int]:
-        """Run the code; return ``(status, value)`` from the native ABI."""
+        """Run the code; return ``(status, value)`` from the native ABI.
+
+        Raises ``TypeError`` or ``OverflowError`` for an argument that is
+        not an exact ``int`` in the signed 64-bit range.
+        """
+    def try_call(self, args: tuple[object, ...], /) -> int | None:
+        """Run the code if the call fits; the decorator's hot path.
+
+        Returns the result, or ``None`` for a wrong argument count, an
+        argument that is not an exact ``int`` in the signed 64-bit range,
+        or overflow. A guard miss raises nothing and runs no Python code on
+        the arguments. ``args`` must be an exact tuple (``TypeError``
+        otherwise); any exception means a bug, not a guard miss.
+        """
 
 def compile_i64(program: tuple[tuple[int, ...], ...], arg_count: int, /) -> I64Function:
     """Compile a serialized program for exactly ``arg_count`` arguments."""

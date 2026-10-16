@@ -5,13 +5,23 @@ mod program;
 
 /// A Python module implemented in Rust.
 ///
-/// Everything here is private to SpeedySnek. The Cranelift backend is used
-/// through `speedysnek._compiler`, which validates programs and runtime
-/// arguments before they reach this module.
+/// Everything here is private to SpeedySnek. Programs are compiled through
+/// `speedysnek._compiler`, which validates them first and wraps the result
+/// in a `CompiledI64`. A compiled `I64Function` has two entry points:
+///
+/// - `call(args)` returns the native ABI's `(status, value)` and raises for
+///   arguments that are not exact i64 ints. `CompiledI64.__call__` builds
+///   its detailed `NativeGuardFailure` diagnostics on top of it.
+/// - `try_call(args)` is the decorator's hot path. It validates the
+///   arguments once and returns the result `int`, or `None` for any call
+///   the i64 specialization cannot handle, without raising.
 #[pymodule]
 mod _native {
+    use std::ffi::c_int;
+
     use pyo3::create_exception;
     use pyo3::exceptions::{PyOverflowError, PyRuntimeError, PyTypeError, PyValueError};
+    use pyo3::ffi;
     use pyo3::prelude::*;
     use pyo3::types::{PyInt, PyTuple};
 
@@ -90,7 +100,64 @@ mod _native {
             }
             Ok(self.code.call(&values))
         }
+
+        /// Run the code if the call fits the i64 specialization.
+        ///
+        /// Private contract, relied on by `speedysnek._decorator`:
+        ///
+        /// - `args` must be an exact tuple; anything else raises
+        ///   ``TypeError``. That is a caller bug, not a guard miss.
+        /// - Returns the result as a Python ``int`` when the tuple has
+        ///   exactly ``arg_count`` items, each an exact ``int`` in the
+        ///   signed 64-bit range, and no operation overflows.
+        /// - Returns ``None`` for every other call: wrong arity, ``bool``,
+        ///   ``int`` subclasses, any non-``int``, values outside i64, and
+        ///   overflow in any intermediate or final operation. ``None`` is
+        ///   unambiguous because every compiled program returns an ``int``.
+        /// - A guard miss raises nothing and runs no Python code on the
+        ///   arguments: no ``__int__``, ``__index__``, ``__repr__`` or
+        ///   (metaclass) attribute lookup.
+        /// - Any exception it does raise is unexpected.
+        ///
+        /// The GIL stays held throughout.
+        #[pyo3(signature = (args, /))]
+        fn try_call(&self, args: &Bound<'_, PyAny>) -> PyResult<Option<i64>> {
+            let args = args
+                .cast_exact::<PyTuple>()
+                .map_err(|_| PyTypeError::new_err("args must be a tuple"))?;
+            let arg_count = self.code.arg_count();
+            if args.len() != arg_count {
+                return Ok(None);
+            }
+            // Typical functions have a few arguments; avoid a heap
+            // allocation for them.
+            let mut inline = [0_i64; INLINE_ARGS];
+            let mut heap = Vec::new();
+            let values = if arg_count <= INLINE_ARGS {
+                &mut inline[..arg_count]
+            } else {
+                heap.resize(arg_count, 0);
+                &mut heap[..]
+            };
+            for (slot, item) in values.iter_mut().zip(args.iter_borrowed()) {
+                match exact_i64_or_none(&item)? {
+                    Some(value) => *slot = value,
+                    None => return Ok(None),
+                }
+            }
+            match self.code.call(values) {
+                (STATUS_OK, value) => Ok(Some(value)),
+                (STATUS_OVERFLOW, _) => Ok(None),
+                // The arity was checked above, so this is a backend bug.
+                (status, _) => Err(PyRuntimeError::new_err(format!(
+                    "unexpected native status {status}"
+                ))),
+            }
+        }
     }
+
+    /// Arguments that `try_call` passes without a heap allocation.
+    const INLINE_ARGS: usize = 8;
 
     /// Compile a serialized program (see `src/program.rs`) for exactly
     /// `arg_count` arguments.
@@ -135,6 +202,38 @@ mod _native {
             return Err(IntError::NotExactInt);
         }
         value.extract::<i64>().map_err(|_| IntError::OutOfRange)
+    }
+
+    /// Like [`exact_i64`], but a rejected value is `Ok(None)` and creates
+    /// no Python exception.
+    ///
+    /// `extract::<i64>()` reports an out-of-range `int` by raising
+    /// ``OverflowError``; `PyLong_AsLongLongAndOverflow` reports it through
+    /// its `overflow` flag instead. An error is returned only if CPython
+    /// unexpectedly sets one.
+    fn exact_i64_or_none(value: &Borrowed<'_, '_, PyAny>) -> PyResult<Option<i64>> {
+        if !value.is_exact_instance_of::<PyInt>() {
+            return Ok(None);
+        }
+        let mut overflow: c_int = 0;
+        // SAFETY:
+        // - `value` is a live, borrowed object and holding a `Borrowed`
+        //   proves the GIL is held for the duration of the call.
+        // - It is an exact `int` (checked above), so CPython converts it
+        //   directly and never calls `__index__` or any other Python code.
+        // - `overflow` is a valid, writable local `c_int`.
+        // The result is a `c_longlong`, which Rust defines as `i64`.
+        let result = unsafe { ffi::PyLong_AsLongLongAndOverflow(value.as_ptr(), &mut overflow) };
+        if overflow != 0 {
+            return Ok(None);
+        }
+        // -1 is also the error return; only then can an error be pending.
+        if result == -1
+            && let Some(error) = PyErr::take(value.py())
+        {
+            return Err(error);
+        }
+        Ok(Some(result))
     }
 
     /// Turn the Python-side tuple of tuples into decoded instructions.

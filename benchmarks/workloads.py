@@ -20,7 +20,7 @@ products of arguments (``a + b * c + c * d - d * 4 ...``), so:
 
 :func:`prepare_layers` produces the same workload at every execution layer
 the runtime benchmark measures, and checks that all of them return the same
-value and that the decorator really runs native code.
+value and that the decorator really runs native code through its fast call.
 
 Fallback cases
 --------------
@@ -38,11 +38,11 @@ import contextlib
 import sys
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from types import FunctionType
+from types import BuiltinMethodType, FunctionType
 from typing import Any
 
 from speedysnek import _native, snekit
-from speedysnek._compiler import I64_MAX, I64_MIN, CompiledI64
+from speedysnek._compiler import I64_MAX, I64_MIN, CompiledI64, NativeGuardFailure
 from speedysnek._decorator import _WARMUP_CALLS, _Status
 from speedysnek._frontend import Instruction, Op, analyze
 
@@ -55,8 +55,12 @@ ARG_NAMES = ("a", "b", "c", "d")
 # workload results, so the Python baseline uses CPython's fast int paths.
 ARGS = (1234, -567, 89, -1011)
 
-# Execution layers measured by ``bench_runtime.py``, outermost first.
-LAYERS = ("python", "snekit", "compiled_i64", "native_call")
+# Execution layers measured by ``bench_runtime.py``. ``python``, ``snekit``
+# and ``fast_call`` are the public path, outermost first: a warmed
+# ``@snekit`` call makes exactly one ``fast_call``. ``compiled_i64`` and
+# ``native_call`` are the diagnostic path (``CompiledI64.__call__`` and the
+# ``I64Function.call`` it wraps), which ``@snekit`` no longer uses.
+LAYERS = ("python", "snekit", "fast_call", "compiled_i64", "native_call")
 
 # Fallback and wrapper-overhead cases, in report order.
 FALLBACK_CASES = (
@@ -68,6 +72,10 @@ FALLBACK_CASES = (
     "keyword_args",
     "default_args",
 )
+
+# The cases in which native code runs and reports a guard miss. They are
+# also timed at the ``fast_call`` layer: the cost of the miss itself.
+GUARD_MISS_CASES = ("float_args", "big_int_args", "overflow")
 
 # The number of calls that take a fresh wrapper through warmup and its
 # first (compiling) call.
@@ -172,14 +180,30 @@ def fits_i64(value: int) -> bool:
 # --- Proving which path a call takes ------------------------------------
 
 
+_FAST_CALL = "fast_call"
+_DIAGNOSTIC_CALL = CompiledI64.__call__.__code__
+
+
+def _is_fast_call(callable_: object) -> bool:
+    """Whether ``callable_`` is a bound ``I64Function.try_call``."""
+    return (
+        type(callable_) is BuiltinMethodType
+        and type(callable_.__self__) is _native.I64Function
+        and callable_.__name__ == "try_call"
+    )
+
+
 @contextlib.contextmanager
 def _recording() -> Iterator[collections.Counter]:
-    """Count the Python frames entered, by code object, in this thread."""
+    """Count, in this thread, the Python frames entered (by code object)
+    and the native fast calls (under ``_FAST_CALL``)."""
     calls: collections.Counter = collections.Counter()
 
-    def profiler(frame, event, _arg):
+    def profiler(frame, event, arg):
         if event == "call":
             calls[frame.f_code] += 1
+        elif event == "c_call" and _is_fast_call(arg):
+            calls[_FAST_CALL] += 1
 
     previous = sys.getprofile()
     sys.setprofile(profiler)
@@ -190,22 +214,26 @@ def _recording() -> Iterator[collections.Counter]:
 
 
 def call_path(wrapper: Callable[..., Any], *args: Any, **kwargs: Any) -> str:
-    """Call ``wrapper`` once and report ``"native"`` or ``"python"``.
+    """Call ``wrapper`` once and report which path it took.
 
-    A native call enters ``CompiledI64.__call__`` and no frame of the
-    original function; a fallback enters the original function once.
+    - ``"native"``: one native fast call and no frame of the original
+      function.
+    - ``"guard_miss"``: one native fast call that returned ``None``, then
+      the original function once.
+    - ``"python"``: the original function once, no native call.
+
+    The diagnostic ``CompiledI64.__call__`` must never run.
     """
     original = wrapper.__wrapped__.__code__
     with _recording() as calls:
         wrapper(*args, **kwargs)
-    python_calls = calls[original]
-    native_calls = calls[CompiledI64.__call__.__code__]
-    if (python_calls, native_calls) == (0, 1):
-        return "native"
-    if python_calls == 1:
-        return "python"
+    observed = (calls[original], calls[_FAST_CALL], calls[_DIAGNOSTIC_CALL])
+    paths = {(0, 1, 0): "native", (1, 1, 0): "guard_miss", (1, 0, 0): "python"}
+    if observed in paths:
+        return paths[observed]
     raise BenchmarkSetupError(
-        f"unexpected call path: {python_calls} Python, {native_calls} native frame(s)"
+        "unexpected call path: {} Python frame(s), {} fast call(s), "
+        "{} CompiledI64.__call__ frame(s)".format(*observed)
     )
 
 
@@ -221,13 +249,15 @@ class Layers:
     """One workload at every execution layer, verified and ready to time.
 
     Each layer has a ``(statement, globals)`` pair for ``pyperf.timeit``.
-    The first three layers use the identical statement ``f(a, b, c, d)``,
-    so they pay the same Python call-site cost.
+    ``python``, ``snekit`` and ``compiled_i64`` use the identical statement
+    ``f(a, b, c, d)``, so they pay the same Python call-site cost.
+    ``fast_call`` and ``native_call`` take one prebuilt argument tuple.
     """
 
     ops: int
     python: FunctionType
     snekit: Callable[..., int]
+    fast_call: Callable[[tuple[int, ...]], int | None]
     compiled: CompiledI64
     native_call: Callable[[tuple[int, ...]], tuple[int, int]]
     args: tuple[int, ...]
@@ -239,10 +269,13 @@ class Layers:
             return "f(a, b, c, d)", {"f": self.python, **values}
         if layer == "snekit":
             return "f(a, b, c, d)", {"f": self.snekit, **values}
+        if layer == "fast_call":
+            # The argument tuple is built once, outside the timed statement,
+            # as the wrapper's ``*args`` tuple is built by the call itself.
+            return "fast_call(args)", {"fast_call": self.fast_call, "args": self.args}
         if layer == "compiled_i64":
             return "f(a, b, c, d)", {"f": self.compiled, **values}
         if layer == "native_call":
-            # The argument tuple is built once, outside the timed statement.
             return "call(args)", {"call": self.native_call, "args": self.args}
         raise ValueError(f"unknown layer {layer!r}")
 
@@ -255,6 +288,8 @@ class Layers:
             if status != _native.STATUS_OK:
                 raise BenchmarkSetupError(f"native status {status}")
             return value
+        if layer == "fast_call" and result is None:
+            raise BenchmarkSetupError("the native fast call reported a guard miss")
         return result
 
 
@@ -290,14 +325,18 @@ def prepare_layers(ops: int, args: tuple[int, ...] = ARGS) -> Layers:
             f"ops_{ops:03d} did not compile: {status_of(wrapper).value}"
         )
     if call_path(wrapper, *args) != "native":
-        raise BenchmarkSetupError(f"ops_{ops:03d} fell back to Python")
+        raise BenchmarkSetupError(f"ops_{ops:03d} did not run the native fast call")
 
-    # The exact object the wrapper calls, not a second compilation.
-    compiled = wrapper._jit_state.specialization.native
+    # The exact objects the wrapper uses, not a second compilation.
+    specialization = wrapper._jit_state.specialization
+    compiled = specialization.native
+    if specialization.fast_call.__self__ is not compiled._function:
+        raise BenchmarkSetupError(f"ops_{ops:03d}: fast call of another function")
     layers = Layers(
         ops=ops,
         python=python,
         snekit=wrapper,
+        fast_call=specialization.fast_call,
         compiled=compiled,
         native_call=compiled._function.call,
         args=args,
@@ -335,13 +374,25 @@ class FallbackCase:
     kwargs: dict[str, Any] = field(default_factory=dict)
     status: _Status = _Status.COMPILED
 
+    @property
+    def sides(self) -> tuple[str, ...]:
+        """What is timed: always ``python`` and ``snekit``, plus, for a
+        guard miss, ``fast_call``: the native call that returns ``None``."""
+        if self.name in GUARD_MISS_CASES:
+            return ("python", "snekit", "fast_call")
+        return ("python", "snekit")
+
     def statement(self, side: str) -> tuple[str, dict[str, Any]]:
+        if side == "fast_call" and side in self.sides:
+            # The wrapper's own bound method, on a prebuilt tuple.
+            fast_call = self.wrapper._jit_state.specialization.fast_call
+            return "fast_call(args)", {"fast_call": fast_call, "args": self.args}
         if side == "python":
             f = self.python
         elif side == "snekit":
             f = self.wrapper
         else:
-            raise ValueError(f"unknown side {side!r}")
+            raise ValueError(f"unknown side {side!r} for {self.name}")
         names = [f"x{i}" for i in range(len(self.args))]
         names += [f"{key}=k_{key}" for key in self.kwargs]
         namespace = {"f": f}
@@ -397,14 +448,14 @@ def fallback_cases() -> list[FallbackCase]:
         ),
         FallbackCase(
             "float_args",
-            "compiled, `float` arguments fail the exact-`int` guard",
+            "compiled, `float` arguments fail the native exact-`int` guard",
             _pair(),
             _compiled(_pair),
             (3.5, 4.25),
         ),
         FallbackCase(
             "big_int_args",
-            "compiled, an `int` outside i64 fails the range guard",
+            "compiled, an `int` outside i64 fails the native range guard",
             _pair(),
             _compiled(_pair),
             (2**64, 4),
@@ -447,8 +498,20 @@ def _verify_fallback(case: FallbackCase) -> None:
     actual = case.run("snekit")
     if actual != expected or type(actual) is not type(expected):
         raise BenchmarkSetupError(f"{case.name}: wrapper result differs")
-    if call_path(case.wrapper, *case.args, **case.kwargs) != "python":
-        raise BenchmarkSetupError(f"{case.name}: did not fall back to Python")
+    guard_miss = case.name in GUARD_MISS_CASES
+    path = call_path(case.wrapper, *case.args, **case.kwargs)
+    if path != ("guard_miss" if guard_miss else "python"):
+        raise BenchmarkSetupError(f"{case.name}: unexpected path {path!r}")
+    if guard_miss:
+        if case.run("fast_call") is not None:
+            raise BenchmarkSetupError(f"{case.name}: the fast call did not miss")
+        # The diagnostic path agrees that this is a guard miss.
+        try:
+            case.wrapper._jit_state.compiled(*case.args)
+        except NativeGuardFailure:
+            pass
+        else:
+            raise BenchmarkSetupError(f"{case.name}: CompiledI64 accepted the call")
     if status_of(case.wrapper) is not case.status:
         raise BenchmarkSetupError(f"{case.name}: state changed while verifying")
 

@@ -5,18 +5,21 @@ Usage::
     python benchmarks/report.py results/runtime.json results/compilation.json \\
         --command "<the benchmark commands you ran>" \\
         --interpretation benchmarks/interpretation.md \\
+        --compare "Old code" old/runtime.json.gz old/compilation.json.gz \\
         -o benchmarks/RESULTS.md
 
-``--command`` and ``--interpretation`` are optional; ``benchmarks/README.md``
-has the exact commands used for the committed baseline.
+``--command``, ``--interpretation`` and ``--compare`` are optional;
+``benchmarks/README.md`` has the exact commands used for the committed
+baseline. Each ``--compare LABEL FILE...`` adds a before/after comparison
+with earlier results.
 
 Every time is pyperf's mean (with its standard deviation) of one call or
 one compilation. Ratios are ``layer / Python``: below 1.0 means the measured
 JIT path is faster than plain Python, above 1.0 means it is slower.
 
 The calculation helpers (:func:`ratio`, :func:`break_even_calls`,
-:func:`linear_fit`, :func:`stability_warnings`, ...) are pure functions with
-unit tests; only :func:`load` needs pyperf.
+:func:`linear_fit`, :func:`crossover`, :func:`stability_warnings`, ...) are
+pure functions with unit tests; only :func:`load` needs pyperf.
 """
 
 from __future__ import annotations
@@ -37,8 +40,9 @@ NO_BREAK_EVEN = "No break-even with the current hot path."
 LAYER_TITLES = {
     "python": "Python",
     "snekit": "`@snekit`",
-    "compiled_i64": "`CompiledI64`",
-    "native_call": "raw native",
+    "fast_call": "native fast call",
+    "compiled_i64": "`CompiledI64` (diagnostic)",
+    "native_call": "`I64Function.call` (diagnostic)",
 }
 
 # pyperf metadata worth showing, in display order.
@@ -192,6 +196,29 @@ def linear_fit(xs: Sequence[float], ys: Sequence[float]) -> tuple[float, float]:
     slope = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys, strict=True))
     slope /= spread
     return mean_y - slope * mean_x, slope
+
+
+def crossover(python: tuple[float, float], jit: tuple[float, float]) -> float | None:
+    """Operations at which two fitted ``(fixed, per_op)`` lines cross.
+
+    ``(jit_fixed - python_fixed) / (python_per_op - jit_per_op)``. ``None``
+    unless the JIT line starts higher and grows more slowly, that is,
+    unless it is slower for small workloads and faster for large ones.
+    """
+    (python_fixed, python_slope), (jit_fixed, jit_slope) = python, jit
+    if jit_slope >= python_slope or jit_fixed <= python_fixed:
+        return None
+    return (jit_fixed - python_fixed) / (python_slope - jit_slope)
+
+
+def change(old: float, new: float) -> str:
+    """``new`` relative to ``old``, e.g. ``0.40× (−60%)``."""
+    if not old > 0:
+        raise ValueError(f"old must be positive, got {old!r}")
+    factor = new / old
+    percent = (factor - 1) * 100
+    sign = "−" if percent < 0 else "+"
+    return f"{factor:.2f}× ({sign}{abs(percent):.0f}%)"
 
 
 def stability_warnings(name: str, stats: Stats) -> list[str]:
@@ -352,7 +379,7 @@ def _runtime(results: Results) -> list[str]:
                 *(format_stat(stats[layer]) for layer in workloads.LAYERS),
                 format_ratio(_ratio_or_none(results.mean(prefix + "snekit"), python)),
                 format_ratio(
-                    _ratio_or_none(results.mean(prefix + "native_call"), python)
+                    _ratio_or_none(results.mean(prefix + "fast_call"), python)
                 ),
             )
         )
@@ -360,20 +387,24 @@ def _runtime(results: Results) -> list[str]:
         "## Steady-state runtime",
         "",
         "Nanoseconds per call (mean ± std dev). `@snekit` was warmed up and "
-        "verified to run native code before timing. Ratios are layer / "
-        "Python: **below 1.0 means the JIT path is faster, above 1.0 means "
-        "it is slower.**",
+        "verified to make exactly one native fast call, and no "
+        "`CompiledI64.__call__`, before timing. Ratios are layer / Python: "
+        "**below 1.0 means the JIT path is faster, above 1.0 means it is "
+        "slower.**",
+        "",
+        "- **native fast call**: `I64Function.try_call(args)` on a prebuilt "
+        "tuple, the one native call a warmed `@snekit` call makes.",
+        "- **diagnostic** layers: `CompiledI64.__call__` and the "
+        "`I64Function.call` it wraps. They report *why* a call misses and are "
+        "**not part of the warmed `@snekit` path**.",
         "",
     ]
     lines += _table(
         (
             "Workload",
-            "Python",
-            "`@snekit`",
-            "`CompiledI64`",
-            "raw native",
+            *(LAYER_TITLES[layer] for layer in workloads.LAYERS),
             "`@snekit` / Python",
-            "raw native / Python",
+            "fast call / Python",
         ),
         rows,
     )
@@ -398,64 +429,104 @@ def _runtime(results: Results) -> list[str]:
 
 
 def breakdown(results: Results, ops: int) -> dict[str, float] | None:
-    """Split one warmed ``@snekit`` call into its layers, in seconds."""
+    """Split one warmed ``@snekit`` call into its nested parts, in seconds.
+
+    A warmed call is the decorator wrapper around exactly one native fast
+    call, so only those two layers are subtracted.
+    """
     prefix = f"runtime.ops_{ops:03d}."
     snekit = results.mean(prefix + "snekit")
-    compiled = results.mean(prefix + "compiled_i64")
-    native = results.mean(prefix + "native_call")
-    if None in (snekit, compiled, native):
+    fast_call = results.mean(prefix + "fast_call")
+    if None in (snekit, fast_call):
         return None
     return {
-        "wrapper": snekit - compiled,
-        "guards": compiled - native,
-        "native": native,
+        "decorator": snekit - fast_call,
+        "fast_call": fast_call,
         "total": snekit,
     }
 
 
+def diagnostic_breakdown(results: Results, ops: int) -> dict[str, float] | None:
+    """Split one ``CompiledI64.__call__`` (the diagnostic path), in seconds."""
+    prefix = f"runtime.ops_{ops:03d}."
+    compiled = results.mean(prefix + "compiled_i64")
+    native = results.mean(prefix + "native_call")
+    if None in (compiled, native):
+        return None
+    return {"guards": compiled - native, "native": native, "total": compiled}
+
+
 COMPONENTS = {
-    "wrapper": "decorator wrapper",
-    "guards": "`CompiledI64` Python guards",
-    "native": "raw native call",
+    "decorator": "decorator overhead",
+    "fast_call": "native fast call",
+}
+
+DIAGNOSTIC_COMPONENTS = {
+    "guards": "Python guards in `CompiledI64.__call__`",
+    "native": "`I64Function.call`",
 }
 
 
-def _breakdown(results: Results) -> list[str]:
-    rows = []
-    for ops in workloads.OP_COUNTS:
-        parts = breakdown(results, ops)
-        if parts is None:
-            continue
-        total = parts["total"]
-        rows.append(
-            (
-                _workload(ops),
-                format_ns(total),
-                *(
-                    f"{format_ns(parts[key])} ({parts[key] * 100 / total:.0f}%)"
-                    for key in COMPONENTS
-                ),
-            )
-        )
-    if not rows:
-        return []
-    lines = [
-        "## Where a warmed `@snekit` call spends its time",
-        "",
-        "Nanoseconds per call, as differences between adjacent layers:",
-        "",
-        "- **decorator wrapper** = `@snekit` − `CompiledI64`: the closure, "
-        "`call_count`, the specialization and `__code__` checks, the `*args` "
-        "and `**kwargs` packing and the `try`.",
-        "- **`CompiledI64` Python guards** = `CompiledI64` − raw native: the "
-        "Python-level `__call__`, its arity, exact-`int` and i64 range "
-        "checks, and the status check on the result.",
-        "- **raw native call** = `I64Function.call(args)`: method call through "
-        "PyO3, tuple and int conversion, a `Vec` allocation, the machine "
-        "code itself, and building the `(status, value)` result tuple.",
-        "",
+def _shares(parts: dict[str, float], components: dict[str, str]) -> list[str]:
+    total = parts["total"]
+    return [
+        format_ns(total),
+        *(
+            f"{format_ns(parts[key])} ({parts[key] * 100 / total:.0f}%)"
+            for key in components
+        ),
     ]
-    lines += _table(("Workload", "`@snekit` total", *COMPONENTS.values()), rows)
+
+
+def _breakdown(results: Results) -> list[str]:
+    lines = []
+    rows = [
+        (_workload(ops), *_shares(parts, COMPONENTS))
+        for ops in workloads.OP_COUNTS
+        if (parts := breakdown(results, ops)) is not None
+    ]
+    if rows:
+        lines += [
+            "## Where a warmed `@snekit` call spends its time",
+            "",
+            "Nanoseconds per call. A warmed call is the decorator wrapper "
+            "around exactly one native fast call, so:",
+            "",
+            "- **decorator overhead** = `@snekit` − native fast call: the "
+            "closure call with `*args`/`**kwargs` packing, `call_count`, the "
+            "specialization, `__code__`, keyword and arity checks, and the "
+            "`None` check on the result.",
+            "- **native fast call** = `I64Function.try_call(args)`: the "
+            "method call through PyO3, one exact-`int` check and i64 "
+            "conversion per argument, the machine code with its overflow "
+            "branches, and the result `int`.",
+            "",
+        ]
+        lines += _table(("Workload", "`@snekit` total", *COMPONENTS.values()), rows)
+    rows = [
+        (_workload(ops), *_shares(parts, DIAGNOSTIC_COMPONENTS))
+        for ops in workloads.OP_COUNTS
+        if (parts := diagnostic_breakdown(results, ops)) is not None
+    ]
+    if rows:
+        if lines:
+            lines.append("")
+        lines += [
+            "### Diagnostic path (not part of warmed `@snekit`)",
+            "",
+            "`CompiledI64.__call__` still exists for direct compiler users "
+            "and tests: it raises `NativeGuardFailure` with the exact reason "
+            "for a miss. It checks the arguments in Python, then "
+            "`I64Function.call` checks them again in Rust and returns "
+            "`(status, value)`. These numbers are **not a component of the "
+            "`@snekit` total above**; they show what the decorator no longer "
+            "pays.",
+            "",
+        ]
+        lines += _table(
+            ("Workload", "`CompiledI64` total", *DIAGNOSTIC_COMPONENTS.values()),
+            rows,
+        )
     return lines
 
 
@@ -493,7 +564,26 @@ def _scaling(results: Results) -> list[str]:
             for layer, (fixed, slope) in fitted.items()
         ),
     )
+    crossings = [
+        (layer, crossover(fitted["python"], fitted[layer]))
+        for layer in ("snekit", "fast_call")
+        if "python" in fitted and layer in fitted
+    ]
+    if crossings:
+        lines += [
+            "",
+            "Estimated crossover, where the fitted line meets Python's "
+            "(`(fixed − Python fixed) / (Python per op − per op)`):",
+            "",
+        ]
+        lines += [f"- {LAYER_TITLES[layer]}: {format_ops(c)}" for layer, c in crossings]
     return lines
+
+
+def format_ops(operations: float | None) -> str:
+    if operations is None:
+        return "none: the fitted lines do not cross at a positive size"
+    return f"≈ {operations:,.0f} operations"
 
 
 def _fallback(results: Results) -> list[str]:
@@ -502,6 +592,7 @@ def _fallback(results: Results) -> list[str]:
     for case in workloads.FALLBACK_CASES:
         python = results.get(f"fallback.{case}.python")
         snekit = results.get(f"fallback.{case}.snekit")
+        miss = results.get(f"fallback.{case}.fast_call")
         if python is None and snekit is None:
             continue
         overhead = (
@@ -514,6 +605,7 @@ def _fallback(results: Results) -> list[str]:
                 format_stat(python),
                 format_stat(snekit),
                 format_ns(overhead),
+                format_stat(miss) if miss else "not attempted",
                 format_ratio(
                     _ratio_or_none(snekit and snekit.mean, python and python.mean)
                 ),
@@ -527,7 +619,10 @@ def _fallback(results: Results) -> list[str]:
         "Nanoseconds per call. Each `@snekit` row runs the original function; "
         "its Python baseline is an undecorated copy of that same function "
         "called with the same arguments, so the overhead column is the cost "
-        "of the wrapper alone.",
+        "of the wrapper alone. A guard miss is reported by the native fast "
+        "call returning `None`, not by an exception. **native miss** times "
+        "that native call alone (part of the overhead); it is not attempted "
+        "when the wrapper falls back before any native code.",
         "",
     ]
     lines += _table(
@@ -537,6 +632,7 @@ def _fallback(results: Results) -> list[str]:
             "Python",
             "`@snekit`",
             "overhead",
+            "native miss",
             "`@snekit` / Python",
         ),
         rows,
@@ -548,8 +644,8 @@ def _fallback_descriptions() -> dict[str, str]:
     return {
         "cold": "warmup call: counted, then Python",
         "disabled": "rejected function (`//`), after it was disabled",
-        "float_args": "compiled; `float` arguments fail the exact-`int` guard",
-        "big_int_args": "compiled; an `int` outside i64 fails the range guard",
+        "float_args": "compiled; `float` arguments miss the exact-`int` guard",
+        "big_int_args": "compiled; an `int` outside i64 misses the range guard",
         "overflow": "compiled; native `*` overflows, Python recomputes",
         "keyword_args": "compiled; keyword arguments skip native code",
         "default_args": "compiled; an omitted default skips native code",
@@ -702,7 +798,7 @@ def key_measurements(results: Results) -> list[str]:
         prefix = f"runtime.ops_{ops:03d}."
         python = results.mean(prefix + "python")
         snekit = results.mean(prefix + "snekit")
-        native = results.mean(prefix + "native_call")
+        native = results.mean(prefix + "fast_call")
         if None not in (python, snekit, native):
             runtime.append((ops, python, snekit, native))
     if runtime:
@@ -725,12 +821,13 @@ def key_measurements(results: Results) -> list[str]:
         native_faster = [ops for ops, python, _, native in runtime if native < python]
         if native_faster:
             bullets.append(
-                "The raw native call alone is faster than the Python function for "
-                + ", ".join(_workload(ops) for ops in native_faster)
-                + "."
+                "The native fast call alone is faster than the Python function "
+                "for " + ", ".join(_workload(ops) for ops in native_faster) + "."
             )
         else:
-            bullets.append("Even the raw native call is slower than Python everywhere.")
+            bullets.append(
+                "Even the native fast call alone is slower than Python everywhere."
+            )
 
     for ops in (workloads.OP_COUNTS[0], workloads.OP_COUNTS[-1]):
         parts = breakdown(results, ops)
@@ -744,20 +841,25 @@ def key_measurements(results: Results) -> list[str]:
             )
 
     fitted = fits(results)
-    if "python" in fitted and "native_call" in fitted:
-        (py_fixed, py_slope), (nat_fixed, nat_slope) = (
+    if "python" in fitted and "fast_call" in fitted:
+        (py_fixed, py_slope), (fast_fixed, fast_slope) = (
             fitted["python"],
-            fitted["native_call"],
+            fitted["fast_call"],
         )
         bullets.append(
-            f"Marginal cost per operation: Python {py_slope * 1e9:.2f} ns, raw "
-            f"native {nat_slope * 1e9:.3f} ns. Fixed cost per call: Python "
-            f"{format_ns(py_fixed)} ns, raw native {format_ns(nat_fixed)} ns"
+            f"Marginal cost per operation: Python {py_slope * 1e9:.2f} ns, native "
+            f"fast call {fast_slope * 1e9:.3f} ns. Fixed cost per call: Python "
+            f"{format_ns(py_fixed)} ns, native fast call {format_ns(fast_fixed)} ns"
             + (
                 f", `@snekit` {format_ns(fitted['snekit'][0])} ns."
                 if "snekit" in fitted
                 else "."
             )
+        )
+    if "python" in fitted and "snekit" in fitted:
+        bullets.append(
+            "Estimated `@snekit` crossover: "
+            f"{format_ops(crossover(fitted['python'], fitted['snekit']))}."
         )
 
     rows = break_even_rows(results)
@@ -789,6 +891,104 @@ def key_measurements(results: Results) -> list[str]:
     return bullets
 
 
+# --- Comparison with an earlier baseline ---------------------------------
+
+
+def comparison_rows(
+    previous: Results, current: Results
+) -> list[tuple[str, str, str, str]]:
+    """``(measurement, previous, current, change)`` for every shared value."""
+    rows: list[tuple[str, str, str, str]] = []
+
+    def add(label: str, old: float | None, new: float | None, fmt=format_time):
+        if old is None or new is None:
+            return
+        rows.append((label, fmt(old), fmt(new), change(old, new) if old > 0 else "—"))
+
+    # Unchanged by speedy-snek: shows how much the machine itself differs.
+    add(
+        "plain Python call, `noop(a, b, c, d)`",
+        previous.mean("reference.python_noop"),
+        current.mean("reference.python_noop"),
+    )
+    for ops in (workloads.OP_COUNTS[0], workloads.OP_COUNTS[-1]):
+        name = f"runtime.ops_{ops:03d}.python"
+        add(f"plain Python, {_workload(ops)}", previous.mean(name), current.mean(name))
+    for ops in workloads.OP_COUNTS:
+        name = f"runtime.ops_{ops:03d}.snekit"
+        add(
+            f"warmed `@snekit`, {_workload(ops)}",
+            previous.mean(name),
+            current.mean(name),
+        )
+    old_fit, new_fit = fits(previous), fits(current)
+    if "snekit" in old_fit and "snekit" in new_fit:
+        add(
+            "warmed `@snekit` fixed cost (fit)",
+            old_fit["snekit"][0],
+            new_fit["snekit"][0],
+        )
+        add(
+            "warmed `@snekit` cost per operation (fit)",
+            old_fit["snekit"][1],
+            new_fit["snekit"][1],
+        )
+    for case in workloads.FALLBACK_CASES:
+        name = f"fallback.{case}.snekit"
+        add(
+            f"fallback `{case}`, `@snekit` call",
+            previous.mean(name),
+            current.mean(name),
+        )
+    if all("python" in f and "snekit" in f for f in (old_fit, new_fit)):
+        old_cross = crossover(old_fit["python"], old_fit["snekit"])
+        new_cross = crossover(new_fit["python"], new_fit["snekit"])
+        rows.append(
+            (
+                "estimated `@snekit` crossover",
+                format_ops(old_cross),
+                format_ops(new_cross),
+                "—"
+                if old_cross is None or new_cross is None
+                else change(old_cross, new_cross),
+            )
+        )
+    old_even = {ops: calls for ops, _, _, calls in break_even_rows(previous)}
+    new_even = {ops: calls for ops, _, _, calls in break_even_rows(current)}
+    for ops in workloads.OP_COUNTS:
+        if ops in old_even and ops in new_even:
+            old, new = old_even[ops], new_even[ops]
+            rows.append(
+                (
+                    f"break-even, {_workload(ops)}",
+                    format_break_even(old),
+                    format_break_even(new),
+                    "—" if old is None or new is None else change(old, new),
+                )
+            )
+    return rows
+
+
+def _comparison(label: str, previous: Results, current: Results) -> list[str]:
+    rows = comparison_rows(previous, current)
+    if not rows:
+        return []
+    lines = [
+        f"## Comparison: {label}",
+        "",
+        f"Previous results: commit {_commits(previous)}, measured "
+        + (" to ".join(previous.dates) if previous.dates else "on an unknown date")
+        + ". Change is current / previous: **below 1.0× is faster or "
+        "fewer calls.** Both runs are means with 10–25% noise; compare "
+        "large changes only. The plain Python rows do not depend on "
+        "speedy-snek and show how much the machine itself differs between "
+        "the runs.",
+        "",
+    ]
+    lines += _table(("Measurement", "previous", "current", "change"), rows)
+    return lines
+
+
 def _stability(results: Results) -> list[str]:
     warnings = [
         warning
@@ -813,6 +1013,7 @@ def render(
     commands: Sequence[str] = (),
     interpretation: str | None = None,
     generated: str | None = None,
+    comparisons: Sequence[tuple[str, Results]] = (),
 ) -> str:
     generated = generated or datetime.datetime.now(datetime.UTC).strftime(
         "%Y-%m-%d %H:%M UTC"
@@ -835,6 +1036,7 @@ def render(
     sections = [
         _environment(results, commands, generated),
         ["## Key measurements", ""] + [f"- {b}" for b in key_measurements(results)],
+        *(_comparison(label, previous, results) for label, previous in comparisons),
         _runtime(results),
         _breakdown(results),
         _scaling(results),
@@ -865,14 +1067,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--interpretation",
         help="Markdown file appended as the report's Interpretation section",
     )
+    parser.add_argument(
+        "--compare",
+        action="append",
+        default=[],
+        nargs="+",
+        metavar=("LABEL", "FILE"),
+        help="compare against earlier pyperf results: a label, then their "
+        "files (repeatable)",
+    )
     args = parser.parse_args(argv)
     results = load(args.results)
+    comparisons = []
+    for label, *files in args.compare:
+        if not files:
+            parser.error(f"--compare {label!r} needs at least one file")
+        comparisons.append((label, load(files)))
     interpretation = (
         Path(args.interpretation).read_text(encoding="utf-8")
         if args.interpretation
         else None
     )
-    text = render(results, args.command, interpretation)
+    text = render(results, args.command, interpretation, comparisons=comparisons)
     if args.output:
         Path(args.output).write_text(text, encoding="utf-8")
     else:

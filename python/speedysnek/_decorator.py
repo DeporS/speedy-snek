@@ -3,7 +3,7 @@
 ``snekit`` is the canonical name; ``jit`` is the same object, kept as a
 descriptive, backwards-compatible alias.
 
-Stage 5: the decorator connects the compiler pipeline for the first time::
+The decorator connects the compiler pipeline::
 
     decorated function
         -> warmup                            (_WARMUP_CALLS plain Python calls)
@@ -26,8 +26,25 @@ machine with three states (:class:`_Status`):
   range, or overflow), that one call runs the original function instead.
   The specialization stays cached for later calls.
 - ``DISABLED``: the frontend rejected the function, the backend could not
-  compile it, the compilation machinery failed, or ``__code__`` was
-  replaced after compilation. Every later call runs the original function.
+  compile it, the compilation machinery failed, a native call failed
+  unexpectedly, or ``__code__`` was replaced after compilation. Every later
+  call runs the original function.
+
+A warmed, eligible call makes one native call, with no Python frame in
+between::
+
+    wrapper(*args)
+        -> spec.fast_call(args)         (I64Function.try_call, in Rust)
+            -> validate every argument once: exact int, in i64
+            -> run the machine code, which checks every operation for overflow
+            -> return the result int, or None for a guard miss
+        -> original function, only if the result was None
+
+Guard misses are expected, so they are reported with the ``None``
+sentinel instead of an exception. Only an unexpected native error (an
+``Exception`` from ``fast_call``) disables the specialization.
+``CompiledI64.__call__``, which explains each guard miss with a
+``NativeGuardFailure``, is not on this path.
 
 The only correctness rule is that ``@snekit`` never changes what a call
 returns or raises. Whenever native execution does not apply, the original
@@ -74,7 +91,7 @@ class _DisabledReason(enum.Enum):
     INTERRUPTED = "interrupted"
     # ``__code__`` was replaced during or after compilation.
     CODE_CHANGED = "code_changed"
-    # A native call raised something other than a guard failure; see
+    # A native call raised an ``Exception``; guard misses never raise. See
     # ``native_error``.
     NATIVE_ERROR = "native_error"
 
@@ -83,19 +100,21 @@ class _Specialization:
     """Everything a native call needs, published as one object.
 
     The wrapper reads ``_JitState.specialization`` once per call, so it
-    either sees a complete specialization or none at all.
+    either sees a complete specialization or none at all. Everything the
+    hot path needs is resolved here, once.
     """
 
-    __slots__ = ("arg_count", "code", "guard_failure", "native")
+    __slots__ = ("arg_count", "code", "fast_call", "native")
 
-    def __init__(
-        self, code: CodeType, native: Any, guard_failure: type[Exception]
-    ) -> None:
+    def __init__(self, code: CodeType, native: Any) -> None:
         self.code = code
+        # The ``CompiledI64``, kept for diagnostics; the wrapper never calls it.
         self.native = native
         self.arg_count = native.arg_count
-        # ``NativeGuardFailure``, kept here so the wrapper never imports it.
-        self.guard_failure = guard_failure
+        # The bound ``I64Function.try_call``: ``fast_call(args)`` returns
+        # the result ``int``, or ``None`` for a guard miss. It also keeps
+        # the machine code alive while a call is using it.
+        self.fast_call = native.fast_call
 
 
 class _JitState:
@@ -159,7 +178,7 @@ class _JitState:
                 self._disable(_DisabledReason.CODE_CHANGED)
 
     def native_failed(self, error: Exception) -> None:
-        """A native call raised something other than a guard failure."""
+        """A native call raised; guard misses return ``None`` instead."""
         with self._lock:
             if self.status is _Status.COMPILED:
                 self.native_error = error
@@ -211,9 +230,7 @@ class _JitState:
         self.compiled = compiled
         self.compiled_code = code
         # Publish the complete specialization before changing the status.
-        self.specialization = _Specialization(
-            code, compiled, _compiler.NativeGuardFailure
-        )
+        self.specialization = _Specialization(code, compiled)
         self.status = _Status.COMPILED
 
     def _disable(self, reason: _DisabledReason) -> None:
@@ -266,12 +283,15 @@ def snekit[F: Callable[..., Any]](func: F) -> F:
             state.invalidate()
         elif not kwargs and len(args) == spec.arg_count:
             try:
-                return spec.native(*args)
-            except spec.guard_failure:
-                pass
+                result = spec.fast_call(args)
             except Exception as error:
+                # Unexpected: guard misses return None. A BaseException
+                # such as KeyboardInterrupt propagates.
                 state.native_failed(error)
-        # Called outside the ``except`` blocks, so an exception raised by
+            else:
+                if result is not None:
+                    return result
+        # Called outside the ``except`` block, so an exception raised by
         # ``func`` gets no ``__context__`` from the native attempt.
         return func(*args, **kwargs)
 
