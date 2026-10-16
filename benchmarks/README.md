@@ -273,3 +273,15 @@ smoke-runs each script with `--debug-single-value`, including the
 `fast_call` layers. CI runs these tests
 and lints the benchmark code. It never runs the full suite and never
 compares timings: shared CI runners are too noisy for a performance gate.
+
+## Experiments
+
+[`experiments/`](experiments) holds short, self-contained A/B experiments
+that are not part of the pyperf suite and do not update the baseline:
+
+| Experiment | Conclusion |
+|---|---|
+| [`wrapper_overhead`](experiments/wrapper_overhead.md) | A wrapper generated for the function's positional signature does not make warmed `@snekit` calls cheaper; not adopted. Also attributes the wrapper's remaining cost. |
+
+`benchmarks/tests/test_wrapper_experiment.py` keeps the experiment's
+prototype honest against the production wrapper.
