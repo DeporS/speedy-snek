@@ -3,8 +3,8 @@
 Because Python doesn’t have to be a slow snek.
 
 SpeedySnek is a small educational JIT compiler experiment for CPython 3.14.
-It is at Stage 1: the project foundation. **Nothing is compiled or optimized
-yet.**
+It is at Stage 1: the project foundation. **No decorated Python
+function is compiled or optimized yet.**
 
 ## Usage
 
