@@ -6,11 +6,12 @@ This is the third stage of the compiler pipeline::
         -> CPython 3.14 bytecode
         -> SpeedySnek normalized instructions
         -> Python reference interpreter  (this module)
-        -> native code (future)
+           or Cranelift i64 backend  (``speedysnek._compiler``)
 
 The interpreter runs a normalized program directly, without the original
-Python function. It is a *correctness oracle*, not an optimization: a
-future native backend must produce exactly the results computed here.
+Python function. It is a *correctness oracle*, not an optimization: the
+native backend must produce exactly the results computed here whenever it
+produces a result at all.
 
 >>> from speedysnek._frontend import Instruction, Op
 >>> program = (

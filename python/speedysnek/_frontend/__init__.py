@@ -5,8 +5,8 @@ This is the first stage of the compiler pipeline::
     Python function
         -> CPython 3.14 bytecode
         -> SpeedySnek normalized instructions  (this package)
-        -> Python reference interpreter  (``speedysnek._interpreter``)
-        -> native code (future)
+        -> reference interpreter  (``speedysnek._interpreter``)
+           or Cranelift i64 backend  (``speedysnek._compiler``)
 
 Only straight-line functions of positional arguments, ``int`` constants,
 ``+``, ``-``, ``*`` and ``return`` are supported. Everything else is

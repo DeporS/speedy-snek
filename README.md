@@ -3,8 +3,9 @@
 Because Python doesn’t have to be a slow snek 🐍
 
 SpeedySnek is a small educational JIT compiler experiment for CPython 3.14.
-It is at Stage 3: a bytecode frontend plus a reference interpreter. **No
-decorated Python function is compiled or optimized yet.**
+It is at Stage 4: a bytecode frontend, a reference interpreter and an
+experimental Cranelift backend. **No decorated Python function is compiled
+or optimized yet.**
 
 ## Usage
 
@@ -29,10 +30,9 @@ Native Rust code lives in the private `speedysnek._native` extension module.
 
 ```
 Python function
-    → CPython 3.14 bytecode
-    → SpeedySnek normalized instructions
-    → Python reference interpreter
-    → native code (future)
+    → CPython 3.14 bytecode frontend
+    → normalized IR
+    → reference interpreter or experimental Cranelift i64 backend
 ```
 
 The private `speedysnek._frontend` package implements the first two
@@ -96,6 +96,37 @@ execute(program, args=(5,))  # 10
 - Arithmetic uses Python `int`, so **arbitrary precision is intentional**:
   `2**63 + 1` is not wrapped to a 64-bit value.
 - It is **not connected to `@jit`** and is not public API.
+
+### Cranelift i64 backend
+
+The private `speedysnek._compiler` module compiles normalized instructions
+into host machine code with [Cranelift](https://cranelift.dev/), working on
+signed 64-bit integers:
+
+```python
+from speedysnek._compiler import compile_i64
+from speedysnek._frontend import analyze
+
+def expression(a, b):
+    return (a + b) * 2
+
+compiled = compile_i64(analyze(expression).instructions)
+compiled(10, 20)  # 60, computed by generated machine code
+```
+
+- It is **private and experimental**, and **not used by `@jit` yet**.
+- It supports only the current arithmetic subset (`+`, `-`, `*` on
+  arguments and constants).
+- It never returns a wrapped 64-bit value. Constants outside the signed
+  64-bit range are rejected at compile time (`UnsupportedProgramError`).
+  Arguments that are not exact `int`s in that range, a wrong number of
+  arguments, or any `+`, `-` or `*` that overflows raise
+  `NativeGuardFailure` instead. In a later stage, these cases will fall back
+  to normal Python execution.
+- Every generated function has the same internal ABI,
+  `status = f(args_ptr, args_len, result_ptr)`, with overflow handled by
+  explicit branches rather than traps.
+- No performance claims are made: there are no benchmarks yet.
 
 ## Development
 
