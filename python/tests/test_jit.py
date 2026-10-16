@@ -5,16 +5,46 @@ import sys
 import pytest
 
 import speedysnek
-from speedysnek import jit
+from speedysnek import snekit
 
 
 def test_public_api():
-    assert speedysnek.__all__ == ["jit"]
-    assert speedysnek.jit is jit
+    assert speedysnek.__all__ == ["snekit", "jit"]
+    assert speedysnek.snekit is snekit
+
+
+def test_jit_is_the_same_object_as_snekit():
+    assert speedysnek.snekit is speedysnek.jit
+
+
+def test_snekit_is_the_canonical_name():
+    # The implementation is named ``snekit``; ``jit`` is only an alias.
+    assert snekit.__name__ == "snekit"
+    assert snekit.__qualname__ == "snekit"
+    assert speedysnek.__all__[0] == "snekit"
+    assert "@snekit" in snekit.__doc__
+    with pytest.raises(TypeError, match="^snekit expected a callable"):
+        snekit(42)
+
+
+def test_jit_alias_still_works():
+    """Backwards compatibility: existing ``@jit`` code keeps working."""
+    from speedysnek import jit
+
+    @jit
+    def expression(a, b):
+        return (a + b) * 2
+
+    for _ in range(20):
+        assert expression(10, 20) == 60
+    assert expression(2**62, 2**62) == 2**64
+    assert expression.call_count == 21
+    assert expression._jit_state.status.value == "compiled"
+    assert expression.__wrapped__.__name__ == "expression"
 
 
 def test_result_is_unchanged():
-    @jit
+    @snekit
     def add(a, b):
         return a + b
 
@@ -28,7 +58,7 @@ def test_metadata_is_preserved():
         return x
 
     original.custom = "attr"
-    wrapped = jit(original)
+    wrapped = snekit(original)
 
     assert wrapped.__name__ == "original"
     assert wrapped.__qualname__ == original.__qualname__
@@ -40,7 +70,7 @@ def test_metadata_is_preserved():
 
 
 def test_call_count():
-    @jit
+    @snekit
     def f():
         return None
 
@@ -51,11 +81,11 @@ def test_call_count():
 
 
 def test_call_counts_are_independent():
-    @jit
+    @snekit
     def f():
         pass
 
-    @jit
+    @snekit
     def g():
         pass
 
@@ -66,7 +96,7 @@ def test_call_counts_are_independent():
 
 
 def test_arguments_are_forwarded():
-    @jit
+    @snekit
     def f(a, /, b, *args, c, d=4, **kwargs):
         return a, b, args, c, d, kwargs
 
@@ -80,7 +110,7 @@ def test_exceptions_propagate_and_are_counted():
 
     error = Boom("boom")
 
-    @jit
+    @snekit
     def f():
         raise error
 
@@ -91,7 +121,7 @@ def test_exceptions_propagate_and_are_counted():
 
 
 def test_bad_call_signature_raises_type_error():
-    @jit
+    @snekit
     def f(a):
         return a
 
@@ -101,7 +131,7 @@ def test_bad_call_signature_raises_type_error():
 
 def test_works_as_method():
     class C:
-        @jit
+        @snekit
         def m(self, x):
             return self, x
 
@@ -112,29 +142,29 @@ def test_works_as_method():
 
 def test_rejects_non_callable():
     with pytest.raises(TypeError):
-        jit(42)
+        snekit(42)
 
 
 def test_wrapper_gains_no_new_public_attributes():
     def add(a, b):
         return a + b
 
-    wrapped = jit(add)
+    wrapped = snekit(add)
     # ``_jit_state`` is private diagnostic state (see test_jit_compile.py).
     assert vars(wrapped).keys() == {"__wrapped__", "call_count", "_jit_state"}
     assert wrapped.__wrapped__ is add
 
 
 def test_functions_the_frontend_rejects_still_work():
-    @jit
+    @snekit
     def divide(a, b):
         return a / b
 
-    @jit
+    @snekit
     def gen(n):
         yield from range(n)
 
-    @jit
+    @snekit
     async def coro(a, b):
         return a + b
 

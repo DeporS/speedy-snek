@@ -1,4 +1,7 @@
-"""The ``jit`` decorator.
+"""The ``snekit`` decorator, also available as ``jit``.
+
+``snekit`` is the canonical name; ``jit`` is the same object, kept as a
+descriptive, backwards-compatible alias.
 
 Stage 5: the decorator connects the compiler pipeline for the first time::
 
@@ -26,7 +29,7 @@ machine with three states (:class:`_Status`):
   compile it, the compilation machinery failed, or ``__code__`` was
   replaced after compilation. Every later call runs the original function.
 
-The only correctness rule is that ``@jit`` never changes what a call
+The only correctness rule is that ``@snekit`` never changes what a call
 returns or raises. Whenever native execution does not apply, the original
 function is called exactly once with the original arguments, and whatever
 it returns or raises is passed through unchanged.
@@ -219,7 +222,7 @@ class _JitState:
         self.disabled_reason = reason
 
 
-def jit[F: Callable[..., Any]](func: F) -> F:
+def snekit[F: Callable[..., Any]](func: F) -> F:
     """Compile ``func`` to native code once it is hot, where possible.
 
     The returned wrapper behaves exactly like ``func``: same results, same
@@ -232,7 +235,7 @@ def jit[F: Callable[..., Any]](func: F) -> F:
     The wrapper exposes ``call_count``: the number of times it has been
     called, including calls that raised.
 
-    >>> @jit
+    >>> @snekit
     ... def expression(a, b):
     ...     return (a + b) * 2
     >>> [expression(10, 20) for _ in range(10)][-1]
@@ -243,7 +246,7 @@ def jit[F: Callable[..., Any]](func: F) -> F:
     11
     """
     if not callable(func):
-        raise TypeError(f"jit expected a callable, got {type(func).__name__}")
+        raise TypeError(f"snekit expected a callable, got {type(func).__name__}")
 
     state = _JitState(func)
     cold = _Status.COLD
@@ -277,3 +280,8 @@ def jit[F: Callable[..., Any]](func: F) -> F:
     # Private diagnostics only; the wrapper uses its closure, not this.
     wrapper._jit_state = state
     return wrapper  # type: ignore[return-value]
+
+
+# The descriptive, backwards-compatible name. It is the same object, so
+# ``@jit`` and ``@snekit`` behave identically.
+jit = snekit

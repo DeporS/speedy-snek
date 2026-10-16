@@ -12,7 +12,7 @@ Only straight-line functions of positional arguments, ``int`` constants,
 ``+``, ``-``, ``*`` and ``return`` are supported. Everything else is
 rejected with a machine-readable :class:`RejectionReason`.
 
-:func:`speedysnek.jit` calls :func:`analyze` once per decorated function,
+:func:`speedysnek.snekit` calls :func:`analyze` once per decorated function,
 after warmup; a rejection makes it run the original function from then on.
 The frontend is not part of the public API.
 

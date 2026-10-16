@@ -40,7 +40,7 @@ Arithmetic uses ordinary Python ``int`` operations, so results have
 arbitrary precision exactly like CPython. There is deliberately no 64-bit
 wrap-around or overflow check.
 
-:func:`speedysnek.jit` never uses the interpreter: it runs either native code
+:func:`speedysnek.snekit` never uses the interpreter: it runs either native code
 or the original function. The interpreter remains the tests' oracle, and is
 not part of the public API.
 """

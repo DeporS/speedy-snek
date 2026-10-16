@@ -18,6 +18,10 @@ dynamic = ["version"]
 tests = [
     "pytest",
 ]
+# Only for running the benchmark suite in ``benchmarks/``.
+benchmarks = [
+    "pyperf>=2.10,<3",
+]
 
 [tool.maturin]
 python-source = "python"
@@ -29,11 +33,13 @@ exclude = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["python/tests"]
+testpaths = ["python/tests", "benchmarks/tests"]
+# Lets the benchmark tests import the benchmark helper modules.
+pythonpath = ["benchmarks"]
 
 [tool.ruff]
 target-version = "py314"
-src = ["python"]
+src = ["python", "benchmarks"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
