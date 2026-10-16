@@ -1,5 +1,9 @@
-"""SpeedySnek: a tiny experimental JIT compiler for Python."""
+"""SpeedySnek: a tiny experimental JIT compiler for Python.
 
-from ._native import sum_as_string
+Native (Rust) functionality lives in the private ``speedysnek._native``
+module and is not part of the public API.
+"""
 
-__all__ = ["sum_as_string"]
+from ._decorator import jit
+
+__all__ = ["jit"]
