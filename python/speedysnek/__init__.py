@@ -1,7 +1,8 @@
 """SpeedySnek: a tiny experimental JIT compiler for Python.
 
-Native (Rust) functionality lives in the private ``speedysnek._native``
-module and is not part of the public API.
+The only public API is :func:`jit`. Everything else, including the native
+(Rust) ``speedysnek._native`` module, is private. The compilation modules
+are imported lazily, the first time a decorated function becomes hot.
 """
 
 from ._decorator import jit
