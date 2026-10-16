@@ -1,8 +1,11 @@
-"""Tests for Stage 5: ``@snekit`` warmup, compilation, guards and fallback.
+"""Tests for ``@snekit``: warmup, compilation, guards and fallback.
 
 Native execution is proven with ``sys.setprofile``, never inferred from an
-equal result: a native call runs ``CompiledI64.__call__`` and no frame of
-the original function, while a Python call runs exactly one frame of it.
+equal result. A warmed native call makes exactly one C call to the
+specialization's bound ``I64Function.try_call`` and enters no frame of the
+original function and no frame of ``CompiledI64.__call__`` (the diagnostic
+path, which the decorator never uses). A Python call runs exactly one
+frame of the original function.
 """
 
 import asyncio
@@ -15,11 +18,12 @@ import subprocess
 import sys
 import threading
 import time
+from types import BuiltinMethodType
 
 import pytest
 
 import speedysnek
-from speedysnek import _compiler, _decorator, _frontend, snekit
+from speedysnek import _compiler, _decorator, _frontend, _native, snekit
 from speedysnek._compiler import I64_MAX, I64_MIN, CompiledI64, NativeGuardFailure
 from speedysnek._decorator import (
     _WARMUP_CALLS,
@@ -30,20 +34,38 @@ from speedysnek._decorator import (
 from speedysnek._frontend import RejectionReason, analyze
 from speedysnek._interpreter import execute
 
-NATIVE_CALL = CompiledI64.__call__.__code__
+# Keys of the counter that ``recording`` fills.
+FAST_CALL = "I64Function.try_call"
+RAW_CALL = "I64Function.call"
+LEGACY_CALL = CompiledI64.__call__.__code__
 
 
 # --- Helpers -------------------------------------------------------------
 
 
+def native_method(callable_):
+    """The name of a bound ``I64Function`` method, else ``None``."""
+    if type(callable_) is BuiltinMethodType and (
+        type(callable_.__self__) is _native.I64Function
+    ):
+        return f"I64Function.{callable_.__name__}"
+    return None
+
+
 @contextlib.contextmanager
 def recording():
-    """Count the Python frames entered, by code object, in this thread."""
+    """Count, in this thread, the Python frames entered (by code object)
+    and the calls to native ``I64Function`` methods (by ``FAST_CALL`` and
+    ``RAW_CALL``)."""
     calls = collections.Counter()
 
-    def profiler(frame, event, _arg):
+    def profiler(frame, event, arg):
         if event == "call":
             calls[frame.f_code] += 1
+        elif event == "c_call":
+            name = native_method(arg)
+            if name is not None:
+                calls[name] += 1
 
     previous = sys.getprofile()
     sys.setprofile(profiler)
@@ -54,23 +76,28 @@ def recording():
 
 
 def traced(f, *args, **kwargs):
-    """Call ``f`` and return ``(result, python_calls, native_calls)``."""
+    """Call ``f`` and return ``(result, python_calls, fast_calls)``.
+
+    Also checks that the decorator never takes the diagnostic path.
+    """
     original = f.__wrapped__.__code__
     with recording() as calls:
         result = f(*args, **kwargs)
-    return result, calls[original], calls[NATIVE_CALL]
+    assert calls[LEGACY_CALL] == 0
+    assert calls[RAW_CALL] == 0
+    return result, calls[original], calls[FAST_CALL]
 
 
 def assert_native(f, *args):
-    result, python_calls, native_calls = traced(f, *args)
-    assert (python_calls, native_calls) == (0, 1)
+    result, python_calls, fast_calls = traced(f, *args)
+    assert (python_calls, fast_calls) == (0, 1)
     return result
 
 
 def assert_python(f, *args, **kwargs):
-    result, python_calls, native_calls = traced(f, *args, **kwargs)
+    result, python_calls, fast_calls = traced(f, *args, **kwargs)
     assert python_calls == 1
-    return result, native_calls
+    return result, fast_calls
 
 
 def state_of(f):
@@ -315,6 +342,22 @@ class Opaque:
         return ("radd", other)
 
 
+class Convertible:
+    """Defines ``__int__`` and ``__index__``; the guards must not use them."""
+
+    def __int__(self):
+        raise AssertionError("__int__ was called")
+
+    def __index__(self):
+        raise AssertionError("__index__ was called")
+
+    def __add__(self, other):
+        return ("add", other)
+
+    def __radd__(self, other):
+        return ("radd", other)
+
+
 @pytest.mark.parametrize(
     ("args", "expected"),
     [
@@ -323,9 +366,13 @@ class Opaque:
         ((MyInt(1), 2), "custom add"),
         ((1.5, 2), 3.5),
         ((1, 2.5), 3.5),
+        ((1j, 2), 2 + 1j),
         (("a", "b"), "ab"),
         (([1], [2]), [1, 2]),
+        (((1,), (2,)), (1, 2)),
         ((1, Opaque()), ("radd", 1)),
+        ((1, Convertible()), ("radd", 1)),
+        ((Convertible(), 1), ("add", 1)),
         ((2**63, 0), 2**63),
         ((I64_MIN - 1, 0), I64_MIN - 1),
         ((2**200, -(2**200)), 0),
@@ -333,12 +380,115 @@ class Opaque:
 )
 def test_guard_failures_fall_back_to_python(args, expected):
     add = compiled(make_add(), 1, 2)
-    result, native_calls = assert_python(add, *args)
+    result, fast_calls = assert_python(add, *args)
     assert result == expected
     assert type(result) is type(expected)
     # The native tier was tried and its guards said no.
-    assert native_calls == 1
+    assert fast_calls == 1
     assert state_of(add).status is _Status.COMPILED
+
+
+@pytest.mark.parametrize("args", [(None, 1), (1, None), (1, "x"), (object(), 2)])
+def test_guard_failures_that_raise_in_python(args):
+    add = compiled(make_add(), 1, 2)
+    with pytest.raises(TypeError) as expected:
+        add.__wrapped__(*args)
+    with recording() as calls:
+        with pytest.raises(TypeError) as actual:
+            add(*args)
+    assert str(actual.value) == str(expected.value)
+    assert actual.value.__context__ is None
+    assert (calls[add.__wrapped__.__code__], calls[FAST_CALL]) == (1, 1)
+    assert calls[LEGACY_CALL] == 0
+    assert state_of(add).status is _Status.COMPILED
+
+
+class RecordingMeta(type):
+    """Records any attribute lookup on its classes, then refuses it."""
+
+    lookups = []
+
+    def __getattribute__(cls, name):
+        RecordingMeta.lookups.append(name)
+        raise RuntimeError(f"metaclass hook ran for {name!r}")
+
+
+class Hostile(metaclass=RecordingMeta):
+    pass
+
+
+class HostileInt(int, metaclass=RecordingMeta):
+    pass
+
+
+class Recorder:
+    """Records any attempt to inspect, convert or compare it."""
+
+    calls = []
+
+    def __getattribute__(self, name):
+        Recorder.calls.append(name)
+        return object.__getattribute__(self, name)
+
+    def _record(self, *args):
+        Recorder.calls.append("dunder")
+        return NotImplemented
+
+    __index__ = __int__ = __float__ = __eq__ = __lt__ = __le__ = _record
+    __gt__ = __ge__ = __hash__ = __bool__ = __len__ = __iter__ = _record
+
+    def __repr__(self):
+        Recorder.calls.append("__repr__")
+        return "Recorder()"
+
+    def __radd__(self, other):
+        return "user code ran in the fallback only"
+
+
+def test_guard_misses_run_no_user_code():
+    @snekit
+    def second(a, b):
+        return b
+
+    compiled(second, 1, 2)
+    hostile, hostile_int, recorder = Hostile(), HostileInt(5), Recorder()
+    RecordingMeta.lookups.clear()
+    Recorder.calls.clear()
+    # ``second`` returns ``b`` without touching it, so any recorded access
+    # could only come from the guards.
+    for args in [(hostile, 1), (1, hostile), (hostile_int, 1), (recorder, 2)]:
+        result, python_calls, fast_calls = traced(second, *args)
+        assert result is args[1]
+        assert (python_calls, fast_calls) == (1, 1)
+    assert RecordingMeta.lookups == []
+    assert Recorder.calls == []
+    assert state_of(second).status is _Status.COMPILED
+
+
+def test_every_guard_miss_kind_keeps_the_specialization():
+    @snekit
+    def f(a, b):
+        return a * b - a * b + 1
+
+    compiled(f, 1, 2)
+    specialization = state_of(f).specialization
+    misses = [
+        (True, 2),
+        (MyInt(1), 2),
+        (1.5, 2),
+        (I64_MAX + 1, 1),
+        (I64_MIN - 1, 1),
+        (2**32, 2**32),  # Intermediate overflow; the final result fits.
+    ]
+    for args in misses:
+        result, fast_calls = assert_python(f, *args)
+        assert result == f.__wrapped__(*args)
+        assert fast_calls == 1
+        assert state_of(f).specialization is specialization
+    assert assert_native(f, 3, 4) == 1
+    assert f.call_count == _WARMUP_CALLS + 1 + len(misses) + 1
+    assert state_of(f).native_error is None
+    assert state_of(f).compile_attempts == 1
 
 
 @pytest.mark.parametrize(
@@ -399,7 +549,7 @@ def test_wrong_arity_preserves_cpython_type_error(args):
         with pytest.raises(TypeError) as actual:
             add(*args)
     assert str(actual.value) == str(expected.value)
-    assert calls[NATIVE_CALL] == 0
+    assert calls[FAST_CALL] == 0
     assert state_of(add).status is _Status.COMPILED
 
 
@@ -435,6 +585,28 @@ def test_python_type_errors_are_not_chained():
     with pytest.raises(TypeError) as excinfo:
         add(1, "x")
     assert excinfo.value.__context__ is None
+
+
+def test_user_exceptions_keep_their_normal_context():
+    error = ValueError("from user code")
+
+    class Raises:
+        def __radd__(self, other):
+            raise error
+
+    add = compiled(make_add(), 1, 2)
+    # Raised while another exception is being handled, the user's error
+    # must get exactly the context it gets without the decorator.
+    for f in (add.__wrapped__, add):
+        outer = KeyError("outer")
+        try:
+            raise outer
+        except KeyError:
+            with pytest.raises(ValueError) as excinfo:
+                f(1, Raises())
+        assert excinfo.value is error
+        assert excinfo.value.__context__ is outer
+        error.__context__ = None
 
 
 def test_guard_failures_never_leak():
@@ -614,25 +786,123 @@ def test_base_exceptions_during_compilation_propagate(monkeypatch):
     assert state.compile_attempts == 1
 
 
+class BrokenNative:
+    """Stands in for a ``CompiledI64`` whose fast call raises."""
+
+    arg_count = 2
+
+    def __init__(self, error):
+        self.error = error
+        self.calls = 0
+
+    def fast_call(self, args):
+        self.calls += 1
+        raise self.error
+
+
 def test_unexpected_native_errors_disable_and_fall_back():
     add = compiled(make_add(), 1, 2)
     state = state_of(add)
     error = RuntimeError("native bug")
-
-    class Broken:
-        arg_count = 2
-
-        def __call__(self, *args):
-            raise error
-
-    state.specialization = _Specialization(
-        state.compiled_code, Broken(), NativeGuardFailure
-    )
+    broken = BrokenNative(error)
+    state.specialization = _Specialization(state.compiled_code, broken)
     assert assert_python(add, 1, 2) == (3, 0)
+    assert broken.calls == 1
     assert state.status is _Status.DISABLED
     assert state.disabled_reason is _DisabledReason.NATIVE_ERROR
     assert state.native_error is error
+    assert state.specialization is None
     assert assert_python(add, 1, 2) == (3, 0)
+    assert broken.calls == 1
+    assert add.call_count == _WARMUP_CALLS + 1 + 2
+
+
+def test_real_native_errors_disable_and_fall_back():
+    # The real ``try_call`` raises ``TypeError`` for anything but an exact
+    # tuple: a caller bug, never a guard miss.
+    add = compiled(make_add(), 1, 2)
+    state = state_of(add)
+    real = state.specialization
+    real.fast_call = lambda args: state.compiled._function.try_call(list(args))
+    assert add(1, 2) == 3
+    assert state.disabled_reason is _DisabledReason.NATIVE_ERROR
+    assert isinstance(state.native_error, TypeError)
+
+
+def test_native_errors_do_not_chain_user_exceptions():
+    error = ValueError("from user code")
+
+    class Raises:
+        def __radd__(self, other):
+            raise error
+
+    add = compiled(make_add(), 1, 2)
+    state = state_of(add)
+    state.specialization = _Specialization(
+        state.compiled_code, BrokenNative(RuntimeError("native bug"))
+    )
+    with pytest.raises(ValueError) as excinfo:
+        add(1, Raises())
+    assert excinfo.value is error
+    assert excinfo.value.__context__ is None
+    assert state.disabled_reason is _DisabledReason.NATIVE_ERROR
+
+
+@pytest.mark.parametrize("error", [KeyboardInterrupt, SystemExit, GeneratorExit])
+def test_base_exceptions_from_native_code_propagate(error):
+    add = compiled(make_add(), 1, 2)
+    state = state_of(add)
+    broken = BrokenNative(error())
+    specialization = _Specialization(state.compiled_code, broken)
+    state.specialization = specialization
+    with recording() as calls:
+        with pytest.raises(error):
+            add(1, 2)
+    # Not converted into a fallback, and not a reason to disable.
+    assert calls[add.__wrapped__.__code__] == 0
+    assert state.status is _Status.COMPILED
+    assert state.specialization is specialization
+    assert state.native_error is None
+
+
+def test_warmed_calls_never_enter_compiled_i64(monkeypatch):
+    def forbidden(self, *args):
+        raise AssertionError("CompiledI64.__call__ was called")
+
+    add = compiled(make_add(), 1, 2)
+    monkeypatch.setattr(CompiledI64, "__call__", forbidden)
+    assert assert_native(add, 3, 4) == 7
+    assert assert_python(add, 1.5, 2) == (3.5, 1)
+    assert assert_python(add, I64_MAX, 1) == (2**63, 1)
+    assert state_of(add).status is _Status.COMPILED
+
+
+def test_the_specialization_caches_the_bound_fast_call():
+    add = compiled(make_add(), 1, 2)
+    state = state_of(add)
+    spec = state.specialization
+    fast_call = spec.fast_call
+    assert type(fast_call) is BuiltinMethodType
+    assert fast_call.__self__ is state.compiled._function
+    assert fast_call.__name__ == "try_call"
+    assert spec.arg_count == state.compiled.arg_count == 2
+    # Every call uses this very object; nothing is looked up per call.
+    seen = []
+
+    def profiler(frame, event, arg):
+        if event == "c_call" and native_method(arg) == FAST_CALL:
+            seen.append(arg)
+
+    sys.setprofile(profiler)
+    try:
+        for i in range(5):
+            add(i, i)
+        add(0.5, 1)
+    finally:
+        sys.setprofile(None)
+    assert len(seen) == 6
+    assert all(arg is fast_call for arg in seen)
+    assert state.specialization is spec
 
 
 @pytest.mark.parametrize("phase", ["cold", "compiled", "disabled"])
@@ -716,7 +986,7 @@ def test_code_replaced_during_compilation_is_not_used(monkeypatch):
     with recording() as calls:
         assert add(6, 7) == 42
     assert calls[multiply.__code__] == 1
-    assert calls[NATIVE_CALL] == 0
+    assert calls[FAST_CALL] == 0
     assert state_of(add).disabled_reason is _DisabledReason.CODE_CHANGED
 
 

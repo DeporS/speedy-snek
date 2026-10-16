@@ -41,17 +41,29 @@ function never reads; the stricter rule only ever causes a guard failure.
 Nothing here calls the original Python function, and no guard runs Python
 code on an argument: only ``type(value) is int`` and integer comparisons.
 
-:func:`speedysnek.snekit` compiles a hot function here once and caches the
-:class:`CompiledI64`. It runs the original Python function instead when
-:class:`UnsupportedProgramError` is raised at compile time (from then on)
-or :class:`NativeGuardFailure` at call time (for that call only). The
+A :class:`CompiledI64` has two ways to run its code:
+
+- Calling it (``compiled(*args)``) is the *diagnostic* path. Its Python
+  guards raise :class:`NativeGuardFailure` with the exact reason, and Rust
+  then checks the arguments again. Tests and direct users of this module
+  rely on those reasons.
+- :attr:`CompiledI64.fast_call` (``fast_call(args)``) is the *fast* path:
+  the native ``I64Function.try_call`` method. Rust checks the arguments
+  once, with no Python code in between, and returns the result ``int``, or
+  ``None`` for any call the native tier cannot run. A guard miss raises
+  nothing.
+
+:func:`speedysnek.snekit` compiles a hot function here once and caches its
+:attr:`~CompiledI64.fast_call`. It runs the original Python function
+instead when :class:`UnsupportedProgramError` is raised at compile time
+(from then on) or ``fast_call`` returns ``None`` (for that call only). The
 backend is not part of the public API.
 """
 
 from __future__ import annotations
 
 import enum
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 from . import _native
 from ._frontend.ir import Instruction, Op
@@ -236,8 +248,33 @@ class CompiledI64:
         """The normalized instructions this code was compiled from."""
         return self._instructions
 
+    @property
+    def fast_call(self) -> Callable[[tuple[object, ...]], int | None]:
+        """The bound native ``I64Function.try_call`` for this code.
+
+        It takes the positional arguments as one tuple and returns the
+        result ``int``, or ``None`` if the call does not fit the native tier
+        (the cases :class:`NativeGuardFailure` describes). It raises nothing
+        for such a call and does not say why. The bound method keeps the
+        machine code alive.
+
+        >>> from speedysnek._frontend import analyze
+        >>> def add(a, b):
+        ...     return a + b
+        >>> fast_call = compile_i64(analyze(add).instructions).fast_call
+        >>> fast_call((2, 3))
+        5
+        >>> print(fast_call((2**63 - 1, 1)))  # overflow
+        None
+        """
+        return self._function.try_call
+
     def __call__(self, /, *args: object) -> int:
-        """Run the native code, or raise :class:`NativeGuardFailure`."""
+        """Run the native code, or raise :class:`NativeGuardFailure`.
+
+        This is the diagnostic path: unlike :attr:`fast_call`, it reports
+        exactly why a call does not fit the native tier.
+        """
         if len(args) != self._function.arg_count:
             raise NativeGuardFailure(
                 f"expected {self._function.arg_count} argument(s), got {len(args)}",

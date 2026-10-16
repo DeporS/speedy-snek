@@ -7,16 +7,21 @@ Run with a release build (see ``benchmarks/README.md``)::
 Benchmark names:
 
 - ``runtime.ops_NNN.<layer>``: one workload with NNN arithmetic operations.
-  Layers, outermost first:
+  The public path, outermost first:
 
   - ``python``: the plain, undecorated function.
-  - ``snekit``: the public wrapper, warmed up and verified to be running
-    native code before timing starts.
-  - ``compiled_i64``: the ``CompiledI64`` object that the wrapper calls,
-    called directly (Python-level arity, type and range guards, then the
-    native call).
-  - ``native_call``: ``I64Function.call(args)`` on a prebuilt tuple, the
-    lowest-level native entry point exposed through PyO3.
+  - ``snekit``: the public wrapper, warmed up and verified to make one
+    native fast call (and no ``CompiledI64.__call__``) before timing.
+  - ``fast_call``: that same bound ``I64Function.try_call`` method, called
+    directly on a prebuilt argument tuple. It is everything a warmed
+    ``@snekit`` call does below the decorator.
+
+  The diagnostic path, which ``@snekit`` no longer uses:
+
+  - ``compiled_i64``: the ``CompiledI64`` object, called directly
+    (Python-level arity, type and range guards, then ``I64Function.call``).
+  - ``native_call``: ``I64Function.call(args)`` on a prebuilt tuple,
+    returning ``(status, value)``.
 
 - ``reference.loop``: an empty statement, the timing loop itself.
 - ``reference.python_noop``: a four-argument Python function that returns
@@ -24,6 +29,8 @@ Benchmark names:
 - ``fallback.<case>.python`` and ``fallback.<case>.snekit``: a wrapper in a
   specific state that runs the original function, and the same function
   undecorated.
+- ``fallback.<case>.fast_call``: for the guard-miss cases only, the
+  wrapper's native fast call on a prebuilt tuple, returning ``None``.
 """
 
 from __future__ import annotations
@@ -62,7 +69,10 @@ def main() -> None:
 
     cases = None
     for name in workloads.FALLBACK_CASES:
-        for side in ("python", "snekit"):
+        sides = ("python", "snekit")
+        if name in workloads.GUARD_MISS_CASES:
+            sides += ("fast_call",)
+        for side in sides:
             full_name = f"fallback.{name}.{side}"
             if not selected(full_name):
                 continue

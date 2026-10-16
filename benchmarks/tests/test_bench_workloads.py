@@ -12,6 +12,7 @@ from speedysnek._frontend import Op, analyze
 from speedysnek._interpreter import execute
 from workloads import (
     ARGS,
+    GUARD_MISS_CASES,
     LAYERS,
     OP_COUNTS,
     BenchmarkSetupError,
@@ -119,6 +120,7 @@ def test_every_layer_returns_the_same_result(layers):
     assert execute(analyze(layers.python).instructions, ARGS) == expected
     for layer in LAYERS:
         assert layers.run(layer) == expected
+    assert layers.fast_call(ARGS) == expected
     assert layers.native_call(ARGS) == (_native.STATUS_OK, expected)
 
 
@@ -127,18 +129,32 @@ def test_warmed_snekit_really_runs_native_code(layers):
     assert status_of(layers.snekit) is _Status.COMPILED
     assert state.compile_attempts == 1
     assert call_path(layers.snekit, *ARGS) == "native"
-    # The direct layers wrap the very code the decorator runs.
+    # The direct layers wrap the very code the decorator runs: the fast
+    # call is the wrapper's own bound method.
+    assert layers.fast_call is state.specialization.fast_call
+    assert layers.fast_call.__self__ is layers.compiled._function
     assert layers.compiled is state.specialization.native
     assert isinstance(layers.compiled, CompiledI64)
+
+
+def test_warmed_snekit_never_enters_compiled_i64(layers, monkeypatch):
+    def forbidden(self, *args):
+        raise AssertionError("CompiledI64.__call__ was called")
+
+    monkeypatch.setattr(CompiledI64, "__call__", forbidden)
+    assert layers.run("snekit") == layers.expected
+    assert call_path(layers.snekit, *ARGS) == "native"
 
 
 def test_layer_statements(layers):
     statements = {layer: layers.statement(layer)[0] for layer in LAYERS}
     # The Python, decorator and CompiledI64 layers share one call site...
     assert statements["python"] == statements["snekit"] == statements["compiled_i64"]
-    # ...and the raw call reuses a prebuilt tuple.
+    # ...and the native calls reuse a prebuilt tuple.
+    assert statements["fast_call"] == "fast_call(args)"
     assert statements["native_call"] == "call(args)"
-    assert layers.statement("native_call")[1]["args"] is layers.args
+    for layer in ("fast_call", "native_call"):
+        assert layers.statement(layer)[1]["args"] is layers.args
     with pytest.raises(ValueError):
         layers.statement("nope")
 
@@ -163,7 +179,22 @@ def test_call_path_tells_native_from_python():
     assert call_path(add, 1, 2) == "python"
     workloads.warm_up(add, 1, 2)
     assert call_path(add, 1, 2) == "native"
-    assert call_path(add, 1.0, 2) == "python"
+    assert call_path(add, 1.0, 2) == "guard_miss"
+    assert call_path(add, 2**63, 2) == "guard_miss"
+    assert call_path(add, 1, b=2) == "python"
+
+
+def test_call_path_rejects_the_diagnostic_path():
+    @snekit
+    def add(a, b):
+        return a + b
+
+    workloads.warm_up(add, 1, 2)
+    compiled = add._jit_state.compiled
+    # Simulate a decorator that calls CompiledI64.__call__ again.
+    add._jit_state.specialization.fast_call = lambda args: compiled(*args)
+    with pytest.raises(BenchmarkSetupError, match="CompiledI64"):
+        call_path(add, 1, 2)
 
 
 # --- Fallback cases ------------------------------------------------------
@@ -190,8 +221,34 @@ def test_fallback_returns_the_same_result(cases, name):
 @pytest.mark.parametrize("name", workloads.FALLBACK_CASES)
 def test_fallback_really_runs_python(cases, name):
     case = cases[name]
-    assert call_path(case.wrapper, *case.args, **case.kwargs) == "python"
+    path = call_path(case.wrapper, *case.args, **case.kwargs)
+    # A guard miss tries the native fast call first; nothing else does.
+    assert path == ("guard_miss" if name in GUARD_MISS_CASES else "python")
     assert status_of(case.wrapper) is case.status
+
+
+def test_guard_miss_cases():
+    assert GUARD_MISS_CASES == ("float_args", "big_int_args", "overflow")
+    assert set(GUARD_MISS_CASES) <= set(workloads.FALLBACK_CASES)
+
+
+@pytest.mark.parametrize("name", workloads.FALLBACK_CASES)
+def test_fallback_sides(cases, name):
+    case = cases[name]
+    if name in GUARD_MISS_CASES:
+        assert case.sides == ("python", "snekit", "fast_call")
+        statement, namespace = case.statement("fast_call")
+        assert statement == "fast_call(args)"
+        assert (
+            namespace["fast_call"] is case.wrapper._jit_state.specialization.fast_call
+        )
+        assert namespace["args"] is case.args
+        # The timed native call really is a guard miss.
+        assert case.run("fast_call") is None
+    else:
+        assert case.sides == ("python", "snekit")
+        with pytest.raises(ValueError):
+            case.statement("fast_call")
 
 
 @pytest.mark.parametrize("name", workloads.FALLBACK_CASES)

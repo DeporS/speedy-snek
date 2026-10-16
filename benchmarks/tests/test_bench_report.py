@@ -17,6 +17,8 @@ from report import (
     Results,
     Stats,
     break_even_calls,
+    change,
+    crossover,
     format_break_even,
     format_ratio,
     format_time,
@@ -42,13 +44,16 @@ def synthetic(python_ns, snekit_ns, *, lifecycle_us=500.0, native_ns=None):
         prefix = f"runtime.ops_{ops:03d}."
         benchmarks[prefix + "python"] = steady((python_ns + ops) * 1e-9)
         benchmarks[prefix + "snekit"] = steady(snekit_ns * 1e-9)
-        benchmarks[prefix + "compiled_i64"] = steady(snekit_ns * 0.75e-9)
-        benchmarks[prefix + "native_call"] = steady(native_ns * 1e-9)
+        benchmarks[prefix + "fast_call"] = steady(native_ns * 1e-9)
+        benchmarks[prefix + "compiled_i64"] = steady(snekit_ns * 2e-9)
+        benchmarks[prefix + "native_call"] = steady(native_ns * 1.5e-9)
         for kind in ("frontend", "backend", "codegen", "lifecycle"):
             benchmarks[f"compile.{kind}.ops_{ops:03d}"] = steady(lifecycle_us * 1e-6)
     for case in workloads.FALLBACK_CASES:
         benchmarks[f"fallback.{case}.python"] = steady(200e-9)
         benchmarks[f"fallback.{case}.snekit"] = steady(800e-9)
+    for case in workloads.GUARD_MISS_CASES:
+        benchmarks[f"fallback.{case}.fast_call"] = steady(60e-9)
     return Results(
         benchmarks=benchmarks,
         metadata={"speedysnek_build": "release", "cpu_model_name": "Test CPU"},
@@ -165,15 +170,76 @@ def test_linear_fit_rejects_degenerate_input():
         linear_fit([1, 2], [1])
 
 
-def test_breakdown_adds_up():
+def test_breakdown_subtracts_only_nested_layers():
     results = synthetic(python_ns=200, snekit_ns=1000, native_ns=100)
     parts = report.breakdown(results, 5)
+    assert set(parts) == {"decorator", "fast_call", "total"}
     assert parts["total"] == pytest.approx(1000e-9)
-    assert parts["wrapper"] + parts["guards"] + parts["native"] == pytest.approx(
-        parts["total"]
-    )
-    assert parts["wrapper"] == pytest.approx(250e-9)
-    assert parts["native"] == pytest.approx(100e-9)
+    assert parts["fast_call"] == pytest.approx(100e-9)
+    assert parts["decorator"] == pytest.approx(900e-9)
+    assert parts["decorator"] + parts["fast_call"] == pytest.approx(parts["total"])
+
+
+def test_diagnostic_breakdown_is_separate():
+    results = synthetic(python_ns=200, snekit_ns=1000, native_ns=100)
+    parts = report.diagnostic_breakdown(results, 5)
+    # CompiledI64 is 2,000 ns and I64Function.call 150 ns in the synthetic
+    # data: slower than the whole @snekit call, which it is not part of.
+    assert parts["total"] == pytest.approx(2000e-9)
+    assert parts["native"] == pytest.approx(150e-9)
+    assert parts["guards"] == pytest.approx(1850e-9)
+    text = render(results)
+    public = text.split("## Where a warmed")[1].split("###")[0]
+    assert "CompiledI64" not in public.split("|---")[1]
+    assert "### Diagnostic path (not part of warmed `@snekit`)" in text
+
+
+def test_breakdown_needs_the_fast_call_layer():
+    results = synthetic(python_ns=200, snekit_ns=1000)
+    del results.benchmarks["runtime.ops_005.fast_call"]
+    assert report.breakdown(results, 5) is None
+    assert report.diagnostic_breakdown(results, 5) is not None
+
+
+def test_crossover():
+    # Python: 20 + 10x; JIT: 420 + 2x; they meet at x = 400 / 8 = 50.
+    assert crossover((20, 10), (420, 2)) == pytest.approx(50)
+    # Faster everywhere, slower everywhere, or the same slope: no crossover.
+    assert crossover((20, 10), (10, 2)) is None
+    assert crossover((20, 10), (420, 12)) is None
+    assert crossover((20, 10), (420, 10)) is None
+
+
+def test_change():
+    assert change(1000, 400) == "0.40× (−60%)"
+    assert change(100, 150) == "1.50× (+50%)"
+    assert change(100, 100) == "1.00× (+0%)"
+    with pytest.raises(ValueError):
+        change(0, 1)
+
+
+def test_comparison_with_a_previous_baseline():
+    previous = synthetic(python_ns=200, snekit_ns=1000, lifecycle_us=500)
+    current = synthetic(python_ns=200, snekit_ns=400, lifecycle_us=500)
+    rows = report.comparison_rows(previous, current)
+    labels = [label for label, *_ in rows]
+    for ops in (1, 20, 50, 100, 250):
+        assert f"warmed `@snekit`, `ops_{ops:03d}`" in labels
+    assert "warmed `@snekit` fixed cost (fit)" in labels
+    assert "estimated `@snekit` crossover" in labels
+    assert "fallback `float_args`, `@snekit` call" in labels
+    assert "break-even, `ops_250`" in labels
+    row = dict((label, rest) for label, *rest in rows)["warmed `@snekit`, `ops_001`"]
+    assert row == ["1.0 µs", "400.0 ns", "0.40× (−60%)"]
+    text = render(current, previous=previous)
+    assert "## Comparison with the previous baseline" in text
+    assert "## Comparison" not in render(current)
+
+
+def test_render_reports_the_crossover():
+    results = synthetic(python_ns=20, snekit_ns=1000)
+    # Python grows by 1 ns per operation; @snekit is flat at 1,000 ns.
+    assert "Estimated `@snekit` crossover: ≈ 980 operations." in render(results)
 
 
 def test_stability_warnings():
@@ -235,9 +301,23 @@ def test_render_runtime_row():
     # Python is 205 ns for ops_005 in the synthetic data.
     assert cells[1] == "205.0 ± 0.0"
     assert cells[2] == "1,000.0 ± 0.0"
-    assert cells[4] == "100.0 ± 0.0"
-    assert cells[5] == format_ratio(1000 / 205)
-    assert cells[6] == format_ratio(100 / 205)
+    assert cells[3] == "100.0 ± 0.0"  # native fast call
+    assert cells[4] == "2,000.0 ± 0.0"  # CompiledI64, diagnostic
+    assert cells[5] == "150.0 ± 0.0"  # I64Function.call, diagnostic
+    assert cells[6] == format_ratio(1000 / 205)
+    assert cells[7] == format_ratio(100 / 205)
+
+
+def test_render_fallback_native_miss_column():
+    text = render(synthetic(python_ns=200, snekit_ns=1000))
+    rows = {
+        line.split("|")[1].strip(): [c.strip() for c in line.strip("|").split("|")]
+        for line in text.split("## Fallback")[1].split("##")[0].splitlines()
+        if line.startswith("| `")
+    }
+    assert rows["`float_args`"][5] == "60.0 ± 0.0"
+    assert rows["`overflow`"][5] == "60.0 ± 0.0"
+    assert rows["`keyword_args`"][5] == "not attempted"
 
 
 def test_render_warns_about_debug_builds():
@@ -334,7 +414,10 @@ def test_benchmark_entry_points_start(tmp_path):
     pytest.importorskip("pyperf")
     outputs = []
     for script, name in (
-        ("bench_runtime.py", r"^runtime\.ops_001\.snekit$"),
+        (
+            "bench_runtime.py",
+            r"^(runtime\.ops_001\.(snekit|fast_call)|fallback\.float_args\.fast_call)$",
+        ),
         ("bench_compilation.py", r"^compile\.lifecycle\.ops_001$"),
     ):
         output = tmp_path / f"{script}.json"
@@ -357,6 +440,8 @@ def test_benchmark_entry_points_start(tmp_path):
     results = report.load(outputs)
     assert set(results.benchmarks) == {
         "runtime.ops_001.snekit",
+        "runtime.ops_001.fast_call",
+        "fallback.float_args.fast_call",
         "compile.lifecycle.ops_001",
     }
     assert results.metadata["speedysnek_build"] in {"debug", "release"}
