@@ -47,8 +47,9 @@ use `@snekit`.
 function with `functools.wraps` (so `__name__`, `__qualname__`, `__doc__`,
 `__module__`, `__annotations__` and `__wrapped__` are preserved, and methods
 bind normally) and exposes `call_count`: the number of times the wrapper has
-been called, including calls that raised. Its increments are atomic, and it
-can be set to any `int` in the signed 64-bit range.
+been called, including calls that raised. It is an exact `int` with no
+upper bound, its increments are atomic, and it can be set to any integer
+(anything `operator.index` accepts).
 
 The wrapper is a native callable object, not a Python function: it has no
 `__code__`, `__defaults__` or `__globals__` of its own,
@@ -232,7 +233,7 @@ compiled(10, 20)  # 60, computed by generated machine code
 
 [`benchmarks/`](benchmarks) is a [pyperf](https://pyperf.readthedocs.io/)
 suite. It times the plain function, the warmed `@snekit` wrapper and the
-native fast call it makes, and separately the diagnostic `CompiledI64`
+native fast path called from Python, and separately the diagnostic `CompiledI64`
 path. It also measures fallback overhead, compilation and warmup cost,
 and cold import. The benchmarks are optional, and pyperf is not installed
 for ordinary users.

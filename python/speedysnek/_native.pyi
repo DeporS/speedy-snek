@@ -63,6 +63,8 @@ class NativeWrapper:
     """
 
     call_count: int
+    """Calls so far, raising ones included: exact, with no upper bound.
+    Setting it accepts anything ``operator.index`` accepts."""
     __annotate__: Callable[[int], dict[str, Any]] | None
     __annotations__: dict[str, Any]
     def __init__(

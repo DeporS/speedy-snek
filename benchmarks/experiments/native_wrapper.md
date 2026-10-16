@@ -33,8 +33,9 @@ kwargs dict into a new one. No custom vectorcall or other new `unsafe` code
 was written. The only `unsafe` in the change is the existing
 `PyLong_AsLongLongAndOverflow` helper, reused unchanged.
 
-**`NativeWrapper`** (`src/lib.rs`, about 250 lines) holds the original
-function, its existing Python `_JitState`, and an atomic `call_count`. Its
+**`NativeWrapper`** (`src/lib.rs`, about 350 lines) holds the original
+function, its existing Python `_JitState`, and an exact, atomic
+`call_count` (see [the counter](#the-call_count-counter)). Its
 `__call__` is the old Python wrapper's body, line for line:
 
 1. Count the call.
@@ -217,9 +218,10 @@ which are now documented and pinned by tests:
 - **`call_count`**:
   - Increments are atomic, so concurrent calls are no longer
     undercounted.
-  - It accepts only an `int` in the signed 64-bit range (`TypeError` or
-    `OverflowError` otherwise). Before, any value was stored and the next
-    call failed for a non-number.
+  - Setting it accepts any integer (anything `operator.index` accepts, of
+    any size) and raises `TypeError` for anything else when it is set.
+    Before, any value was stored and the next call failed for a
+    non-number.
   - It cannot be deleted. Before, deleting it made every later call raise
     `AttributeError`.
 - **No wrapper frame.** Tracebacks through `@snekit` no longer contain a
@@ -230,6 +232,76 @@ which are now documented and pinned by tests:
   rejected function still never loads the compiler.
 - **Frontend.** Analyzing a wrapper, as in `snekit(snekit(f))`, still
   rejects it, now as `NOT_A_FUNCTION` instead of `CLOSURE`.
+
+## The `call_count` counter
+
+Review follow-up. The first version kept the count in an `AtomicI64` and
+its setter accepted only i64 values. Setting `call_count = 2**63 - 1` and
+calling once wrapped the count to `-2**63`.
+
+The count is now `base + calls`:
+
+- `calls` is the `AtomicI64` that every call increments with one
+  `fetch_add`, before the original function or native code runs. Calls
+  that raise are therefore counted too.
+- `base` is an optional exact Python `int` (`None` means 0).
+
+When `fetch_add` returns `i64::MAX`, that increment wrapped `calls` to
+`i64::MIN` and lost exactly 2⁶⁴. A cold path then adds 2⁶⁴ to `base`.
+`calls` is never reset, so increments that land in between are not lost.
+
+- **No wrapping or saturation.** The count is exact beyond `i64::MAX`
+  and has no upper bound.
+- **Atomic under the GIL.** Between the wrap and the new `base` being
+  stored there is only exact-`int` arithmetic, which runs no Python code
+  and cannot switch threads. No thread can observe a wrapped `calls`
+  without its carry.
+- **Locks.** The `base` lock is held only to read or swap a pointer.
+  Replaced ints are released after it is dropped. `base` is visited by
+  `__traverse__`.
+- **Failure.** The carry can only fail with `MemoryError`. The increment
+  is then undone and the error propagates before the call runs, just as
+  when the old closure's `call_count += 1` failed.
+- **Setter.** It runs `operator.index` once, before changing any state.
+  Values in i64 go to `calls` (with `base = None`), larger or smaller
+  ones to `base` (with `calls = 0`). Setting the counter back to a normal
+  value works after an overflow.
+- **Getter.** Returns `calls` as an `int`, or `base + calls`.
+- **Setter range.** Accepting values outside i64 is a deliberate
+  expansion: the getter can now return them, so the setter accepts them
+  too. In-range values, `__index__` objects and the `TypeError` for
+  non-integers are unchanged.
+
+The ordinary path gains one well-predicted comparison of `fetch_add`'s
+result. A short A/B of warmed `ops_001`, alternating 4 processes of each
+build pinned to one CPU, gave 144–150 ns per call before and 127–143 ns
+after. That is no slowdown; the difference is attributed to noise or code
+layout, not to the change.
+
+## Benchmark reporting
+
+`benchmarks/report.py` used to present `@snekit − fast_call` as the
+wrapper's overhead and give both as percentages of one call. That holds
+only for the Python closure, which called `fast_call` itself. The
+native wrapper runs the fast path's Rust code directly, while the
+separately timed `fast_call` adds a Python method call that the wrapper
+never makes.
+
+The harness now records the architecture of the wrapper it benchmarked as
+the `speedysnek_wrapper` metadata (`native` or `python_closure`), read from
+the object `snekit` returns. The report then:
+
+- **Native results:** shows `@snekit` and `fast_call` side by side as
+  separate call paths, with no difference, components or percentages.
+- **Python closure results:** keeps the historical nested breakdown.
+- **Files that do not record it**, which includes every committed
+  baseline: says the architecture is not recorded and omits the
+  breakdown, unless `--assume-wrapper` states it.
+
+Regenerating the committed `RESULTS.md` with `--assume-wrapper
+python_closure` reproduces every table and number. The only additions are
+the line stating the wrapper architecture and one reworded diagnostic
+sentence. The committed report and raw data are unchanged.
 
 ## Limitations
 

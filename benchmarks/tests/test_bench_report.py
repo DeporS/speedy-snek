@@ -4,6 +4,7 @@ Nothing here measures or compares real timings.
 """
 
 import math
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -13,7 +14,9 @@ import pytest
 import report
 import workloads
 from report import (
+    NATIVE,
     NO_BREAK_EVEN,
+    PYTHON_CLOSURE,
     Results,
     Stats,
     break_even_calls,
@@ -36,8 +39,19 @@ def steady(seconds):
     return Stats(values=(seconds,) * 6, shortest_raw=0.1, processes=20)
 
 
-def synthetic(python_ns, snekit_ns, *, lifecycle_us=500.0, native_ns=None):
-    """Results where every workload has the same per-call times."""
+def synthetic(
+    python_ns,
+    snekit_ns,
+    *,
+    lifecycle_us=500.0,
+    native_ns=None,
+    wrapper=PYTHON_CLOSURE,
+):
+    """Results where every workload has the same per-call times.
+
+    ``wrapper`` is the recorded wrapper architecture, or ``None`` for
+    results that do not record it.
+    """
     native_ns = native_ns if native_ns is not None else snekit_ns / 4
     benchmarks = {}
     for ops in workloads.OP_COUNTS:
@@ -57,6 +71,9 @@ def synthetic(python_ns, snekit_ns, *, lifecycle_us=500.0, native_ns=None):
     return Results(
         benchmarks=benchmarks,
         metadata={"speedysnek_build": "release", "cpu_model_name": "Test CPU"},
+        wrapper_sources=[
+            ("runtime.json", wrapper, "missing" if wrapper is None else "recorded")
+        ],
     )
 
 
@@ -351,7 +368,7 @@ def test_render_tolerates_partial_results():
 # --- pyperf integration --------------------------------------------------
 
 
-def _write_suite(path, benchmarks):
+def _write_suite(path, benchmarks, metadata=None):
     pyperf = pytest.importorskip("pyperf")
     suite = None
     for name, values in benchmarks.items():
@@ -364,6 +381,7 @@ def _write_suite(path, benchmarks):
                     "loops": 1000,
                     "unit": "second",
                     "git_commit": commit,
+                    **(metadata or {}),
                 },
                 collect_metadata=False,
             )
@@ -460,3 +478,161 @@ def test_benchmark_entry_points_start(tmp_path):
         "compile.lifecycle.ops_001",
     }
     assert results.metadata["speedysnek_build"] in {"debug", "release"}
+    # The harness records the wrapper it actually benchmarked.
+    assert results.metadata["speedysnek_wrapper"] == NATIVE
+    assert report.wrapper(results) == NATIVE
+
+
+# --- Wrapper architecture --------------------------------------------------
+
+
+def _section(text, heading):
+    """The text under ``heading``, up to the next heading of any level."""
+    return re.split(r"\n#{2,3} ", text.split(heading)[1])[0]
+
+
+def test_python_closure_results_keep_the_nested_breakdown():
+    text = render(synthetic(python_ns=200, snekit_ns=1000, native_ns=100))
+    section = _section(text, "## Where a warmed `@snekit` call spends its time")
+    assert "decorator overhead" in section
+    assert "| `ops_005` | 1,000.0 | 900.0 (90%) | 100.0 (10%) |" in section
+    assert "the one native call a warmed `@snekit` call makes" in text
+    assert "native call alone (part of the overhead)" in text
+    assert "the largest part of a `@snekit` call is the decorator overhead" in text
+    assert "Python closure around one `fast_call`" in text
+
+
+def test_native_results_show_separate_paths():
+    results = synthetic(python_ns=200, snekit_ns=1000, native_ns=100, wrapper=NATIVE)
+    assert all(report.breakdown(results, ops) is None for ops in workloads.OP_COUNTS)
+    assert report.diagnostic_breakdown(results, 5) is not None
+    text = render(results)
+    section = _section(text, "## `@snekit` and the native fast call")
+    # Both measurements, side by side; no difference, share or component.
+    assert "| `ops_005` | 1,000.0 ± 0.0 | 100.0 ± 0.0 |" in section
+    header = next(line for line in section.splitlines() if line.startswith("| Work"))
+    assert header == "| Workload | `@snekit` | native fast call (from Python) |"
+    assert "%" not in section
+    assert "900.0" not in section
+    assert "not the wrapper's overhead" in section
+    # Nothing anywhere treats the fast call as a part of `@snekit`.
+    for stale in (
+        "decorator overhead",
+        "Where a warmed",
+        "closure",
+        "largest part",
+        "the one native call a warmed",
+        "native fast call alone",
+        "(part of the overhead)",
+    ):
+        assert stale not in text
+    assert "separate measurements of separate call paths" in text
+    assert "not a part of the overhead" in text
+    assert "### Diagnostic path (not part of warmed `@snekit`)" in text
+    assert "native `NativeWrapper`" in text
+
+
+def test_results_without_wrapper_metadata_omit_the_decomposition():
+    results = synthetic(python_ns=200, snekit_ns=1000, native_ns=100, wrapper=None)
+    assert report.wrapper(results) is None
+    assert report.breakdown(results, 5) is None
+    text = render(results)
+    section = _section(text, "## Where a warmed `@snekit` call spends its time")
+    assert section.strip().startswith("Not computed")
+    assert "--assume-wrapper" in section
+    assert "|" not in section
+    for stale in ("decorator overhead", "largest part", "(part of the overhead)"):
+        assert stale not in text
+    assert "| **`@snekit` wrapper** | not recorded in the results |" in text
+    # Measurements that do not depend on the architecture are still there.
+    assert "## Steady-state runtime" in text
+    assert "### Diagnostic path (not part of warmed `@snekit`)" in text
+    assert "## Break-even" in text
+
+
+@pytest.mark.parametrize(
+    ("sources", "expected", "description"),
+    [
+        ([], None, "not applicable (no call benchmarks)"),
+        ([("a", NATIVE, "recorded")], NATIVE, "native `NativeWrapper`"),
+        (
+            [("a", PYTHON_CLOSURE, "assumed")],
+            PYTHON_CLOSURE,
+            "(assumed with `--assume-wrapper`, not recorded in the results)",
+        ),
+        ([("a", None, "missing")], None, "not recorded in the results"),
+        (
+            [("a", NATIVE, "recorded"), ("b", None, "missing")],
+            None,
+            "unknown or mixed (a: native, b: not recorded)",
+        ),
+        (
+            [("a", NATIVE, "recorded"), ("b", PYTHON_CLOSURE, "recorded")],
+            None,
+            "unknown or mixed",
+        ),
+        ([("a", "future", "recorded")], None, "unknown or mixed (a: future)"),
+    ],
+)
+def test_wrapper_resolution(sources, expected, description):
+    results = Results(wrapper_sources=sources)
+    assert report.wrapper(results) == expected
+    assert description in report.describe_wrapper(results)
+
+
+def test_load_records_where_the_wrapper_comes_from(tmp_path):
+    call = {"runtime.ops_001.snekit": [5e-7, 5e-7, 5e-7]}
+    native = tmp_path / "native.json"
+    old = tmp_path / "old.json"
+    compile_only = tmp_path / "compile.json"
+    _write_suite(native, call, {"speedysnek_wrapper": NATIVE})
+    _write_suite(old, call)
+    _write_suite(compile_only, {"compile.lifecycle.ops_001": [1e-4, 1e-4, 1e-4]})
+
+    assert report.wrapper(report.load([native, compile_only])) == NATIVE
+    # Files that do not record it stay unknown unless it is stated.
+    unknown = report.load([old])
+    assert unknown.wrapper_sources == [("old.json", None, "missing")]
+    assert report.wrapper(unknown) is None
+    assumed = report.load([old], assume_wrapper=PYTHON_CLOSURE)
+    assert assumed.wrapper_sources == [("old.json", PYTHON_CLOSURE, "assumed")]
+    assert report.wrapper(assumed) == PYTHON_CLOSURE
+    # A recorded value always wins over the assumption.
+    recorded = report.load([native], assume_wrapper=PYTHON_CLOSURE)
+    assert report.wrapper(recorded) == NATIVE
+    # Mixing a recorded file with an unrecorded one decides nothing.
+    assert report.wrapper(report.load([native, old])) is None
+    with pytest.raises(ValueError):
+        report.load([old], assume_wrapper="pyhton")
+
+
+def test_main_assume_wrapper(tmp_path):
+    old = tmp_path / "old.json"
+    _write_suite(
+        old,
+        {
+            "runtime.ops_001.snekit": [5e-7, 5e-7, 5e-7],
+            "runtime.ops_001.fast_call": [1e-7, 1e-7, 1e-7],
+        },
+    )
+    output = tmp_path / "RESULTS.md"
+    assert report.main([str(old), "-o", str(output)]) == 0
+    assert "Not computed" in output.read_text(encoding="utf-8")
+    args = [str(old), "-o", str(output), "--assume-wrapper", PYTHON_CLOSURE]
+    assert report.main(args) == 0
+    assert "| `ops_001` | 500.0 | 400.0 (80%) | 100.0 (20%) |" in output.read_text(
+        encoding="utf-8"
+    )
+    with pytest.raises(SystemExit):
+        report.main([str(old), "--assume-wrapper", "closure"])
+
+
+def test_comparison_across_wrapper_architectures():
+    previous = synthetic(python_ns=200, snekit_ns=1000, wrapper=PYTHON_CLOSURE)
+    current = synthetic(python_ns=200, snekit_ns=400, wrapper=NATIVE)
+    labels = [label for label, *_ in report.comparison_rows(previous, current)]
+    assert "warmed `@snekit`, `ops_001`" in labels
+    text = render(current, comparisons=[("Closure", previous)])
+    comparison = _section(text, "## Comparison: Closure")
+    assert "`@snekit` wrapper: Python closure around one `fast_call`" in comparison
+    assert "complete public call" in comparison

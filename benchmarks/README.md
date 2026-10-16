@@ -85,8 +85,8 @@ python benchmarks/report.py results/runtime.json results/compilation.json \
     -o results/RESULTS.md
 ```
 
-The report gives the environment, a ratio table, a breakdown of the
-warmed `@snekit` call, a separate table for the diagnostic path, a fixed
+The report gives the environment, a ratio table, `@snekit` next to the
+native fast call, a separate table for the diagnostic path, a fixed
 versus per-operation fit with the estimated crossover, fallback
 overhead, compilation costs, break-even estimates and stability
 warnings. A *Key measurements* section is generated from the data.
@@ -94,6 +94,23 @@ warnings. A *Key measurements* section is generated from the data.
 `--compare LABEL FILE...` (repeatable) adds a before/after table against
 earlier results, including plain-Python rows that show how much the
 machine itself differs between the runs.
+
+How `@snekit` and the native fast call are presented depends on which
+wrapper was measured. The harness records it as the `speedysnek_wrapper`
+metadata, read from the object `snekit` returns:
+
+- **`native`**: the current `NativeWrapper`. The two are shown side by
+  side as separate call paths, never subtracted or given as shares of one
+  call.
+- **`python_closure`**: the earlier Python closure around exactly one
+  `fast_call`. The report shows the nested breakdown into decorator
+  overhead and fast call.
+
+Result files from before this metadata existed do not record it. The
+report then says the architecture is not recorded and omits the
+breakdown, unless `--assume-wrapper python_closure` (or `native`) states
+it. The flag applies only to files that do not record a value, including
+`--compare` inputs. Every committed baseline is `python_closure`.
 
 **Ratios are `layer time / Python time`. Below 1.0 the measured JIT path
 is faster; above 1.0 it is slower.**
@@ -121,6 +138,7 @@ python benchmarks/report.py \
     --compare "Stage 6 baseline (historical)" \
         benchmarks/baseline/stage6/runtime.json.gz \
         benchmarks/baseline/stage6/compilation.json.gz \
+    --assume-wrapper python_closure \
     --command "..." --interpretation benchmarks/interpretation.md \
     -o benchmarks/RESULTS.md
 ```
@@ -184,9 +202,14 @@ cache. `native_call` does the same work, but its conversion raises for
 rejected arguments, it always allocates a `Vec`, and it builds a
 `(status, value)` tuple. Neither layer rebuilds the arguments per call.
 
-Do not add the layers up. Only `snekit − fast_call` is a nested
-difference; `compiled_i64` and `native_call` are a separate path, and
-the report shows them in their own table.
+Do not add the layers up. With the native wrapper, `snekit` and
+`fast_call` are **separate call paths**: the wrapper runs the fast path's
+Rust code directly, while `fast_call` adds a Python method call that a
+warmed `@snekit` call never makes. Their difference is therefore not the
+wrapper's overhead. Only with the Python closure that `@snekit` used to
+return (the committed baseline) was `snekit − fast_call` a nested
+difference. `compiled_i64` and `native_call` are a separate path in
+either case, and the report shows them in their own table.
 
 Before anything is timed, `workloads.prepare_layers` runs in every pyperf
 worker:

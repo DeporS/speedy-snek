@@ -266,8 +266,9 @@ def snekit[F: Callable[..., Any]](func: F) -> F:
     :func:`inspect.isfunction` is false for it.
 
     The wrapper exposes ``call_count``: the number of times it has been
-    called, including calls that raised. It can be set to any ``int`` in
-    the signed 64-bit range.
+    called, including calls that raised. It is an exact ``int`` with no
+    upper bound, and it can be set to any integer (anything
+    :func:`operator.index` accepts).
 
     >>> @snekit
     ... def expression(a, b):

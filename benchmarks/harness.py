@@ -14,10 +14,11 @@ import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from types import FunctionType
 
 import pyperf
 
-from speedysnek import _native
+from speedysnek import _native, snekit
 from speedysnek._decorator import _WARMUP_CALLS
 
 REPOSITORY = Path(__file__).resolve().parent.parent
@@ -59,6 +60,7 @@ def environment_metadata() -> dict[str, str | int]:
     metadata: dict[str, str | int] = {
         "speedysnek_build": "debug" if _native.DEBUG_BUILD else "release",
         "speedysnek_warmup_calls": _WARMUP_CALLS,
+        "speedysnek_wrapper": wrapper_architecture(),
         "machine": platform.machine() or "unknown",
         "cpython_jit": _cpython_jit(),
     }
@@ -73,6 +75,22 @@ def environment_metadata() -> dict[str, str | int]:
         if output:
             metadata[key] = output
     return metadata
+
+
+def wrapper_architecture() -> str:
+    """Which ``@snekit`` wrapper this build returns, from the object itself.
+
+    ``report.py`` needs it: with the ``"python_closure"`` wrapper, a warmed
+    call is the closure around one ``fast_call``, so their difference is
+    the wrapper's overhead. The ``"native"`` wrapper runs the fast path's
+    Rust code directly, so ``snekit`` and ``fast_call`` are separate paths.
+    """
+    wrapper = snekit(lambda: None)
+    if type(wrapper) is getattr(_native, "NativeWrapper", None):
+        return "native"
+    if isinstance(wrapper, FunctionType):
+        return "python_closure"
+    raise RuntimeError(f"unknown @snekit wrapper type {type(wrapper).__name__}")
 
 
 def _cpython_jit() -> str:

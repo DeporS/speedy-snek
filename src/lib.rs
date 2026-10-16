@@ -193,6 +193,9 @@ mod _native {
     /// `types.MethodType`, used to bind a `NativeWrapper` like a function.
     static METHOD_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 
+    /// `operator.index`, used to accept a new `call_count`.
+    static OPERATOR_INDEX: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+
     /// The callable that `@snekit` returns (see `speedysnek._decorator`).
     ///
     /// It runs the decorator's per-call logic without a Python frame.
@@ -204,13 +207,24 @@ mod _native {
     /// Metadata copied by `functools.update_wrapper` lives in the instance
     /// `__dict__`, except `__annotate__` and `__annotations__`, which behave
     /// like a function's: computed lazily, cached, and kept consistent.
+    ///
+    /// `call_count` is exact and unbounded: it is `count_base + calls`, where
+    /// `calls` is the atomic counter every call increments and `count_base`
+    /// an optional Python `int` (`None` means 0). When an increment wraps
+    /// `calls` from `i64::MAX` to `i64::MIN`, it lost exactly 2**64, which
+    /// [`NativeWrapper::carry`] adds to `count_base`. `calls` is never reset,
+    /// so increments made meanwhile are never lost. The base is only changed
+    /// with the GIL held and by exact-`int` arithmetic, which runs no Python
+    /// code and lets no other thread run, so no thread can observe a
+    /// wrapped `calls` without its carry.
     #[pyclass(frozen, dict, weakref, module = "speedysnek._native")]
     struct NativeWrapper {
         func: Py<PyAny>,
         state: Py<PyAny>,
         /// `_Status.COLD`.
         cold: Py<PyAny>,
-        call_count: AtomicI64,
+        calls: AtomicI64,
+        count_base: Mutex<Option<Py<PyAny>>>,
         annotations: Mutex<Annotations>,
     }
 
@@ -229,20 +243,52 @@ mod _native {
                 func,
                 state,
                 cold,
-                call_count: AtomicI64::new(0),
+                calls: AtomicI64::new(0),
+                count_base: Mutex::new(None),
                 annotations: Mutex::default(),
             }
         }
 
-        /// The number of calls, including calls that raised.
+        /// The number of calls, including calls that raised: an exact
+        /// `int`, with no upper bound.
         #[getter]
-        fn get_call_count(&self) -> i64 {
-            self.call_count.load(Ordering::Relaxed)
+        fn get_call_count<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+            let base = self
+                .count_base
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|b| b.clone_ref(py));
+            let calls = self.calls.load(Ordering::Relaxed).into_pyobject(py)?;
+            match base {
+                None => Ok(calls.into_any()),
+                Some(base) => base.bind(py).add(calls),
+            }
         }
 
+        /// Accepts what `operator.index` accepts (an `int`, or an object
+        /// with `__index__`), of any size.
         #[setter]
-        fn set_call_count(&self, value: i64) {
-            self.call_count.store(value, Ordering::Relaxed);
+        fn set_call_count(&self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+            let py = value.py();
+            // Runs `__index__` once, before any state changes; the result is
+            // an exact `int`, so nothing below runs Python code.
+            let value = OPERATOR_INDEX
+                .import(py, "operator", "index")?
+                .call1((value,))?;
+            let (calls, base) = match value.extract::<i64>() {
+                Ok(calls) => (calls, None),
+                // Outside i64: keep the exact value as the base.
+                Err(_) => (0, Some(value.unbind())),
+            };
+            let old = {
+                let mut count_base = self.count_base.lock().unwrap();
+                self.calls.store(calls, Ordering::Relaxed);
+                std::mem::replace(&mut *count_base, base)
+            };
+            // Dropped without the lock held.
+            drop(old);
+            Ok(())
         }
 
         /// The same logic, line for line, as the Python closure `@snekit`
@@ -254,7 +300,10 @@ mod _native {
             args: &Bound<'py, PyTuple>,
             kwargs: Option<&Bound<'py, PyDict>>,
         ) -> PyResult<Bound<'py, PyAny>> {
-            self.call_count.fetch_add(1, Ordering::Relaxed);
+            // Counted first, so calls that raise are counted too.
+            if self.calls.fetch_add(1, Ordering::Relaxed) == i64::MAX {
+                self.carry(py)?;
+            }
             let func = self.func.bind(py);
             let state = self.state.bind(py);
             let mut spec = state.getattr(intern!(py, "specialization"))?;
@@ -411,8 +460,11 @@ mod _native {
             visit.call(&self.func)?;
             visit.call(&self.state)?;
             visit.call(&self.cold)?;
-            // Never contended: the lock is only taken with the GIL held,
+            // Never contended: these locks are only taken with the GIL held,
             // and never across a call into Python.
+            if let Ok(count_base) = self.count_base.try_lock() {
+                visit.call(&*count_base)?;
+            }
             if let Ok(annotations) = self.annotations.try_lock() {
                 visit.call(&annotations.annotate)?;
                 visit.call(&annotations.cached)?;
@@ -422,6 +474,42 @@ mod _native {
     }
 
     impl NativeWrapper {
+        /// Record the 2**64 that an increment from `i64::MAX` just lost.
+        ///
+        /// Only exact-`int` arithmetic happens between the wrap and the new
+        /// base being stored, so with the GIL held no other thread can run
+        /// in between (see the struct documentation). The only possible
+        /// error is a `MemoryError`; the increment is then undone and the
+        /// error propagates before the call runs, exactly as when the old
+        /// Python closure's `call_count += 1` failed.
+        #[cold]
+        fn carry(&self, py: Python<'_>) -> PyResult<()> {
+            let new_base = (|| {
+                let base = self
+                    .count_base
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|b| b.clone_ref(py));
+                let carry = (1_u128 << 64).into_pyobject(py)?.into_any();
+                match base {
+                    None => Ok(carry),
+                    Some(base) => base.bind(py).add(carry),
+                }
+            })();
+            let new_base = match new_base {
+                Ok(new_base) => new_base,
+                Err(error) => {
+                    self.calls.fetch_sub(1, Ordering::Relaxed);
+                    return Err(error);
+                }
+            };
+            let old = self.count_base.lock().unwrap().replace(new_base.unbind());
+            // Dropped without the lock held.
+            drop(old);
+            Ok(())
+        }
+
         fn replace_annotations(&self, value: Option<Py<PyAny>>) -> PyResult<()> {
             let old = {
                 let mut annotations = self.annotations.lock().unwrap();

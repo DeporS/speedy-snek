@@ -312,18 +312,100 @@ def test_call_count_can_be_set_to_an_int():
     assert type(add.call_count) is int
 
 
+def _count_in_threads(f, start, threads=4, calls=5000):
+    f.call_count = start
+    workers = [
+        threading.Thread(target=lambda: [f(i, 1) for i in range(calls)])
+        for _ in range(threads)
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+    return f.call_count - start
+
+
 def test_call_count_is_exact_under_threads():
     add = warmed(make_add(), 1, 2)
+    assert _count_in_threads(add, 0) == 20000
+
+
+# The counter is an ``i64`` that every call increments, plus an exact
+# Python ``int`` that takes over beyond the i64 range.
+I64_MAX = 2**63 - 1
+
+
+def test_call_count_crosses_the_i64_limit_exactly():
+    add = warmed(make_add(), 1, 2)
+    add.call_count = I64_MAX
+    assert add(1, 2) == 3
+    assert add.call_count == I64_MAX + 1
+    assert type(add.call_count) is int
+
+
+def test_call_count_keeps_counting_after_crossing():
+    add = make_add()
+    add.call_count = I64_MAX - 2
+    for i in range(1, 11):
+        add(1, 2)
+        assert add.call_count == I64_MAX - 2 + i
+    assert add.call_count == I64_MAX + 8
+
+
+def test_call_count_crosses_on_a_call_that_raises():
+    @snekit
+    def fails(a):
+        raise ValueError(a)
+
+    fails.call_count = I64_MAX
+    with pytest.raises(ValueError) as excinfo:
+        fails("boom")
+    # The original function ran and raised normally.
+    assert excinfo.value.args == ("boom",)
+    assert excinfo.value.__context__ is None
+    assert fails.call_count == I64_MAX + 1
+    with pytest.raises(ValueError):
+        fails("again")
+    assert fails.call_count == I64_MAX + 2
+
+
+def test_call_count_crosses_on_a_native_call_and_a_guard_miss():
+    add = warmed(make_add(), 1, 2)
+    calls = native_calls(add)
+    add.call_count = I64_MAX
+    assert add(20, 22) == 42  # native
+    assert add(0.5, 1) == 1.5  # guard miss
+    assert native_calls(add) == calls + 2
+    assert add.call_count == I64_MAX + 2
+
+
+def test_call_count_can_be_reset_after_overflow():
+    add = make_add()
+    add.call_count = I64_MAX
+    add(1, 2)
     add.call_count = 0
-    threads = [
-        threading.Thread(target=lambda: [add(i, 1) for i in range(5000)])
-        for _ in range(4)
-    ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-    assert add.call_count == 20000
+    add(1, 2)
+    assert add.call_count == 1
+    add.call_count = I64_MAX
+    add(1, 2)
+    add(1, 2)
+    assert add.call_count == I64_MAX + 2
+
+
+@pytest.mark.parametrize("start", [2**64, 2**200, -(2**63) - 1, -(2**100)])
+def test_call_count_accepts_ints_beyond_i64(start):
+    add = make_add()
+    add.call_count = start
+    assert add.call_count == start
+    add(1, 2)
+    add(1, 2)
+    assert add.call_count == start + 2
+    assert type(add.call_count) is int
+
+
+def test_call_count_crosses_the_limit_under_threads():
+    add = warmed(make_add(), 1, 2)
+    assert _count_in_threads(add, I64_MAX - 7000) == 20000
 
 
 def test_defaults_and_code_changes_reach_the_original():
@@ -466,15 +548,20 @@ def test_the_wrapper_is_not_a_function():
     assert not hasattr(add, "__globals__")
 
 
-def test_call_count_accepts_only_ints_in_i64_range():
+def test_call_count_accepts_only_integers():
+    # A function wrapper stored any value, and failed on the next call for
+    # a non-number. The native wrapper accepts what ``operator.index``
+    # accepts, of any size, and rejects the rest when it is set.
     add = make_add()
-    with pytest.raises(TypeError):
-        add.call_count = 1.5
-    with pytest.raises(OverflowError):
-        add.call_count = 2**63
+    add.call_count = True
+    assert add.call_count == 1
+    assert type(add.call_count) is int
+    for value in (1.5, "1", None):
+        with pytest.raises(TypeError, match="cannot be interpreted as an integer"):
+            add.call_count = value
     with pytest.raises(AttributeError):
         del add.call_count
-    assert add.call_count == 0
+    assert add.call_count == 1
 
 
 def test_profilers_see_no_wrapper_frame():
