@@ -115,12 +115,13 @@ def test_rejects_non_callable():
         jit(42)
 
 
-def test_wrapper_gains_no_new_attributes():
+def test_wrapper_gains_no_new_public_attributes():
     def add(a, b):
         return a + b
 
     wrapped = jit(add)
-    assert vars(wrapped).keys() == {"__wrapped__", "call_count"}
+    # ``_jit_state`` is private diagnostic state (see test_jit_compile.py).
+    assert vars(wrapped).keys() == {"__wrapped__", "call_count", "_jit_state"}
     assert wrapped.__wrapped__ is add
 
 

@@ -32,7 +32,7 @@ Running a program has three steps, each with its own failure mode:
 2. Guards check the runtime arguments against the current specialization:
    every argument the program reads must be an exact ``int``. Otherwise
    :class:`GuardFailure` is raised. The program is fine; it just does not
-   apply to these arguments, and a future JIT will fall back to CPython.
+   apply to these arguments.
 3. The stack machine executes the program. Once validation and guards pass,
    this step cannot fail (short of running out of memory).
 
@@ -40,8 +40,9 @@ Arithmetic uses ordinary Python ``int`` operations, so results have
 arbitrary precision exactly like CPython. There is deliberately no 64-bit
 wrap-around or overflow check.
 
-The interpreter is not connected to :func:`speedysnek.jit` and is not part
-of the public API.
+:func:`speedysnek.jit` never uses the interpreter: it runs either native code
+or the original function. The interpreter remains the tests' oracle, and is
+not part of the public API.
 """
 
 from __future__ import annotations
