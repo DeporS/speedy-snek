@@ -11,14 +11,14 @@ after a short warmup, to signed 64-bit machine code with Cranelift.
 Everything else, including every unsupported function, argument or call,
 safely falls back to normal Python.
 
-The project now has a reproducible [benchmark suite](benchmarks/README.md)
+The project has a reproducible [benchmark suite](benchmarks/README.md)
 measuring where the time goes. **The optimizer is experimental, and for
-most functions it currently makes calls slower, not faster.** On the
+small functions it still makes calls slower, not faster.** On the
 committed baseline machine, a warmed `@snekit` call has a fixed cost of
-about 1.2 µs. That makes it 25× slower than plain Python for a one-operation
-function, still 1.3× slower at 100 operations, and faster (0.59×) only at
-250 operations. See [Benchmarks](#benchmarks) and
-[`benchmarks/RESULTS.md`](benchmarks/RESULTS.md).
+about 500 ns. That makes it 7.7× slower than plain Python for a
+one-operation function and 1.4× slower at 20 operations. It is faster from
+about 30 operations up: 0.61× at 50, 0.16× at 250. See
+[Benchmarks](#benchmarks) and [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md).
 
 ## Usage
 
@@ -63,6 +63,18 @@ decorated function
     → original CPython function otherwise
 ```
 
+Once compiled, a call that fits makes exactly one native call, with no
+Python code in between:
+
+```
+@snekit wrapper
+    → native fast call (Rust)
+        → validate every argument once: exact int, inside signed 64-bit
+        → run the machine code, which checks every operation for overflow
+        → return the result int, or None for a guard miss
+    → original function, only if the result was None
+```
+
 Each decorated function has its own small state machine:
 
 - **Cold.** The first 8 calls run the original function. Nothing is
@@ -81,7 +93,11 @@ Each decorated function has its own small state machine:
   range, or a `+`, `-` or `*` that would overflow, even in an intermediate
   value), **that call** runs the original function, which computes Python's
   exact arbitrary-precision result. The native code stays cached for later
-  calls.
+  calls. Such a guard miss is expected, so it is reported with a cheap
+  `None` sentinel, not an exception, and the guards never run any of the
+  argument's Python code (no `__index__`, `__int__`, `__repr__` or
+  metaclass hooks). Only an unexpected error from the native code
+  disables the specialization.
 - **Disabled.** If the function is outside the supported subset (branches,
   loops, calls, globals, closures, generators, async functions, keyword
   arguments, …), the backend cannot compile it, or the compiler fails
@@ -188,22 +204,32 @@ compiled(10, 20)  # 60, computed by generated machine code
   arguments and constants).
 - It never returns a wrapped 64-bit value. Constants outside the signed
   64-bit range are rejected at compile time (`UnsupportedProgramError`).
-  Arguments that are not exact `int`s in that range, a wrong number of
-  arguments, or any `+`, `-` or `*` that overflows raise
-  `NativeGuardFailure` instead. `@snekit` handles both by running the original
-  Python function.
+  At call time, arguments that are not exact `int`s in that range, a wrong
+  number of arguments, or any `+`, `-` or `*` that overflows are a guard
+  miss.
+- A compiled program has two entry points:
+  - `compiled(*args)`, the **diagnostic** path, raises
+    `NativeGuardFailure` with the exact reason for a miss (wrong arity, not
+    an exact `int`, outside i64, or overflow at a given instruction). It
+    checks the arguments in Python, then again in Rust. Tests and direct
+    users of the compiler rely on it.
+  - `compiled.fast_call(args)`, the **fast** path that `@snekit` uses,
+    checks the arguments once, in Rust, and returns the result `int`, or
+    `None` for any miss, without raising and without saying why.
 - Every generated function has the same internal ABI,
   `status = f(args_ptr, args_len, result_ptr)`, with overflow handled by
   explicit branches rather than traps.
-- It is not yet faster than Python; see [Benchmarks](#benchmarks).
+- Native code beats Python by a wide margin per operation, but each call
+  still has a fixed cost; see [Benchmarks](#benchmarks).
 
 ## Benchmarks
 
 [`benchmarks/`](benchmarks) is a [pyperf](https://pyperf.readthedocs.io/)
-suite. It times the plain function, the warmed `@snekit` wrapper, the
-internal `CompiledI64` object and the raw native call separately, along
-with fallback overhead, compilation and warmup cost, and cold import. The
-benchmarks are optional, and pyperf is not installed for ordinary users.
+suite. It times the plain function, the warmed `@snekit` wrapper and the
+native fast call it makes, and separately the diagnostic `CompiledI64`
+path. It also measures fallback overhead, compilation and warmup cost,
+and cold import. The benchmarks are optional, and pyperf is not installed
+for ordinary users.
 
 ```sh
 python -m pip install maturin
@@ -224,26 +250,32 @@ python benchmarks/report.py results/runtime.json results/compilation.json \
 [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md) is one committed baseline
 from one machine, not a universal claim. It was measured on a shared
 4-vCPU KVM guest with CPython 3.14.6 and a release build; most benchmarks
-show 10–25% noise. On that machine:
+show 15–25% noise. That machine ran plain Python much slower than during
+the previous baseline, so the previous code was measured again in the
+same session as a controlled comparison. On that machine:
 
-- A warmed `@snekit` call is **slower than plain Python for 1 to 100
-  operations**: 25.2× at 1, 5.9× at 20 and 1.33× at 100. It beats Python
-  only for the 250-operation workload (0.59×). A separate repeat run
-  confirmed both of the results closest to parity.
-- Only that workload breaks even, after about 8,300 calls (an 8.3 ms
-  warmup-and-compile lifecycle, saving about 1 µs per call).
-- The generated machine code is not the bottleneck. The raw native call
-  costs about 0.7 ns per extra operation, against about 9.5 ns in Python.
-  Most of each warmed call (55–66%) goes to the Python-level argument
-  guards in `CompiledI64.__call__`, and another 21–33% to the decorator
-  wrapper.
-- Fallback calls cost 220–375 ns extra when native code is skipped, and
-  1.65–2.24 µs extra when a guard rejects the arguments (`float`, large
-  `int`, overflow).
+- Removing the Python guard layer made a warmed `@snekit` call **about
+  2.5–3× cheaper** than the previous code: 1,446 → 544 ns at 1 operation
+  and 1,741 → 725 ns at 250. Its fixed cost fell from about 1.45 µs to
+  about 500 ns.
+- Warmed `@snekit` is now **faster than plain Python from about 30
+  operations** (0.61× at 50, 0.36× at 100, 0.16× at 250). It is still
+  slower for smaller functions: 7.7× at 1 operation, 3.6× at 5 and 1.4× at
+  20. The previous code crossed over at about 94 operations in the same
+  session (134 in the previous baseline).
+- Three workloads now break even, after about 7,200 (`ops_050`), 4,500
+  (`ops_100`) and 3,200 (`ops_250`) calls; previously only `ops_250` did.
+- A guard miss (`float`, an `int` outside i64, overflow) now costs 430–515
+  ns over plain Python instead of 1.9–2.8 µs, because it no longer raises
+  and catches an exception. Paths that skip native code are unchanged
+  (315–525 ns extra).
+- The **decorator wrapper itself** is now the largest cost: 340–430 ns,
+  56–78% of a warmed call. The native fast call costs about 112 ns plus
+  0.84 ns per operation (Python: about 18 ns per operation on this
+  machine).
 
 The [interpretation](benchmarks/RESULTS.md#interpretation) recommends
-next moving argument validation out of the Python guard layer, so the
-wrapper calls native code directly.
+making the wrapper cheaper next.
 
 [`benchmarks/README.md`](benchmarks/README.md) explains the methodology,
 how to get more stable numbers, and how to update the baseline.

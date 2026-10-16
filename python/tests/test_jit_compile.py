@@ -574,7 +574,7 @@ def test_exceptions_after_a_guard_failure_propagate_unchanged():
         with pytest.raises(ValueError) as excinfo:
             add(1, Raises())
     assert excinfo.value is error
-    # Not chained to the internal NativeGuardFailure.
+    # Not chained to anything from the native attempt.
     assert excinfo.value.__context__ is None
     assert excinfo.value.__cause__ is None
     assert calls[add.__wrapped__.__code__] == 1
