@@ -1,7 +1,10 @@
 .venv/
 target/
+dist/
 __pycache__/
+.pytest_cache/
 *.py[cod]
+*.so
 *.pyd
 
 test.md
