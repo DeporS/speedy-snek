@@ -41,7 +41,7 @@ function never reads; the stricter rule only ever causes a guard failure.
 Nothing here calls the original Python function, and no guard runs Python
 code on an argument: only ``type(value) is int`` and integer comparisons.
 
-:func:`speedysnek.jit` compiles a hot function here once and caches the
+:func:`speedysnek.snekit` compiles a hot function here once and caches the
 :class:`CompiledI64`. It runs the original Python function instead when
 :class:`UnsupportedProgramError` is raised at compile time (from then on)
 or :class:`NativeGuardFailure` at call time (for that call only). The

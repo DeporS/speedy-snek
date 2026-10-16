@@ -1,4 +1,4 @@
-"""Tests for Stage 5: ``@jit`` warmup, compilation, guards and fallback.
+"""Tests for Stage 5: ``@snekit`` warmup, compilation, guards and fallback.
 
 Native execution is proven with ``sys.setprofile``, never inferred from an
 equal result: a native call runs ``CompiledI64.__call__`` and no frame of
@@ -19,7 +19,7 @@ import time
 import pytest
 
 import speedysnek
-from speedysnek import _compiler, _decorator, _frontend, jit
+from speedysnek import _compiler, _decorator, _frontend, snekit
 from speedysnek._compiler import I64_MAX, I64_MIN, CompiledI64, NativeGuardFailure
 from speedysnek._decorator import (
     _WARMUP_CALLS,
@@ -107,7 +107,7 @@ def compile_spy(monkeypatch):
 
 
 def make_add():
-    @jit
+    @snekit
     def add(a, b):
         return a + b
 
@@ -115,7 +115,7 @@ def make_add():
 
 
 def make_expression():
-    @jit
+    @snekit
     def expression(a, b):
         return (a + b) * 2
 
@@ -162,7 +162,7 @@ def test_compiled_code_is_cached_and_reused(compile_spy):
 
 
 def test_compilation_uses_the_full_positional_arity(compile_spy):
-    @jit
+    @snekit
     def second(a, b, c):
         return b
 
@@ -276,7 +276,7 @@ def test_i64_boundary_values(args, expected):
 
 
 def test_constants_and_negative_values():
-    @jit
+    @snekit
     def f(a, b, c):
         return (a - 1000) * b - c * -3
 
@@ -288,7 +288,7 @@ def test_constants_and_negative_values():
 
 
 def test_zero_argument_function():
-    @jit
+    @snekit
     def answer():
         return 6 * 7
 
@@ -356,7 +356,7 @@ def test_guard_failures_fall_back_to_python(args, expected):
 def test_overflow_falls_back_to_exact_python_result(source, args, expected):
     namespace = {}
     exec(f"def f(a, b):\n    return {source}\n", namespace)
-    f = compiled(jit(namespace["f"]), 1, 2)
+    f = compiled(snekit(namespace["f"]), 1, 2)
     result, native_calls = assert_python(f, *args)
     assert (result, native_calls) == (expected, 1)
     assert state_of(f).status is _Status.COMPILED
@@ -379,7 +379,7 @@ def test_keyword_arguments_use_python():
 
 
 def test_default_arguments_use_python():
-    @jit
+    @snekit
     def f(a, b=5):
         return a + b
 
@@ -443,7 +443,7 @@ def test_guard_failures_never_leak():
         try:
             add(*args)
         except NativeGuardFailure:  # pragma: no cover - the failure mode
-            pytest.fail("NativeGuardFailure leaked through @jit")
+            pytest.fail("NativeGuardFailure leaked through @snekit")
 
 
 # --- Unsupported functions -----------------------------------------------
@@ -516,7 +516,7 @@ UNSUPPORTED = [
 
 @pytest.mark.parametrize(("func", "args", "reason"), UNSUPPORTED)
 def test_unsupported_functions_keep_working(func, args, reason, compile_spy):
-    f = jit(func)
+    f = snekit(func)
     expected = func(*args)
     for _ in range(_WARMUP_CALLS + 20):
         assert f(*args) == expected
@@ -539,15 +539,15 @@ def test_rejection_is_not_retried(monkeypatch):
         return real(func)
 
     monkeypatch.setattr(_frontend, "analyze", spy)
-    f = jit(_branch)
+    f = snekit(_branch)
     for _ in range(_WARMUP_CALLS * 5):
         f(3)
     assert analyses == [_branch]
 
 
 def test_generators_and_coroutines_keep_working():
-    gen = jit(_generator)
-    coro = jit(_coroutine)
+    gen = snekit(_generator)
+    coro = snekit(_coroutine)
     for _ in range(_WARMUP_CALLS + 2):
         assert list(gen(3)) == [0, 1, 2]
         assert asyncio.run(coro(1, 2)) == 3
@@ -556,7 +556,7 @@ def test_generators_and_coroutines_keep_working():
 
 
 def test_backend_unsupported_program_disables():
-    @jit
+    @snekit
     def huge(a):
         return a + 10**30  # Folded into one constant outside i64.
 
@@ -645,7 +645,7 @@ def test_original_exceptions_propagate_unchanged(phase):
 
     if phase == "disabled":
 
-        @jit
+        @snekit
         def f(a, b):
             if a:
                 pass
@@ -728,7 +728,7 @@ def test_metadata_is_preserved_after_compilation():
         """Add two numbers."""
         return a + b
 
-    wrapped = compiled(jit(original), 1, 2)
+    wrapped = compiled(snekit(original), 1, 2)
     assert wrapped.__name__ == "original"
     assert wrapped.__qualname__ == original.__qualname__
     assert wrapped.__module__ == original.__module__
@@ -741,11 +741,11 @@ class Scaled:
     def __init__(self, factor):
         self.factor = factor
 
-    @jit
+    @snekit
     def double(self, x):
         return x * 2
 
-    @jit
+    @snekit
     def scale(self, x):
         return self.factor * x
 
@@ -777,7 +777,7 @@ def test_methods_reading_attributes_stay_in_python():
 
 def test_rejects_non_callable():
     with pytest.raises(TypeError):
-        jit(None)
+        snekit(None)
 
 
 # --- Threading -----------------------------------------------------------
@@ -837,11 +837,11 @@ def loaded():
 
 report = {"import": loaded()}
 
-@speedysnek.jit
+@speedysnek.snekit
 def add(a, b):
     return a + b
 
-@speedysnek.jit
+@speedysnek.snekit
 def divide(a, b):
     return a / b
 
@@ -875,9 +875,9 @@ def test_compilation_modules_are_imported_lazily():
 
 def test_public_api_is_unchanged_after_compilation():
     compiled(make_add(), 1, 2)
-    assert speedysnek.__all__ == ["jit"]
+    assert speedysnek.__all__ == ["snekit", "jit"]
     public = {name for name in dir(speedysnek) if not name.startswith("_")}
-    assert public == {"jit"}
+    assert public == {"snekit", "jit"}
     for name in (
         "CompiledI64",
         "NativeGuardFailure",

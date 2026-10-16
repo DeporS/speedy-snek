@@ -39,6 +39,8 @@ mod _native {
         m.add("STATUS_OVERFLOW", STATUS_OVERFLOW)?;
         m.add("STATUS_BAD_ARITY", STATUS_BAD_ARITY)?;
         m.add("MAX_ARGS", MAX_ARGS)?;
+        // Lets benchmarks record, and warn about, unrepresentative builds.
+        m.add("DEBUG_BUILD", cfg!(debug_assertions))?;
         m.add("CodegenError", m.py().get_type::<CodegenError>())?;
         Ok(())
     }

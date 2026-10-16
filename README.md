@@ -2,21 +2,30 @@
 
 Because Python doesn’t have to be a slow snek 🐍
 
-SpeedySnek is a small educational JIT compiler experiment for CPython 3.14.
-It is at Stage 5: **`@jit` now performs experimental native compilation**.
-A decorated function in the supported straight-line integer subset is
-compiled once, after a short warmup, to signed 64-bit machine code with
-Cranelift. Everything else keeps running as normal Python.
+Need more speed? Just `@snekit`.
 
-**No performance claims are made yet.** There are no benchmarks, and the
-wrapper's per-call overhead has not been optimized; that is the next stage.
+SpeedySnek is a small educational JIT compiler experiment for CPython 3.14.
+**`@snekit` performs experimental native compilation**: a decorated
+function in the supported straight-line integer subset is compiled once,
+after a short warmup, to signed 64-bit machine code with Cranelift.
+Everything else, including every unsupported function, argument or call,
+safely falls back to normal Python.
+
+The project now has a reproducible [benchmark suite](benchmarks/README.md)
+measuring where the time goes. **The optimizer is experimental, and for
+most functions it currently makes calls slower, not faster.** On the
+committed baseline machine, a warmed `@snekit` call has a fixed cost of
+about 1.2 µs. That makes it 25× slower than plain Python for a one-operation
+function, still 1.3× slower at 100 operations, and faster (0.59×) only at
+250 operations. See [Benchmarks](#benchmarks) and
+[`benchmarks/RESULTS.md`](benchmarks/RESULTS.md).
 
 ## Usage
 
 ```python
-from speedysnek import jit
+from speedysnek import snekit
 
-@jit
+@snekit
 def expression(a, b):
     return (a + b) * 2
 
@@ -27,7 +36,14 @@ expression(2**62, 2**62)          # 18446744073709551616, computed by Python
 expression.call_count             # 101
 ```
 
-`@jit` must never change what a call returns or raises. It wraps the
+`@jit` is the descriptive, backwards-compatible name for the same
+decorator: `speedysnek.jit is speedysnek.snekit`, so existing
+`from speedysnek import jit` code keeps working unchanged. New code should
+use `@snekit`.
+
+### Guarantees
+
+`@snekit` must never change what a call returns or raises. It wraps the
 function with `functools.wraps` (so `__name__`, `__qualname__`, `__doc__`,
 `__module__`, `__annotations__` and `__wrapped__` are preserved, and methods
 bind normally) and exposes `call_count`: the number of times the wrapper has
@@ -85,7 +101,7 @@ Native Rust code lives in the private `speedysnek._native` extension module.
 Python function
     → CPython 3.14 bytecode frontend
     → normalized IR
-    → reference interpreter (test oracle) or Cranelift i64 backend (@jit)
+    → reference interpreter (test oracle) or Cranelift i64 backend (@snekit)
 ```
 
 The private `speedysnek._frontend` package implements the first two
@@ -115,7 +131,7 @@ Current status:
   closures, generators, async functions, non-`int` constants, …) is
   rejected with a machine-readable reason and, where applicable, the
   offending CPython opcode and bytecode offset.
-- `@jit` runs the frontend once per hot function. It is not public API.
+- `@snekit` runs the frontend once per hot function. It is not public API.
 - All CPython 3.14-specific handling lives in
   `python/speedysnek/_frontend/cpython314.py`.
 
@@ -147,7 +163,7 @@ execute(program, args=(5,))  # 10
   stack values, …) raise `InvalidProgramError`, which means a compiler bug.
 - Arithmetic uses Python `int`, so **arbitrary precision is intentional**:
   `2**63 + 1` is not wrapped to a 64-bit value.
-- `@jit` never uses it; it is used by the tests and is not public API.
+- `@snekit` never uses it; it is used by the tests and is not public API.
 
 ### Cranelift i64 backend
 
@@ -166,7 +182,7 @@ compiled = compile_i64(analyze(expression).instructions)
 compiled(10, 20)  # 60, computed by generated machine code
 ```
 
-- It is **private and experimental**. `@jit` uses it to compile hot
+- It is **private and experimental**. `@snekit` uses it to compile hot
   functions.
 - It supports only the current arithmetic subset (`+`, `-`, `*` on
   arguments and constants).
@@ -174,12 +190,63 @@ compiled(10, 20)  # 60, computed by generated machine code
   64-bit range are rejected at compile time (`UnsupportedProgramError`).
   Arguments that are not exact `int`s in that range, a wrong number of
   arguments, or any `+`, `-` or `*` that overflows raise
-  `NativeGuardFailure` instead. `@jit` handles both by running the original
+  `NativeGuardFailure` instead. `@snekit` handles both by running the original
   Python function.
 - Every generated function has the same internal ABI,
   `status = f(args_ptr, args_len, result_ptr)`, with overflow handled by
   explicit branches rather than traps.
-- No performance claims are made: there are no benchmarks yet.
+- It is not yet faster than Python; see [Benchmarks](#benchmarks).
+
+## Benchmarks
+
+[`benchmarks/`](benchmarks) is a [pyperf](https://pyperf.readthedocs.io/)
+suite. It times the plain function, the warmed `@snekit` wrapper, the
+internal `CompiledI64` object and the raw native call separately, along
+with fallback overhead, compilation and warmup cost, and cold import. The
+benchmarks are optional, and pyperf is not installed for ordinary users.
+
+```sh
+python -m pip install maturin
+python -m pip install -e ".[tests,benchmarks]"   # builds a release extension
+maturin develop --release                         # after every Rust change
+
+mkdir -p results
+python benchmarks/bench_runtime.py     -o results/runtime.json
+python benchmarks/bench_compilation.py -o results/compilation.json
+python benchmarks/report.py results/runtime.json results/compilation.json \
+    -o results/RESULTS.md
+```
+
+> **Debug builds are not representative.** A plain `maturin develop`
+> builds an unoptimized extension that is many times slower; the scripts
+> warn about it and the report records the build mode.
+
+[`benchmarks/RESULTS.md`](benchmarks/RESULTS.md) is one committed baseline
+from one machine, not a universal claim. It was measured on a shared
+4-vCPU KVM guest with CPython 3.14.6 and a release build; most benchmarks
+show 10–25% noise. On that machine:
+
+- A warmed `@snekit` call is **slower than plain Python for 1 to 100
+  operations**: 25.2× at 1, 5.9× at 20 and 1.33× at 100. It beats Python
+  only for the 250-operation workload (0.59×). A separate repeat run
+  confirmed both of the results closest to parity.
+- Only that workload breaks even, after about 8,300 calls (an 8.3 ms
+  warmup-and-compile lifecycle, saving about 1 µs per call).
+- The generated machine code is not the bottleneck. The raw native call
+  costs about 0.7 ns per extra operation, against about 9.5 ns in Python.
+  Most of each warmed call (55–66%) goes to the Python-level argument
+  guards in `CompiledI64.__call__`, and another 21–33% to the decorator
+  wrapper.
+- Fallback calls cost 220–375 ns extra when native code is skipped, and
+  1.65–2.24 µs extra when a guard rejects the arguments (`float`, large
+  `int`, overflow).
+
+The [interpretation](benchmarks/RESULTS.md#interpretation) recommends
+next moving argument validation out of the Python guard layer, so the
+wrapper calls native code directly.
+
+[`benchmarks/README.md`](benchmarks/README.md) explains the methodology,
+how to get more stable numbers, and how to update the baseline.
 
 ## Development
 
@@ -187,7 +254,11 @@ Requires CPython 3.14 and a Rust toolchain.
 
 ```sh
 python -m venv .venv && source .venv/bin/activate
-pip install maturin pytest
-maturin develop
+python -m pip install maturin
+python -m pip install -e ".[tests,benchmarks]"
+maturin develop --release
 pytest
 ```
+
+`pytest` runs the compiler tests in `python/tests/` and the benchmark
+correctness tests in `benchmarks/tests/`. No test asserts a timing.

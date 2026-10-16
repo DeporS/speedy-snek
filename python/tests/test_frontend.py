@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 import speedysnek
-from speedysnek import _frontend, jit
+from speedysnek import _frontend, snekit
 from speedysnek._frontend import (
     Analysis,
     Instruction,
@@ -257,7 +257,7 @@ def test_analysis_does_not_call_the_function():
 
 
 def test_analyzing_a_jit_wrapper_does_not_call_it():
-    @jit
+    @snekit
     def add(a, b):
         return a + b
 

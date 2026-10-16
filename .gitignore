@@ -8,3 +8,6 @@ __pycache__/
 *.pyd
 
 test.md
+
+# Local benchmark output (the committed baseline lives in benchmarks/baseline/).
+/results/

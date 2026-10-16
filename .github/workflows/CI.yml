@@ -26,8 +26,8 @@ jobs:
       - name: Ruff
         run: |
           python -m pip install ruff
-          ruff format --check python
-          ruff check python
+          ruff format --check python benchmarks
+          ruff check python benchmarks
 
   test:
     name: test (${{ matrix.os }}, CPython 3.14)
@@ -43,6 +43,9 @@ jobs:
         with:
           python-version: "3.14"
       - name: Build and install
-        run: python -m pip install ".[tests]"
+        run: python -m pip install ".[tests,benchmarks]"
+      # Includes the benchmark suite's correctness tests and a single-value
+      # smoke run of each benchmark script. No timings are compared: the
+      # full performance suite never runs in CI.
       - name: Test
         run: python -m pytest -v

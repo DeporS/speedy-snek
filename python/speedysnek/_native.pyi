@@ -17,6 +17,11 @@ STATUS_BAD_ARITY: int
 
 MAX_ARGS: int
 
+# ``True`` when the extension was built with debug assertions, as by a plain
+# ``maturin develop``. Benchmarks record it; debug builds are not
+# representative.
+DEBUG_BUILD: bool
+
 class CodegenError(RuntimeError):
     """Cranelift could not compile a valid program for this host."""
 

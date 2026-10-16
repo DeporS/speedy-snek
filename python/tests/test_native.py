@@ -12,3 +12,7 @@ def test_sum_as_string_rejects_negative():
     # The Rust signature takes ``usize``.
     with pytest.raises(OverflowError):
         _native.sum_as_string(-1, 1)
+
+
+def test_debug_build_flag_is_a_bool():
+    assert type(_native.DEBUG_BUILD) is bool
