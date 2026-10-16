@@ -2,6 +2,8 @@
 
 Because Python doesn’t have to be a slow snek 🐍
 
+![SpeedySnek Demo](assets/speedysnek-demo-v10.gif)
+
 Need more speed? Just `@snekit`.
 
 SpeedySnek is a small educational JIT compiler experiment for CPython 3.14.
