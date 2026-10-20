@@ -1817,9 +1817,27 @@ def test_compilation_modules_are_imported_lazily():
 
 def test_public_api_is_unchanged_after_compilation():
     compiled(make_add(), 1, 2)
-    assert speedysnek.__all__ == ["snekit", "jit", "hunt", "HuntReport", "HuntFinding"]
+    assert speedysnek.__all__ == [
+        "snekit",
+        "jit",
+        "hunt",
+        "HuntReport",
+        "HuntFinding",
+        "bite",
+        "BiteReport",
+        "BiteFinding",
+    ]
     public = {name for name in dir(speedysnek) if not name.startswith("_")}
-    assert public == {"snekit", "jit", "hunt", "HuntReport", "HuntFinding"}
+    assert public == {
+        "snekit",
+        "jit",
+        "hunt",
+        "HuntReport",
+        "HuntFinding",
+        "bite",
+        "BiteReport",
+        "BiteFinding",
+    }
     for name in (
         "CompiledI64",
         "NativeGuardFailure",

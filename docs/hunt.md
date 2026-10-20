@@ -4,7 +4,8 @@
 these functions can the current compiler frontend translate? It is
 discovery only. It never calls, decorates, compiles, benchmarks or
 replaces a function, and it does not load the native extension or the
-compiler.
+compiler. To apply `@snekit` to the ready functions of a module, use
+[`snek.bite()`](bite.md).
 
 ```python
 import speedysnek as snek
@@ -70,3 +71,7 @@ file. `str(report)` and `report.render()` give the same text.
 
 The frontend reports the first unsupported construct it meets, so fixing
 one reason can reveal the next.
+
+Once the report looks right, [`snek.bite(my_module)`](bite.md) wraps the
+module's ready functions with `@snekit`, using the same rules and the same
+explanations.

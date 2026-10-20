@@ -62,12 +62,45 @@ load_data      skipped  function calls and global names are not supported (line 
 
 `hunt()` reads the bytecode of a module's functions, or of functions you
 pass it, and reports which ones the current compiler understands. It does
-not run, decorate or optimize them yet. **Ready** means only that the
+not run, decorate or optimize them. **Ready** means only that the
 compiler understands a function's bytecode; it does not guarantee a
 speedup.
 
 `hunt()` also returns the report as data. Pass `quiet=True` to skip the
 printout; see [the hunt guide](docs/hunt.md) for details.
+
+## Take a bite
+
+Happy with what the snek found? Let it bite:
+
+```python
+report = snek.hunt(my_calculations)   # inspect
+applied = snek.bite(my_calculations)  # apply @snekit
+```
+
+```text
+🐍 Snek took a bite.
+
+sum_squares      bitten          wrapped with @snekit
+format_report    skipped         f-strings are not supported (line 9)
+old_calculation  already bitten  already wrapped with @snekit
+
+1 function bitten, 1 skipped, 1 already bitten.
+```
+
+`hunt()` only inspects. `bite()` is the explicit opt-in: it replaces the
+compatible public functions in that one module with `@snekit` wrappers,
+exactly as if you had decorated them in the source. Unsupported functions
+are left alone, and calling `bite()` again changes nothing.
+
+`bite()` updates the module's names, not every reference in your program:
+code that already did `from my_calculations import sum_squares` keeps the
+original function.
+
+Biting means "try the existing JIT after warmup", not "guaranteed faster".
+Nothing is compiled until a function has warmed up, and calls still fall
+back to Python whenever the native path does not apply. See
+[the bite guide](docs/bite.md) for aliases, repeat bites and the report.
 
 ## How it works
 
@@ -171,6 +204,7 @@ For implementation details and development:
 
 - [Python frontend](python/speedysnek/_frontend) — analyzes supported Python bytecode.
 - [Hunting](docs/hunt.md) — the `snek.hunt()` discovery report.
+- [Biting](docs/bite.md) — applying `@snekit` to a module with `snek.bite()`.
 - [Rust implementation](src) — native wrapper, guards and code generation.
 - [Loop design](docs/loops.md) — execution limits and fallback behavior.
 - [Range support](docs/for-range.md) — lowering and builtin binding checks.
