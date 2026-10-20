@@ -497,7 +497,7 @@ def test_stream(capsys):
 
 def test_stream_that_cannot_encode_the_snek():
     raw = io.BytesIO()
-    stream = io.TextIOWrapper(raw, encoding="ascii")
+    stream = io.TextIOWrapper(raw, encoding="ascii", newline="\n")
     report = hunt(make_module(), stream=stream)
     stream.flush()
     expected = report.render().removeprefix("🐍 ") + "\n"
