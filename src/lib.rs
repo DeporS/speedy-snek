@@ -37,8 +37,9 @@ mod _native {
 
     use crate::codegen::{NativeCode, STATUS_BAD_ARITY, STATUS_OK, STATUS_OVERFLOW};
     use crate::program::{
-        MAX_ARGS, MAX_LOCALS, OP_ADD, OP_LOAD_ARG, OP_LOAD_CONST, OP_LOAD_LOCAL, OP_MULTIPLY,
-        OP_RETURN, OP_STORE_LOCAL, OP_SUBTRACT, Op,
+        MAX_ARGS, MAX_JUMPS, MAX_LOCALS, OP_ADD, OP_EQUAL, OP_GREATER_EQUAL, OP_GREATER_THAN,
+        OP_JUMP, OP_JUMP_IF_FALSE, OP_LESS_EQUAL, OP_LESS_THAN, OP_LOAD_ARG, OP_LOAD_CONST,
+        OP_LOAD_LOCAL, OP_MULTIPLY, OP_NOT_EQUAL, OP_RETURN, OP_STORE_LOCAL, OP_SUBTRACT, Op,
     };
 
     create_exception!(
@@ -58,11 +59,20 @@ mod _native {
         m.add("OP_RETURN", OP_RETURN)?;
         m.add("OP_LOAD_LOCAL", OP_LOAD_LOCAL)?;
         m.add("OP_STORE_LOCAL", OP_STORE_LOCAL)?;
+        m.add("OP_JUMP", OP_JUMP)?;
+        m.add("OP_JUMP_IF_FALSE", OP_JUMP_IF_FALSE)?;
+        m.add("OP_LESS_THAN", OP_LESS_THAN)?;
+        m.add("OP_LESS_EQUAL", OP_LESS_EQUAL)?;
+        m.add("OP_GREATER_THAN", OP_GREATER_THAN)?;
+        m.add("OP_GREATER_EQUAL", OP_GREATER_EQUAL)?;
+        m.add("OP_EQUAL", OP_EQUAL)?;
+        m.add("OP_NOT_EQUAL", OP_NOT_EQUAL)?;
         m.add("STATUS_OK", STATUS_OK)?;
         m.add("STATUS_OVERFLOW", STATUS_OVERFLOW)?;
         m.add("STATUS_BAD_ARITY", STATUS_BAD_ARITY)?;
         m.add("MAX_ARGS", MAX_ARGS)?;
         m.add("MAX_LOCALS", MAX_LOCALS)?;
+        m.add("MAX_JUMPS", MAX_JUMPS)?;
         // Lets benchmarks record, and warn about, unrepresentative builds.
         m.add("DEBUG_BUILD", cfg!(debug_assertions))?;
         m.add("CodegenError", m.py().get_type::<CodegenError>())?;

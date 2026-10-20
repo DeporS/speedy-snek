@@ -767,6 +767,215 @@ def test_readme_augmented_example():
 # --- Fallback ------------------------------------------------------------
 
 
+# --- Conditionals --------------------------------------------------------
+
+
+def branch_calculate_score(wins, penalties):
+    score = wins * 3 - penalties
+    if score < 0:
+        score = 0
+    else:
+        score += 5
+    return score
+
+
+def choose(a, b):
+    if a >= b:
+        result = a - b
+    else:
+        result = b - a
+    return result
+
+
+def adjust(a, b):
+    result = a
+    if a < b:
+        result += b
+    return result * 2
+
+
+def selected_branch(a, b):
+    result = a
+    if a < b:
+        result += 1
+    else:
+        result *= b
+    return result
+
+
+def possibly_unbound(a, b):
+    if a < b:
+        result = a
+    return result
+
+
+def flag(a, b):
+    r = 0
+    if a < b:
+        r = 1
+    return r
+
+
+BRANCH_EXAMPLES = [
+    (branch_calculate_score, [(10, 3), (1, 5), (0, 0), (-4, -20)]),
+    (choose, [(5, 3), (3, 5), (4, 4), (I64_MIN, -1)]),
+    (adjust, [(1, 2), (2, 1), (3, 3), (-7, 7)]),
+    (selected_branch, [(1, 2), (5, 3), (2, I64_MAX), (I64_MAX, 1)]),
+]
+
+
+@pytest.mark.parametrize(
+    ("func", "cases"), BRANCH_EXAMPLES, ids=lambda v: getattr(v, "__name__", "")
+)
+def test_conditionals_run_natively(func, cases):
+    f = compiled(snekit(func), *cases[0])
+    for args in cases:
+        expected = func(*args)
+        result = assert_native(f, *args)
+        assert type(result) is int and result == expected
+        assert execute(analyze(func).instructions, args) == expected
+    assert state_of(f).compiled.instructions == analyze(func).instructions
+
+
+def test_overflow_only_on_the_branch_not_taken_stays_native():
+    f = compiled(snekit(selected_branch), 1, 2)
+    # ``result *= b`` would overflow, but a < b selects ``result += 1``.
+    assert assert_native(f, 2, I64_MAX) == 3
+    # ``result += 1`` would overflow, but a >= b selects ``result *= b``.
+    assert assert_native(f, I64_MAX, 1) == I64_MAX
+
+
+def test_overflow_on_the_selected_branch_falls_back_once():
+    f = compiled(snekit(selected_branch), 1, 2)
+    specialization = state_of(f).specialization
+    result, fast_calls = assert_python(f, I64_MAX, 2)
+    assert result == I64_MAX * 2
+    assert fast_calls == 1
+    # The specialization is kept and used again.
+    assert state_of(f).specialization is specialization
+    assert state_of(f).status is _Status.COMPILED
+    assert assert_native(f, 3, 2) == 6
+    assert assert_native(f, 2, 3) == 3
+
+
+def test_comparison_results_are_never_bools():
+    f = compiled(snekit(flag), 1, 2)
+    assert type(assert_native(f, 1, 2)) is int
+    assert type(assert_native(f, 2, 1)) is int
+
+    @snekit
+    def compare(a, b):
+        return a < b
+
+    for _ in range(_WARMUP_CALLS + 3):
+        assert compare(1, 2) is True
+    assert state_of(compare).status is _Status.DISABLED
+    assert state_of(compare).rejection.reason is RejectionReason.UNSUPPORTED_CONDITION
+
+
+def test_bool_arguments_fall_back_for_conditions():
+    f = compiled(snekit(flag), 1, 2)
+    for args in [(True, 2), (False, True), (0, True)]:
+        result, fast_calls = assert_python(f, *args)
+        assert result == flag(*args)
+        assert fast_calls == 1
+    assert state_of(f).status is _Status.COMPILED
+
+
+def test_possibly_unbound_local_is_rejected_and_keeps_python_behavior():
+    f = snekit(possibly_unbound)
+    for _ in range(_WARMUP_CALLS + 3):
+        assert f(1, 2) == 1
+    state = state_of(f)
+    assert state.status is _Status.DISABLED
+    assert state.rejection.reason is RejectionReason.UNSUPPORTED_VARIABLE
+    with pytest.raises(UnboundLocalError):
+        f(2, 1)
+    assert assert_python(f, 3, 4) == (3, 0)
+
+
+class Ordered:
+    """Records every comparison and arithmetic operation made on it."""
+
+    def __init__(self, value, log):
+        self.value = value
+        self.log = log
+
+    def __lt__(self, other):
+        self.log.append(("lt", other))
+        return self.value < other
+
+    def __ge__(self, other):
+        self.log.append(("ge", other))
+        return self.value >= other
+
+    def __rsub__(self, other):
+        self.log.append(("rsub", other))
+        return other - self.value
+
+    def __sub__(self, other):
+        self.log.append(("sub", other))
+        return self.value - other
+
+    def __iadd__(self, other):
+        self.log.append(("iadd", other))
+        return self
+
+    def __mul__(self, other):
+        self.log.append(("mul", other))
+        return self.value * other
+
+
+def test_custom_comparisons_run_once_in_python():
+    f = compiled(snekit(choose), 5, 3)
+    log = []
+    result, fast_calls = assert_python(f, Ordered(10, log), 4)
+    assert result == 6
+    assert log == [("ge", 4), ("sub", 4)]
+    assert fast_calls == 1
+
+    g = compiled(snekit(adjust), 1, 2)
+    log = []
+    value = Ordered(1, log)
+    result, fast_calls = assert_python(g, value, 4)
+    assert result == 2
+    # Exactly one comparison, one in-place add and one multiply.
+    assert log == [("lt", 4), ("iadd", 4), ("mul", 2)]
+    assert assert_native(g, 1, 4) == 10
+
+
+def test_comparison_with_user_visible_side_effect_runs_once():
+    calls = []
+
+    class Loud(int):
+        def __lt__(self, other):
+            calls.append(other)
+            return True
+
+    f = compiled(snekit(flag), 1, 2)
+    result, fast_calls = assert_python(f, Loud(5), 1)
+    assert result == 1
+    assert calls == [1]
+    assert fast_calls == 1
+
+
+def test_readme_conditional_example():
+    @snekit
+    def calculate_score(wins, penalties):
+        score = wins * 3 - penalties
+        if score < 0:
+            score = 0
+        else:
+            score += 5
+        return score
+
+    results = [calculate_score(10, 3) for _ in range(_WARMUP_CALLS + 2)]
+    assert results[-1] == 32
+    assert state_of(calculate_score).status is _Status.COMPILED
+    assert assert_native(calculate_score, 1, 5) == 0
+    assert calculate_score(2**62, 0) == 3 * 2**62 + 5
+
+
 class MyInt(int):
     def __add__(self, other):
         return "custom add"
@@ -1068,9 +1277,16 @@ def _closure():
 
 
 def _branch(a):
-    if a > 0:
+    # ``or`` compiles to POP_JUMP_IF_TRUE, outside the supported subset.
+    if a > 0 or a < -10:
         return a
-    return -a
+    return 0 - a
+
+
+def _truthy_branch(a):
+    if a:
+        return a
+    return 0 - a
 
 
 def _call(a):
@@ -1122,6 +1338,7 @@ class _CallableObject:
 UNSUPPORTED = [
     (_closure(), (4,), RejectionReason.CLOSURE),
     (_branch, (-4,), RejectionReason.CONTROL_FLOW),
+    (_truthy_branch, (-4,), RejectionReason.UNSUPPORTED_CONDITION),
     (_call, (-4,), RejectionReason.UNSUPPORTED_OPCODE),
     (_global, (4,), RejectionReason.UNSUPPORTED_OPCODE),
     (_augmented, (4,), RejectionReason.UNSUPPORTED_OPERATOR),

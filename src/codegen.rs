@@ -18,26 +18,45 @@
 //! Failures are ordinary branches to a block that returns a status code.
 //! The generated code never traps, never unwinds and never calls anything.
 //!
-//! Like the operand stack, local slots exist only at compile time: a slot
-//! names the SSA value most recently stored in it. A `STORE_LOCAL` rebinds
-//! the slot and copies nothing at run time, and every `LOAD_LOCAL` of it
-//! reuses that one value, so an assigned expression is computed once. SSA
-//! values never change, so a later store to one slot cannot affect a value
-//! already read from it or copied to another. Every `ADD`, `SUBTRACT` and
-//! `MULTIPLY` keeps its own overflow branch, even when its result is later
-//! overwritten or never read.
+//! The operand stack exists only at compile time: each entry is an SSA
+//! value. Validation guarantees that it is empty at every jump and jump
+//! target, so no stack value ever crosses from one Cranelift block to
+//! another.
+//!
+//! Each local slot is a Cranelift `Variable`. A `STORE_LOCAL` defines the
+//! variable and a `LOAD_LOCAL` uses it; within a block that is just the
+//! most recently stored SSA value, so an assigned expression is computed
+//! once and an assignment copies nothing at run time. Where paths join,
+//! `cranelift_frontend`'s SSA construction gives the join block a parameter
+//! for each slot whose value differs between the incoming paths, and every
+//! jump into it passes that path's value: a path that did not store a slot
+//! passes the value the slot held before the branch. SSA values never
+//! change, so a later store to one slot cannot affect a value already read
+//! from it or copied to another. Validation proves that every slot read is
+//! stored on every path to the read, so the SSA construction never has to
+//! invent an initial value.
+//!
+//! Every IR instruction that starts a basic block (index 0, a jump target,
+//! or the instruction after a `JUMP_IF_FALSE`) gets its own Cranelift
+//! block. Every edge points forward, so all predecessors of a block are
+//! emitted before it and it is sealed as soon as code generation reaches
+//! it. A comparison becomes a signed `icmp`, whose result feeds only the
+//! `brif` of the `JUMP_IF_FALSE` after it. Only the selected branch runs:
+//! every `ADD`, `SUBTRACT` and `MULTIPLY` keeps its own overflow branch in
+//! the block it belongs to, even when its result is later overwritten or
+//! never read, and an operation on a path not taken never runs.
 
 use std::sync::{Mutex, OnceLock};
 
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{AbiParam, BlockArg, InstBuilder, MemFlagsData, Value, types};
+use cranelift_codegen::ir::{AbiParam, Block, BlockArg, InstBuilder, MemFlagsData, Value, types};
 use cranelift_codegen::isa::OwnedTargetIsa;
 use cranelift_codegen::settings::{self, Configurable};
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module, default_libcall_names};
 
-use crate::program::{self, Op};
+use crate::program::{self, Comparison, Op};
 
 pub const STATUS_OK: i32 = 0;
 pub const STATUS_OVERFLOW: i32 = 1;
@@ -107,44 +126,75 @@ impl NativeCode {
         b.switch_to_block(body);
         b.seal_block(body);
 
+        // A block for every instruction that starts one, other than the
+        // first, which is `body`. Validation guarantees every target is in
+        // range and ahead of its jump.
+        let mut blocks: Vec<Option<Block>> = vec![None; ops.len()];
+        for (index, op) in ops.iter().enumerate() {
+            if let Op::Jump(target) | Op::JumpIfFalse(target) = *op {
+                let target = target as usize;
+                if target <= index || target >= ops.len() {
+                    return Err(format!("invalid jump target {target} at index {index}"));
+                }
+                blocks[target].get_or_insert_with(|| b.create_block());
+                if let Op::JumpIfFalse(_) = op {
+                    blocks[index + 1].get_or_insert_with(|| b.create_block());
+                }
+            }
+        }
+
+        // One variable per local slot. Validation proves each is defined on
+        // every path before it is used.
+        let locals: Vec<Variable> = (0..local_count)
+            .map(|_| b.declare_var(types::I64))
+            .collect();
+
         // The stack machine exists only at compile time: each stack slot is
         // an SSA value, so the generated code keeps values in registers.
-        let mut stack: Vec<Value> = Vec::new();
-        // The value each local slot holds; `None` until it is first stored.
-        let mut locals: Vec<Option<Value>> = vec![None; local_count];
+        let mut stack: Vec<StackValue> = Vec::new();
+        // Whether the current block already ends with a jump or return.
+        let mut terminated = false;
         for (index, op) in ops.iter().enumerate() {
+            if let Some(block) = blocks[index] {
+                if !terminated {
+                    // Fall through. Validation guarantees the stack is empty.
+                    b.ins().jump(block, &[]);
+                }
+                // Every predecessor is at a lower index and already emitted.
+                b.switch_to_block(block);
+                b.seal_block(block);
+                terminated = false;
+            } else if terminated {
+                // Unreachable after validation.
+                return Err(format!("instruction {index} is unreachable"));
+            }
             match *op {
                 Op::LoadArg(arg) => {
                     // Validation guarantees arg < arg_count <= MAX_ARGS, so
                     // the offset fits in i32, and the arity check above
                     // guarantees the load is in bounds.
                     let offset = arg as i32 * 8;
-                    stack.push(
-                        b.ins()
-                            .load(types::I64, MemFlagsData::trusted(), args, offset),
-                    );
+                    stack.push(StackValue::Int(b.ins().load(
+                        types::I64,
+                        MemFlagsData::trusted(),
+                        args,
+                        offset,
+                    )));
                 }
-                Op::LoadConst(value) => stack.push(b.ins().iconst(types::I64, value)),
+                Op::LoadConst(value) => {
+                    stack.push(StackValue::Int(b.ins().iconst(types::I64, value)))
+                }
                 Op::LoadLocal(slot) => {
-                    // Unreachable after validation, but an error is better
-                    // than a panic or a made-up value.
-                    let value = locals
-                        .get(slot as usize)
-                        .copied()
-                        .flatten()
-                        .ok_or_else(|| format!("local {slot} read before assignment"))?;
-                    stack.push(value);
+                    let var = local(&locals, slot)?;
+                    stack.push(StackValue::Int(b.use_var(var)));
                 }
                 Op::StoreLocal(slot) => {
-                    let value = pop(&mut stack)?;
-                    let entry = locals
-                        .get_mut(slot as usize)
-                        .ok_or_else(|| format!("local {slot} out of range"))?;
-                    *entry = Some(value);
+                    let value = pop_int(&mut stack)?;
+                    b.def_var(local(&locals, slot)?, value);
                 }
                 Op::Add | Op::Subtract | Op::Multiply => {
-                    let right = pop(&mut stack)?;
-                    let left = pop(&mut stack)?;
+                    let right = pop_int(&mut stack)?;
+                    let left = pop_int(&mut stack)?;
                     // Each instruction yields the (wrapped) value and an
                     // overflow flag. The wrapped value is only used on the
                     // path where the flag is clear, so it is exact there.
@@ -159,15 +209,54 @@ impl NativeCode {
                         .brif(overflowed, overflow, &[BlockArg::Value(at)], next, &[]);
                     b.switch_to_block(next);
                     b.seal_block(next);
-                    stack.push(value);
+                    stack.push(StackValue::Int(value));
+                }
+                Op::Compare(comparison) => {
+                    let right = pop_int(&mut stack)?;
+                    let left = pop_int(&mut stack)?;
+                    // A direct signed comparison: never a subtraction, which
+                    // could overflow.
+                    let cc = match comparison {
+                        Comparison::LessThan => IntCC::SignedLessThan,
+                        Comparison::LessEqual => IntCC::SignedLessThanOrEqual,
+                        Comparison::GreaterThan => IntCC::SignedGreaterThan,
+                        Comparison::GreaterEqual => IntCC::SignedGreaterThanOrEqual,
+                        Comparison::Equal => IntCC::Equal,
+                        Comparison::NotEqual => IntCC::NotEqual,
+                    };
+                    stack.push(StackValue::Condition(b.ins().icmp(cc, left, right)));
+                }
+                Op::Jump(target) => {
+                    b.ins().jump(block_at(&blocks, target)?, &[]);
+                    terminated = true;
+                }
+                Op::JumpIfFalse(target) => {
+                    let condition = match stack.pop() {
+                        Some(StackValue::Condition(value)) => value,
+                        _ => return Err(format!("no condition for the jump at {index}")),
+                    };
+                    let taken = block_at(&blocks, target)?;
+                    let next = block_at(&blocks, index as u32 + 1)?;
+                    if taken == next {
+                        // Both outcomes continue at the same instruction.
+                        b.ins().jump(next, &[]);
+                    } else {
+                        b.ins().brif(condition, next, &[], taken, &[]);
+                    }
+                    terminated = true;
                 }
                 Op::Return => {
-                    let value = pop(&mut stack)?;
+                    let value = pop_int(&mut stack)?;
                     b.ins().store(MemFlagsData::trusted(), value, result, 0);
                     let status = b.ins().iconst(types::I32, i64::from(STATUS_OK));
                     b.ins().return_(&[status]);
+                    terminated = true;
                 }
             }
+        }
+        if !terminated {
+            // Unreachable after validation.
+            return Err("program falls off its end".to_owned());
         }
 
         b.switch_to_block(overflow);
@@ -245,9 +334,39 @@ impl Drop for NativeCode {
     }
 }
 
-fn pop(stack: &mut Vec<Value>) -> Result<Value, String> {
+/// A value on the compile-time operand stack.
+#[derive(Clone, Copy)]
+enum StackValue {
+    /// An i64.
+    Int(Value),
+    /// The i8 result of an `icmp`, consumed only by the following branch.
+    Condition(Value),
+}
+
+fn pop_int(stack: &mut Vec<StackValue>) -> Result<Value, String> {
     // Unreachable after validation, but an error is better than a panic.
-    stack.pop().ok_or_else(|| "stack underflow".to_owned())
+    match stack.pop() {
+        Some(StackValue::Int(value)) => Ok(value),
+        Some(StackValue::Condition(_)) => Err("expected an integer, found a condition".to_owned()),
+        None => Err("stack underflow".to_owned()),
+    }
+}
+
+fn local(locals: &[Variable], slot: u32) -> Result<Variable, String> {
+    // Unreachable after validation.
+    locals
+        .get(slot as usize)
+        .copied()
+        .ok_or_else(|| format!("local {slot} out of range"))
+}
+
+fn block_at(blocks: &[Option<Block>], index: u32) -> Result<Block, String> {
+    // Unreachable after validation.
+    blocks
+        .get(index as usize)
+        .copied()
+        .flatten()
+        .ok_or_else(|| format!("no block starts at instruction {index}"))
 }
 
 /// The host target, created once and shared by every compilation.

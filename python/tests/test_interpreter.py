@@ -509,14 +509,11 @@ def test_bool_rejected_end_to_end():
         ((RETURN,), "stack underflow at index 0: RETURN needs 1", 0),
         ((arg(0),), "program has no RETURN", None),
         ((arg(0), arg(1), ADD), "program has no RETURN", None),
-        ((arg(0), RETURN, const(1)), "RETURN at index 1 is not the final", 1),
-        (
-            (arg(0), RETURN, arg(1), arg(2), ADD),
-            "3 instruction\\(s\\) follow it",
-            1,
-        ),
-        ((arg(0), RETURN, arg(0), RETURN), "2 RETURN instructions", 3),
-        ((RETURN, RETURN, RETURN), "3 RETURN instructions \\(at indexes 0, 1, 2\\)", 1),
+        # Code after a RETURN that nothing jumps to can never run.
+        ((arg(0), RETURN, const(1)), "instruction at index 2 is unreachable", 2),
+        ((arg(0), RETURN, arg(1), arg(2), ADD), "index 2 is unreachable", 2),
+        ((arg(0), RETURN, arg(0), RETURN), "index 2 is unreachable", 2),
+        ((RETURN, RETURN, RETURN), "stack underflow at index 0: RETURN needs 1", 0),
         ((arg(0), arg(1), RETURN), "leaves 1 extra value", 2),
         ((const(1), const(2), const(3), ADD, RETURN), "leaves 1 extra value", 4),
         ((arg(0), arg(1), arg(2), RETURN), "leaves 2 extra value", 3),
@@ -543,7 +540,7 @@ def test_bool_rejected_end_to_end():
         ((arg(0), store(0), RETURN), "stack underflow at index 2: RETURN needs 1", 2),
         ((arg(0), store(0)), "program has no RETURN", None),
         ((arg(0), store(0), load(0), load(0), RETURN), "leaves 1 extra value", 4),
-        ((arg(0), RETURN, store(0)), "RETURN at index 1 is not the final", 1),
+        ((arg(0), RETURN, store(0)), "index 2 is unreachable", 2),
     ],
 )
 def test_invalid_programs(program, message, index):
@@ -624,6 +621,258 @@ def test_error_categories_are_distinct():
     # Neither is a built-in error that user code might catch by accident.
     for error in (GuardFailure, InvalidProgramError):
         assert error.__bases__ == (Exception,)
+
+
+# --- Conditionals --------------------------------------------------------
+
+LT = Instruction(Op.LESS_THAN)
+
+COMPARISONS = {
+    Op.LESS_THAN: "<",
+    Op.LESS_EQUAL: "<=",
+    Op.GREATER_THAN: ">",
+    Op.GREATER_EQUAL: ">=",
+    Op.EQUAL: "==",
+    Op.NOT_EQUAL: "!=",
+}
+
+
+def jump(target):
+    return Instruction(Op.JUMP, target)
+
+
+def jump_if_false(target):
+    return Instruction(Op.JUMP_IF_FALSE, target)
+
+
+def pick(op):
+    """``return 1 if a <op> b else 0`` as IR, one RETURN per branch."""
+    return (
+        arg(0),
+        arg(1),
+        Instruction(op),
+        jump_if_false(6),
+        const(1),
+        RETURN,
+        const(0),
+        RETURN,
+    )
+
+
+@pytest.mark.parametrize("op", list(COMPARISONS), ids=lambda op: op.name)
+def test_comparisons_are_exact_for_any_size(op):
+    program = pick(op)
+    values = [-(2**100), -(2**63) - 1, -(2**63), -1, 0, 1, 2**63 - 1, 2**63, 2**100]
+    for a in values:
+        for b in values:
+            expected = int(eval(f"a {COMPARISONS[op]} b"))
+            result = execute(program, (a, b))
+            assert type(result) is int and result == expected, (op, a, b)
+
+
+def test_only_the_selected_branch_runs():
+    # ``r = a; if a < b: r += 1 else: r *= b; return r``.
+    def selected_branch(a, b):
+        result = a
+        if a < b:
+            result += 1
+        else:
+            result *= b
+        return result
+
+    for args in [(1, 2), (2, 1), (2, 2), (-(2**70), 3), (2**70, 3)]:
+        run(selected_branch, *args)
+
+
+def calculate_score(wins, penalties):
+    score = wins * 3 - penalties
+    if score < 0:
+        score = 0
+    else:
+        score += 5
+    return score
+
+
+def choose(a, b):
+    if a >= b:
+        result = a - b
+    else:
+        result = b - a
+    return result
+
+
+def adjust(a, b):
+    result = a
+    if a < b:
+        result += b
+    return result * 2
+
+
+def nested(a, b, c):
+    r = a
+    if a < b:
+        if b <= c:
+            r = c - a
+        else:
+            r += 1
+    elif a == c:
+        b = 0
+    if b != 0:
+        r *= b
+    return r + b
+
+
+@pytest.mark.parametrize(
+    "func", [calculate_score, choose, adjust, nested], ids=lambda f: f.__name__
+)
+def test_conditionals_match_python(func):
+    arity = func.__code__.co_argcount
+    values = [-(2**64), -3, -1, 0, 1, 2, 3, 2**64]
+    rng = random.Random(f"interpreter-{func.__name__}")
+    for _ in range(300):
+        run(func, *(rng.choice(values) for _ in range(arity)))
+
+
+def test_reads_on_any_branch_are_guarded():
+    program = (arg(0), const(0), LT, jump_if_false(6), arg(1), RETURN, arg(2), RETURN)
+    assert validate(program) == (0, 1, 2)
+    # Arguments read only on a branch not taken are still guarded.
+    with pytest.raises(GuardFailure) as excinfo:
+        execute(program, (1, 2, "x"))
+    assert excinfo.value.arg_index == 2
+
+
+def test_values_join_through_locals():
+    # r = 10; if a < 0: r = a; return r   (r keeps 10 on the other path)
+    program = (
+        const(10),
+        store(0),
+        arg(0),
+        const(0),
+        LT,
+        jump_if_false(8),
+        arg(0),
+        store(0),
+        load(0),
+        RETURN,
+    )
+    assert execute(program, (-5,)) == -5
+    assert execute(program, (5,)) == 10
+
+
+@pytest.mark.parametrize(
+    ("program", "message", "index"),
+    [
+        # Targets.
+        ((jump(0), const(1), RETURN), "JUMP at index 0 jumps back to index 0", 0),
+        ((const(1), jump(0), RETURN), "jumps back to index 0", 1),
+        ((const(1), store(0), jump(1), RETURN), "jumps back to index 1", 2),
+        ((jump(3), const(1), RETURN), "jumps to index 3, past the end", 0),
+        ((arg(0), arg(0), LT, jump_if_false(9), const(1), RETURN), "past the end", 3),
+        # Reachability and termination.
+        ((jump(2), const(1), const(2), RETURN), "index 1 is unreachable", 1),
+        ((const(1), RETURN, const(2), RETURN), "index 2 is unreachable", 2),
+        (
+            (arg(0), arg(0), LT, jump_if_false(6), const(1), RETURN, const(2)),
+            "index 6 falls off the end",
+            6,
+        ),
+        # Conditions.
+        ((arg(0), arg(0), LT, RETURN), "LESS_THAN at index 2 must be immediately", 2),
+        # A condition cannot be stored: it must go straight to the jump.
+        (
+            (arg(0), arg(0), LT, store(0), const(1), RETURN),
+            "LESS_THAN at index 2 must be immediately followed by JUMP_IF_FALSE",
+            2,
+        ),
+        (
+            (arg(0), arg(0), LT, const(1), ADD, jump_if_false(7), const(1), RETURN),
+            "must be immediately followed",
+            2,
+        ),
+        (
+            (arg(0), jump_if_false(3), const(1), const(2), RETURN),
+            "JUMP_IF_FALSE at index 1 needs a condition but found an integer",
+            1,
+        ),
+        (
+            (jump_if_false(2), const(1), RETURN),
+            "stack underflow at index 0: JUMP_IF_FALSE",
+            0,
+        ),
+        (
+            (arg(0), LT, jump_if_false(4), const(1), RETURN),
+            "stack underflow at index 1",
+            1,
+        ),
+        # The stack must be empty at jumps and joins.
+        ((const(1), jump(2), RETURN), "JUMP at index 1 leaves 1 extra value", 1),
+        (
+            (const(9), arg(0), arg(0), LT, jump_if_false(6), const(1), RETURN),
+            "JUMP_IF_FALSE at index 4 leaves 1 extra",
+            4,
+        ),
+        (
+            (arg(0), arg(0), LT, jump_if_false(5), const(1), const(2), ADD, RETURN),
+            "jump target at index 5 is reached from index 4 with 1 value",
+            5,
+        ),
+        # Locals must be assigned on every path.
+        (
+            (arg(0), arg(0), LT, jump_if_false(6), const(1), store(0), load(0), RETURN),
+            "LOAD_LOCAL at index 6 reads local 0 before it is assigned on every path",
+            6,
+        ),
+        (
+            (
+                arg(0),
+                arg(0),
+                LT,
+                jump_if_false(7),
+                const(1),
+                store(0),
+                jump(9),
+                const(2),
+                store(1),
+                load(0),
+                RETURN,
+            ),
+            "index 9 reads local 0",
+            9,
+        ),
+        # Corrupted targets.
+        (
+            (corrupt(jump(1), arg=-1), RETURN),
+            "JUMP at index 0 has negative target index",
+            0,
+        ),
+        ((corrupt(jump(1), arg=None), RETURN), "JUMP at index 0 needs an int", 0),
+        (
+            (corrupt(jump_if_false(1), arg=True), RETURN),
+            "needs an int argument, got bool",
+            0,
+        ),
+        (
+            (corrupt(Instruction(Op.LESS_THAN), arg=1), RETURN),
+            "LESS_THAN at index 0 takes no argument",
+            0,
+        ),
+    ],
+)
+def test_invalid_control_flow(program, message, index):
+    with pytest.raises(InvalidProgramError, match=message) as excinfo:
+        validate(program)
+    assert excinfo.value.index == index
+    with pytest.raises(InvalidProgramError, match=message):
+        execute(program, (1,))
+
+
+def test_validation_covers_every_path_before_running():
+    # The malformed branch is never taken for these arguments, but the
+    # whole program is still rejected before anything runs.
+    program = (arg(0), const(0), LT, jump_if_false(6), ADD, RETURN, arg(0), RETURN)
+    with pytest.raises(InvalidProgramError, match="stack underflow at index 4"):
+        execute(program, (5,))
 
 
 # --- Determinism and side effects ----------------------------------------

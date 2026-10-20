@@ -22,24 +22,29 @@ The native tier is narrower than Python, and never silently differs from
 it. Anything outside the tier raises instead of returning a wrong value:
 
 - :class:`UnsupportedProgramError` at compile time: valid IR that cannot be
-  represented, such as a constant outside the signed 64-bit range or a
-  local slot index of ``MAX_LOCALS`` or more.
+  represented, such as a constant outside the signed 64-bit range, a
+  local slot index of ``MAX_LOCALS`` or more, or more than ``MAX_JUMPS``
+  jumps.
 - :class:`NativeGuardFailure` at call time: the call does not fit the tier.
   Its :attr:`~NativeGuardFailure.reason` says why: the wrong number of
   arguments, an argument that is not an exact ``int`` (``bool`` and ``int``
   subclasses included), an argument outside the signed 64-bit range, or an
   ``ADD``, ``SUBTRACT`` or ``MULTIPLY`` whose exact result does not fit.
 
-Malformed IR, including a ``LOAD_LOCAL`` of a slot that no earlier
-``STORE_LOCAL`` wrote, raises
+Malformed IR, including a ``LOAD_LOCAL`` of a slot that is not stored on
+every path to it, a backward jump or a stack value left at a join, raises
 :class:`~speedysnek._interpreter.InvalidProgramError`, exactly as in the
 reference interpreter. The Rust extension validates the serialized program
 again on its own.
 
-Local slots exist only at compile time: a slot names a value that was
-already computed, so assignments copy nothing at run time. Every ``ADD``,
+Local slots are Cranelift variables: within a block a slot names a value
+that was already computed, so assignments copy nothing at run time, and
+where branches join, SSA block parameters carry each path's value.
+Comparisons are signed and only steer the following branch; they never
+produce a Python value. Only the selected branch runs. Every ``ADD``,
 ``SUBTRACT`` and ``MULTIPLY`` checks for overflow when it runs, whether or
-not its result is used later.
+not its result is used later; an operation on a branch not taken never
+runs and so cannot cause a guard failure.
 
 **Argument rule:** a compiled program takes exactly ``arg_count``
 positional arguments, and every one of them, read or not, must be an exact
@@ -76,7 +81,7 @@ import enum
 from collections.abc import Callable, Iterable
 
 from . import _native
-from ._frontend.ir import Instruction, Op
+from ._frontend.ir import JUMPS, Instruction, Op
 from ._interpreter import InvalidProgramError, validate
 
 __all__ = [
@@ -104,6 +109,14 @@ _OPCODES = {
     Op.SUBTRACT: _native.OP_SUBTRACT,
     Op.MULTIPLY: _native.OP_MULTIPLY,
     Op.RETURN: _native.OP_RETURN,
+    Op.JUMP: _native.OP_JUMP,
+    Op.JUMP_IF_FALSE: _native.OP_JUMP_IF_FALSE,
+    Op.LESS_THAN: _native.OP_LESS_THAN,
+    Op.LESS_EQUAL: _native.OP_LESS_EQUAL,
+    Op.GREATER_THAN: _native.OP_GREATER_THAN,
+    Op.GREATER_EQUAL: _native.OP_GREATER_EQUAL,
+    Op.EQUAL: _native.OP_EQUAL,
+    Op.NOT_EQUAL: _native.OP_NOT_EQUAL,
 }
 
 
@@ -176,7 +189,8 @@ def _as_tuple(instructions: Iterable[Instruction]) -> tuple[Instruction, ...]:
 
 def _check(program: tuple[Instruction, ...]) -> tuple[int, ...]:
     """Apply the interpreter's validation plus the native tier's limits:
-    i64 constants and local indexes below ``MAX_LOCALS``.
+    i64 constants, local indexes below ``MAX_LOCALS`` and at most
+    ``MAX_JUMPS`` jumps.
 
     Returns the indexes of the arguments the program reads.
     """
@@ -198,6 +212,13 @@ def _check(program: tuple[Instruction, ...]) -> tuple[int, ...]:
                 f"{_native.MAX_LOCALS} locals",
                 index=index,
             )
+    jumps = [index for index, i in enumerate(program) if i.op in JUMPS]
+    if len(jumps) > _native.MAX_JUMPS:
+        raise UnsupportedProgramError(
+            f"the program has {len(jumps)} jumps, beyond the native limit of "
+            f"{_native.MAX_JUMPS}",
+            index=jumps[_native.MAX_JUMPS],
+        )
     return read_args
 
 
