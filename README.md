@@ -39,6 +39,36 @@ function and reuses its native version on eligible calls.
 and loops. Performance depends on the workload; small functions can still
 run slower.
 
+## Go hunting
+
+Not sure which functions the snek can handle? Send it hunting:
+
+```python
+import my_calculations
+import speedysnek as snek
+
+report = snek.hunt(my_calculations)
+```
+
+```text
+🐍 Snek went hunting.
+
+sum_squares    ready    integer arithmetic and one range loop
+format_report  skipped  f-strings are not supported (line 9)
+load_data      skipped  function calls and global names are not supported (line 13)
+
+1 ready, 2 skipped.
+```
+
+`hunt()` reads the bytecode of a module's functions, or of functions you
+pass it, and reports which ones the current compiler understands. It does
+not run, decorate or optimize them yet. **Ready** means only that the
+compiler understands a function's bytecode; it does not guarantee a
+speedup.
+
+`hunt()` also returns the report as data. Pass `quiet=True` to skip the
+printout; see [the hunt guide](docs/hunt.md) for details.
+
 ## How it works
 
 1. **Warm up.** The first eight calls run the original function.
@@ -140,6 +170,7 @@ SpeedySnek is built with **Python, Rust, PyO3 and Cranelift**.
 For implementation details and development:
 
 - [Python frontend](python/speedysnek/_frontend) — analyzes supported Python bytecode.
+- [Hunting](docs/hunt.md) — the `snek.hunt()` discovery report.
 - [Rust implementation](src) — native wrapper, guards and code generation.
 - [Loop design](docs/loops.md) — execution limits and fallback behavior.
 - [Range support](docs/for-range.md) — lowering and builtin binding checks.

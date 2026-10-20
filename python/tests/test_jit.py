@@ -9,7 +9,7 @@ from speedysnek import snekit
 
 
 def test_public_api():
-    assert speedysnek.__all__ == ["snekit", "jit"]
+    assert speedysnek.__all__ == ["snekit", "jit", "hunt", "HuntReport", "HuntFinding"]
     assert speedysnek.snekit is snekit
 
 
