@@ -529,6 +529,241 @@ def test_replacing_code_of_a_function_with_locals():
     assert state_of(f).disabled_reason is _DisabledReason.CODE_CHANGED
 
 
+# --- Augmented assignment ------------------------------------------------
+
+
+def aug_calculate_score(wins, draws, penalties):
+    points = wins * 3
+    points += draws
+    points -= penalties * 2
+    return points
+
+
+def update_argument(a, b):
+    a += b
+    a *= 3
+    a -= b
+    return a
+
+
+def copy_before_update(a, b):
+    x = a
+    y = x
+    x += b
+    return y - x
+
+
+def update_from_itself(a, b):
+    x = a
+    x -= x * b
+    return x
+
+
+def overwritten_update(a):
+    a += 1
+    a = 0
+    return a
+
+
+AUGMENTED = [
+    aug_calculate_score,
+    update_argument,
+    copy_before_update,
+    update_from_itself,
+    overwritten_update,
+]
+
+
+@pytest.mark.parametrize("func", AUGMENTED, ids=lambda f: f.__name__)
+def test_augmented_assignment_runs_natively(func):
+    arity = func.__code__.co_argcount
+    f = compiled(snekit(func), *(1,) * arity)
+    values = [0, 1, -1, 7, -12, 2**20, -(2**31)]
+    for i in range(len(values)):
+        args = tuple(values[(i + k) % len(values)] for k in range(arity))
+        expected = func(*args)
+        assert assert_native(f, *args) == expected
+        assert execute(analyze(func).instructions, args) == expected
+
+
+def test_augmented_examples():
+    score = compiled(snekit(aug_calculate_score), 1, 1, 1)
+    assert assert_native(score, 10, 4, 3) == 28
+    update = compiled(snekit(update_argument), 1, 1)
+    assert assert_native(update, 5, 2) == (5 + 2) * 3 - 2
+    # ``x = x - x * b``: the right-hand side reads the old ``x``.
+    itself = compiled(snekit(update_from_itself), 1, 1)
+    assert assert_native(itself, 5, 3) == 5 - 15
+
+
+def test_augmented_assignment_does_not_change_a_copy():
+    f = compiled(snekit(copy_before_update), 1, 2)
+    # ``y`` keeps the original ``a``, so the result is always ``-b``.
+    for a, b in [(10, 3), (-5, 8), (0, 0), (I64_MAX - 5, 5), (I64_MIN, 1)]:
+        assert assert_native(f, a, b) == -b
+
+
+@pytest.mark.parametrize(
+    ("func", "args", "expected"),
+    [
+        (update_argument, (I64_MAX // 3 - 7, 7), I64_MAX // 3 * 3 - 7),
+        (update_argument, (-(I64_MAX // 3) + 1, -1), -(I64_MAX // 3) * 3 + 1),
+        (aug_calculate_score, (0, I64_MAX, 0), I64_MAX),
+        (aug_calculate_score, (0, I64_MIN, 0), I64_MIN),
+        (copy_before_update, (I64_MIN, I64_MAX), -I64_MAX),
+        (update_from_itself, (I64_MAX, 0), I64_MAX),
+        (overwritten_update, (I64_MAX - 1,), 0),
+        (overwritten_update, (I64_MIN,), 0),
+    ],
+    ids=lambda v: getattr(v, "__name__", ""),
+)
+def test_augmented_i64_boundaries(func, args, expected):
+    f = compiled(snekit(func), *(1,) * len(args))
+    assert func(*args) == expected
+    assert assert_native(f, *args) == expected
+
+
+@pytest.mark.parametrize(
+    ("func", "args"),
+    [
+        # The overwritten ``a += 1`` overflows; Python returns 0.
+        (overwritten_update, (I64_MAX,)),
+        # ``+=``, ``*=`` and ``-=`` each overflow in turn.
+        (update_argument, (I64_MAX, 1)),
+        (update_argument, (I64_MAX // 3, 1)),
+        (update_argument, (-(I64_MAX // 3) - 3, 3)),
+        (aug_calculate_score, (0, I64_MAX, -1)),
+        (copy_before_update, (1, I64_MAX)),
+        (copy_before_update, (I64_MIN + 1, I64_MIN)),
+        (update_from_itself, (2**32, 2**32)),
+    ],
+    ids=lambda v: getattr(v, "__name__", ""),
+)
+def test_augmented_overflow_falls_back_to_python(func, args):
+    f = compiled(snekit(func), *(1,) * len(args))
+    specialization = state_of(f).specialization
+    result, fast_calls = assert_python(f, *args)
+    assert result == func(*args)
+    assert fast_calls == 1
+    assert state_of(f).specialization is specialization
+    assert state_of(f).status is _Status.COMPILED
+    assert assert_native(f, *(2,) * len(args)) == func(*(2,) * len(args))
+
+
+def test_overwritten_augmented_overflow_returns_zero():
+    f = compiled(snekit(overwritten_update), 1)
+    assert assert_python(f, I64_MAX) == (0, 1)
+    assert assert_native(f, 5) == 0
+    assert state_of(f).status is _Status.COMPILED
+
+
+def test_augmented_read_before_assignment_falls_back_to_python():
+    @snekit
+    def unbound(a):
+        x += a  # noqa: F821
+        return x
+
+    for _ in range(_WARMUP_CALLS + 5):
+        with pytest.raises(UnboundLocalError):
+            unbound(1)
+    state = state_of(unbound)
+    assert state.status is _Status.DISABLED
+    assert state.rejection.reason is RejectionReason.UNSUPPORTED_VARIABLE
+    with recording() as calls:
+        with pytest.raises(UnboundLocalError):
+            unbound(1)
+    assert calls[unbound.__wrapped__.__code__] == 1
+
+
+class InPlace:
+    """Updates itself in place and records each in-place operator."""
+
+    def __init__(self):
+        self.log = []
+
+    def _update(self, name, other):
+        self.log.append((name, other))
+        return self
+
+    def __iadd__(self, other):
+        return self._update("iadd", other)
+
+    def __isub__(self, other):
+        return self._update("isub", other)
+
+    def __imul__(self, other):
+        return self._update("imul", other)
+
+    def __add__(self, other):
+        raise AssertionError("augmented assignment must use __iadd__")
+
+    __sub__ = __mul__ = __radd__ = __rsub__ = __rmul__ = __add__
+
+
+class InPlaceInt(int):
+    """An ``int`` subclass, so not an exact ``int``, with ``__iadd__``."""
+
+    calls = 0
+
+    def __iadd__(self, other):
+        InPlaceInt.calls += 1
+        return "iadd"
+
+
+def test_fallback_keeps_in_place_operators():
+    f = compiled(snekit(update_argument), 1, 2)
+    target = InPlace()
+    result, fast_calls = assert_python(f, target, 4)
+    assert result is target
+    # Each operator ran exactly once, in order, with the right operand.
+    assert target.log == [("iadd", 4), ("imul", 3), ("isub", 4)]
+    assert fast_calls == 1
+    assert assert_native(f, 5, 2) == 19
+    assert state_of(f).status is _Status.COMPILED
+
+
+def test_fallback_extends_a_list_in_place_once():
+    @snekit
+    def extend(a, b):
+        a += b
+        return a
+
+    compiled(extend, 1, 2)
+    items = [1]
+    result, fast_calls = assert_python(extend, items, [2, 3])
+    # ``list.__iadd__`` mutates the list it returns; ``a + b`` would not.
+    assert result is items
+    assert items == [1, 2, 3]
+    assert fast_calls == 1
+    assert assert_native(extend, 4, 5) == 9
+
+
+def test_fallback_uses_an_int_subclass_iadd():
+    @snekit
+    def add_to(a, b):
+        a += b
+        return a
+
+    compiled(add_to, 1, 2)
+    InPlaceInt.calls = 0
+    assert assert_python(add_to, InPlaceInt(1), 2) == ("iadd", 1)
+    assert InPlaceInt.calls == 1
+
+
+def test_readme_augmented_example():
+    @snekit
+    def calculate_score(wins, draws, penalties):
+        points = wins * 3
+        points += draws
+        points -= penalties * 2
+        return points
+
+    for _ in range(100):
+        assert calculate_score(10, 4, 3) == 28
+    assert state_of(calculate_score).status is _Status.COMPILED
+    assert assert_native(calculate_score, 10, 4, 3) == 28
+
+
 # --- Fallback ------------------------------------------------------------
 
 
@@ -847,7 +1082,7 @@ def _global(a):
 
 
 def _augmented(a):
-    a += 1
+    a %= 3
     return a
 
 

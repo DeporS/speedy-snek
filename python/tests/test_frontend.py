@@ -400,8 +400,9 @@ def test_rejects_assignment_forms_outside_the_subset():
         f = define(f"def f(a, b):\n    {body}\n")
         assert_rejected(f, RejectionReason.UNSUPPORTED_OPCODE, opname, offset)
 
-    # Augmented assignment is BINARY_OP with an in-place operator.
-    for operator in ("+=", "-=", "*="):
+    # Augmented assignment is BINARY_OP with an in-place operator; only
+    # ``+=``, ``-=`` and ``*=`` are supported.
+    for operator in ("/=", "//=", "%=", "**=", "<<=", ">>=", "&=", "|=", "^=", "@="):
         f = define(f"def f(a):\n    a {operator} 1\n    return a\n")
         rejection = assert_rejected(
             f, RejectionReason.UNSUPPORTED_OPERATOR, "BINARY_OP", 6
@@ -419,6 +420,32 @@ def test_rejects_non_local_stores():
         rejection = analyze(define(f"def f(a):\n    {body}\n")).rejection
         assert rejection.reason is RejectionReason.UNSUPPORTED_OPCODE
         assert rejection.opname == opname
+
+
+def test_rejects_augmented_assignment_to_non_locals():
+    # Each is rejected before its in-place BINARY_OP is reached.
+    cases = [
+        ("a.x += 1", "COPY", 4),
+        ("a[0] += 1", "COPY", 6),
+        ("global G\n    G += a", "LOAD_GLOBAL", 2),
+        # A variable captured by an inner function lives in a cell.
+        ("a += 1\n    g = lambda: a", "MAKE_CELL", 0),
+    ]
+    for body, opname, offset in cases:
+        f = define(f"def f(a):\n    {body}\n    return a\n")
+        assert_rejected(f, RejectionReason.UNSUPPORTED_OPCODE, opname, offset)
+
+    def outer():
+        x = 0
+
+        def inner(a):
+            nonlocal x
+            x += a
+            return x
+
+        return inner
+
+    assert_rejected(outer(), RejectionReason.CLOSURE)
 
 
 # --- Local variables -----------------------------------------------------
@@ -687,6 +714,153 @@ def test_reassigning_an_argument_read_with_load_fast_check():
             RETURN,
         ],
     )
+
+
+# --- Augmented assignment ------------------------------------------------
+
+
+def test_augmented_assignment_on_a_local():
+    def calculate_score(wins, draws, penalties):
+        points = wins * 3
+        points += draws
+        points -= penalties * 2
+        return points
+
+    operators = [i.argrepr for i in dis.get_instructions(calculate_score)]
+    assert "+=" in operators and "-=" in operators
+    assert_supported(
+        calculate_score,
+        [
+            LOAD_ARG_0,
+            const(3),
+            MULTIPLY,
+            store(0),
+            load(0),
+            LOAD_ARG_1,
+            ADD,
+            store(0),
+            load(0),
+            Instruction(Op.LOAD_ARG, 2),
+            const(2),
+            MULTIPLY,
+            SUBTRACT,
+            store(0),
+            load(0),
+            RETURN,
+        ],
+    )
+
+
+def test_augmented_assignment_on_an_argument():
+    # The first ``a`` is the argument; after ``a += b`` it is slot 0.
+    def update_argument(a, b):
+        a += b
+        a *= 3
+        a -= b
+        return a
+
+    assert_supported(
+        update_argument,
+        [
+            LOAD_ARG_0,
+            LOAD_ARG_1,
+            ADD,
+            store(0),
+            load(0),
+            const(3),
+            MULTIPLY,
+            store(0),
+            load(0),
+            LOAD_ARG_1,
+            SUBTRACT,
+            store(0),
+            load(0),
+            RETURN,
+        ],
+    )
+
+
+def test_augmented_assignment_matches_the_plain_form():
+    # ``x op= e`` is ``x = x op e`` with an in-place operator, so both
+    # normalize to the same instructions.
+    for op in "+-*":
+        augmented = define(f"def f(a, b):\n    a {op}= b * a\n    return a - b\n")
+        plain = define(f"def f(a, b):\n    a = a {op} (b * a)\n    return a - b\n")
+        assert analyze(augmented) == analyze(plain)
+        assert analyze(augmented).supported
+
+
+def test_augmented_assignment_reads_the_target_first():
+    # ``x`` is loaded before the right-hand side, which also reads it.
+    def example(a, b):
+        x = a
+        x -= x * b
+        return x
+
+    assert_supported(
+        example,
+        [
+            LOAD_ARG_0,
+            store(0),
+            load(0),
+            load(0),
+            LOAD_ARG_1,
+            MULTIPLY,
+            SUBTRACT,
+            store(0),
+            load(0),
+            RETURN,
+        ],
+    )
+
+
+def test_augmented_assignment_after_a_copy():
+    # ``y`` keeps slot 1, which the update of ``x`` never stores to.
+    def copy_before_update(a, b):
+        x = a
+        y = x
+        x += b
+        return y - x
+
+    assert_supported(
+        copy_before_update,
+        [
+            LOAD_ARG_0,
+            store(0),
+            load(0),
+            store(1),
+            load(0),
+            LOAD_ARG_1,
+            ADD,
+            store(0),
+            load(1),
+            load(0),
+            SUBTRACT,
+            RETURN,
+        ],
+    )
+
+
+def test_overwritten_augmented_result_is_kept():
+    def overwritten(a):
+        a += 1
+        a = 0
+        return a
+
+    assert_supported(
+        overwritten,
+        [LOAD_ARG_0, const(1), ADD, store(0), const(0), store(0), load(0), RETURN],
+    )
+
+
+def test_rejects_augmented_assignment_before_assignment():
+    def unbound(a):
+        x += a  # noqa: F821
+        return x
+
+    assert_rejected(unbound, RejectionReason.UNSUPPORTED_VARIABLE, "LOAD_FAST_CHECK", 2)
+    with pytest.raises(UnboundLocalError):
+        unbound(1)
 
 
 def test_ir_size_is_linear_in_the_source():

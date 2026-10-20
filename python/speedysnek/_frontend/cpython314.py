@@ -44,9 +44,25 @@ Details of CPython 3.14 that matter here:
   for plain assignments; CPython 3.14 emits them for tuple assignment
   (``x, y = a, b``), chained assignment (``x = y = a``, after a ``COPY``)
   and the walrus operator, all outside the subset, so they are rejected
-  like any other unsupported opcode. Augmented assignment (``a += 1``) is
-  a ``BINARY_OP`` with operator ``+=``, rejected as an unsupported
-  operator, and ``del x`` is a rejected ``DELETE_FAST``.
+  like any other unsupported opcode. ``del x`` is a rejected
+  ``DELETE_FAST``.
+- Augmented assignment to a local, ``x += <expression>``, loads ``x``,
+  evaluates the expression, then ``BINARY_OP`` with the in-place operator
+  (``argrepr`` ``+=``) and ``STORE_FAST x``. For ``def f(a, b): a += b``::
+
+      LOAD_FAST_BORROW_LOAD_FAST_BORROW 1 (a, b)
+      BINARY_OP               13 (+=)
+      STORE_FAST               0 (a)
+
+  That is the same sequence as ``x = x + <expression>`` apart from the
+  operator, so ``+=``, ``-=`` and ``*=`` become ``ADD``, ``SUBTRACT`` and
+  ``MULTIPLY``. They differ only for objects with ``__iadd__``,
+  ``__isub__`` or ``__imul__``, and an exact ``int`` has none of them; the
+  native guards admit nothing else. Other targets are rejected before
+  their ``BINARY_OP``: ``a.x += 1`` and ``a[0] += 1`` start with a
+  ``COPY``, a global with ``LOAD_GLOBAL``, a captured variable with
+  ``MAKE_CELL`` or a closure. ``x += a`` on a local not yet assigned reads
+  ``x`` first and is rejected like any other such read.
 - Integers 0..255 are loaded with ``LOAD_SMALL_INT`` (new in 3.14); other
   constants, including negative literals such as ``-1``, use
   ``LOAD_CONST``. Constant expressions such as ``2 * 3`` are folded by the
@@ -101,11 +117,16 @@ _LOAD_LOCAL_PAIR = frozenset(
 # Instructions that push a constant; ``argval`` is its value.
 _LOAD_CONSTANT = frozenset({"LOAD_SMALL_INT", "LOAD_CONST"})
 
-# Supported ``BINARY_OP`` operators, keyed by ``argrepr``.
+# Supported ``BINARY_OP`` operators, keyed by ``argrepr``. The in-place
+# forms come from augmented assignment and act like the plain ones on an
+# exact ``int``, the only type that runs natively.
 _BINARY_OPS = {
     "+": Op.ADD,
     "-": Op.SUBTRACT,
     "*": Op.MULTIPLY,
+    "+=": Op.ADD,
+    "-=": Op.SUBTRACT,
+    "*=": Op.MULTIPLY,
 }
 
 
