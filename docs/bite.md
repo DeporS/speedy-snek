@@ -34,7 +34,7 @@ inspected exactly as `hunt()` inspects it:
 - **skipped**: the frontend does not accept it, so it is left exactly as
   it was, with the same explanation `hunt()` gives;
 - **already bitten**: the module already holds a `@snekit` wrapper of it,
-  so nothing changes.
+  so no new wrapper is made.
 
 ## Only the module's names change
 
@@ -65,21 +65,37 @@ The report has one finding for the function, under its first name;
 
 `bite()` is idempotent. A function that already has a `@snekit` wrapper in
 the module, whether from an earlier `bite()` or a `@snekit` in the source,
-never gets a second one: its names, call counts and JIT state are left
-untouched and it is reported as `already_bitten`.
+never gets a second one: the wrapper object, its call count and its JIT
+state are left untouched, and the function is reported as
+`already_bitten`.
 
-If the module keeps a plain name next to a wrapper of the same function
-(`fast = snekit(slow)`), that looks deliberate, so the plain name is left
-as it is too.
+If a public name still holds the plain function next to such a wrapper,
+that name is pointed at the existing wrapper too, so it does not bypass
+the JIT:
+
+```python
+def triple(n):
+    return n * 3
+
+fast_triple = snekit(triple)   # unchanged
+# after bite(): module.triple is module.fast_triple
+```
+
+This also applies when the wrapper is under a private name, such as
+`_fast_triple = snekit(triple)`: the private name is left as it is, and
+public names of `triple` get that wrapper.
 
 ## Safety
 
-`bite()` decides everything before changing anything. It inspects every
+`bite()` updates a module all at once or not at all. It inspects every
 candidate and builds every wrapper first; if building one fails, the
-error propagates and the module is left exactly as it was. Just before
-replacing a function's names, it checks that each of them still holds the
-original function. If one has changed in the meantime, none of that
-function's names are replaced, and it is reported as skipped.
+error propagates and the module is left exactly as it was. Then it checks
+that every name it is about to replace still holds the original function.
+If even one has changed in the meantime, no name in the module is
+replaced: that function is reported as skipped because its binding
+changed, and every other function that would have been updated is
+reported as skipped because the module changed. Otherwise all names are
+replaced together, in one update of the module's namespace.
 
 Like `hunt()`, `bite()` reads and writes the module's real namespace
 directly, so custom module `__getattr__`, `__setattr__` or `__dict__`

@@ -20,8 +20,9 @@ wrapper; references held anywhere else, captured before ``bite``, still
 point to the original function. Function objects are never modified.
 
 The module is changed all at once or not at all: every candidate is
-inspected and every wrapper built before the first name is replaced, and a
-name is only replaced while it still holds the original function. Like
+inspected and every wrapper built first, then every name to replace is
+checked to still hold its original function, and only then are all of
+them replaced in one update. If any has changed, nothing is replaced. Like
 ``hunt``, ``bite`` reads the module through ``ModuleType``'s own
 ``__dict__`` descriptor and runs no user code. The native extension is
 loaded only when there is at least one function to wrap.
@@ -187,9 +188,20 @@ class BiteReport:
 
 
 class _Candidate:
-    """One function and every public module name bound to it or its wrapper."""
+    """One function and every public module name bound to it or its wrapper.
 
-    __slots__ = ("function", "names", "plain_names", "wrappers")
+    ``status``, ``wrapper`` and ``hunt`` record what ``bite`` plans for it.
+    """
+
+    __slots__ = (
+        "function",
+        "hunt",
+        "names",
+        "plain_names",
+        "status",
+        "wrapper",
+        "wrappers",
+    )
 
     def __init__(self, function: FunctionType) -> None:
         self.function = function
@@ -199,6 +211,10 @@ class _Candidate:
         self.plain_names: list[str] = []
         # The distinct ``@snekit`` wrappers of the function, with a name.
         self.wrappers: list[tuple[str, Any]] = []
+        self.status = SKIPPED
+        # The wrapper every plain name will hold: a new or an existing one.
+        self.wrapper: Any = None
+        self.hunt: HuntFinding | None = None
 
 
 def bite(
@@ -215,10 +231,16 @@ def bite(
     own public Python functions, in definition order. Each function the
     compiler frontend accepts gets one new ``@snekit`` wrapper, and every
     public name in the module bound to it, aliases included, is rebound to
-    that wrapper. Functions ``hunt`` would skip are left as they are, and
-    functions that already have a ``@snekit`` wrapper in the module are
-    reported as ``"already_bitten"`` and not touched again, so calling
-    ``bite`` twice changes nothing the second time.
+    that wrapper. Functions ``hunt`` would skip are left as they are. A
+    function that already has a ``@snekit`` wrapper in the module is
+    reported as ``"already_bitten"`` and never wrapped again; any public
+    name still holding the plain function is pointed at that existing
+    wrapper. Calling ``bite`` twice changes nothing the second time.
+
+    The module is updated all at once or not at all: if any name to be
+    replaced no longer holds its original function by the time the
+    wrappers are ready, no name is replaced and the affected functions are
+    reported as skipped.
 
     Only the module's names change. References taken before ``bite``, such
     as ``from my_module import f`` elsewhere, still hold the original
@@ -242,62 +264,44 @@ def bite(
     candidates = _module_candidates(namespace)
 
     # Decide everything before changing anything.
-    findings: list[BiteFinding | None] = []
-    to_wrap: list[tuple[int, _Candidate, HuntFinding]] = []
     analyze = None
     for candidate in candidates:
-        name = candidate.names[0]
         if candidate.wrappers:
-            findings.append(_already_bitten(candidate))
+            # Never wrap twice: plain aliases get the existing wrapper.
+            candidate.status = ALREADY_BITTEN
+            candidate.wrapper = candidate.wrappers[0][1]
             continue
         if analyze is None:
             from ._frontend import analyze
-        hunted = _inspect(name, candidate.function, analyze)
-        if not hunted.ready:
-            findings.append(
-                BiteFinding(
-                    name,
-                    candidate.function,
-                    SKIPPED,
-                    hunted.summary,
-                    hunt=hunted,
-                    names=candidate.names,
-                )
-            )
-            continue
-        to_wrap.append((len(findings), candidate, hunted))
-        findings.append(None)  # Filled in once the wrapper is in place.
+        candidate.hunt = _inspect(candidate.names[0], candidate.function, analyze)
+        candidate.status = BITTEN if candidate.hunt.ready else SKIPPED
 
     # Build every wrapper before replacing any name: if one fails, the
     # module is left exactly as it was.
-    wrappers = [_wrap(candidate.function) for _, candidate, _ in to_wrap]
+    to_wrap = [candidate for candidate in candidates if candidate.status == BITTEN]
+    wrappers = [_wrap(candidate.function) for candidate in to_wrap]
+    for candidate, wrapper in zip(to_wrap, wrappers, strict=True):
+        candidate.wrapper = wrapper
 
-    for (index, candidate, hunted), wrapper in zip(to_wrap, wrappers, strict=True):
-        name = candidate.names[0]
-        # A name may have been rebound since it was read; never clobber it.
-        if all(namespace.get(key) is candidate.function for key in candidate.names):
-            for key in candidate.names:
-                namespace[key] = wrapper
-            findings[index] = BiteFinding(
-                name,
-                candidate.function,
-                BITTEN,
-                _bitten_summary(candidate.names),
-                wrapper=wrapper,
-                hunt=hunted,
-                names=candidate.names,
-            )
-        else:
-            findings[index] = BiteFinding(
-                name,
-                candidate.function,
-                SKIPPED,
-                "its module name changed before it could be replaced",
-                hunt=hunted,
-                names=candidate.names,
-            )
+    # Every name to replace must still hold the original function. If any
+    # does not, the module changed under us: replace nothing at all.
+    updates: dict[str, Any] = {}
+    changed: list[_Candidate] = []
+    for candidate in candidates:
+        if candidate.status == SKIPPED or not candidate.plain_names:
+            continue
+        for key in candidate.plain_names:
+            if namespace.get(key) is not candidate.function:
+                changed.append(candidate)
+                break
+            updates[key] = candidate.wrapper
+    if not changed:
+        # One update of the real namespace: no module hooks, and every
+        # alias changes together.
+        dict.update(namespace, updates)
 
-    report = BiteReport(findings)  # type: ignore[arg-type]
+    findings = [_finding(candidate, changed) for candidate in candidates]
+    report = BiteReport(findings)
     if not quiet:
         _write(sys.stdout if stream is None else stream, report.render())
     return report
@@ -370,19 +374,34 @@ def _wrapped_function(wrapper: Any) -> FunctionType | None:
     return function if type(function) is FunctionType else None
 
 
-def _already_bitten(candidate: _Candidate) -> BiteFinding:
-    name, wrapper = candidate.wrappers[0]
-    summary = "already wrapped with @snekit"
-    if candidate.plain_names:
-        # The module keeps the plain function under another name too; that
-        # looks deliberate, so it is left alone rather than wrapped twice.
-        summary += f" as {name}; {', '.join(candidate.plain_names)} left as is"
+def _finding(candidate: _Candidate, changed: list[_Candidate]) -> BiteFinding:
+    """The finding for ``candidate``, once ``bite`` has committed or not."""
+    status = candidate.status
+    wrapper = candidate.wrapper
+    if status == BITTEN:
+        summary = _bitten_summary(candidate.names)
+    elif status == ALREADY_BITTEN:
+        summary = "already wrapped with @snekit"
+        if candidate.plain_names:
+            name = candidate.wrappers[0][0]
+            aliases = ", ".join(candidate.plain_names)
+            summary += f" as {name}; {aliases} now point to it too"
+    else:
+        summary = candidate.hunt.summary
+    if changed and status != SKIPPED and candidate.plain_names:
+        # Planned, but not applied: nothing in the module was replaced.
+        status, wrapper = SKIPPED, None
+        if any(candidate is other for other in changed):
+            summary = "its module binding changed before it could be updated"
+        else:
+            summary = "module changed before it could be updated"
     return BiteFinding(
         candidate.names[0],
         candidate.function,
-        ALREADY_BITTEN,
+        status,
         summary,
         wrapper=wrapper,
+        hunt=candidate.hunt,
         names=candidate.names,
     )
 

@@ -323,35 +323,118 @@ def test_existing_snekit_wrappers_are_unchanged():
     assert existing.call_count == 0
 
 
-def test_plain_name_next_to_its_wrapper_is_not_wrapped_twice():
-    module = make_module(
-        "def triple(n):\n    return n * 3\n\n\n"
-        "fast_triple = __import__('speedysnek').snekit(triple)\n"
+TRIPLE = textwrap.dedent(
+    """\
+    from speedysnek import snekit
+
+    def triple(n):
+        return n * 3
+
+    {wrapper_name} = snekit(triple)
+    times_three = triple
+    """
+)
+
+
+def counting_wrap(monkeypatch):
+    built = []
+
+    def wrap(function):
+        built.append(function)
+        return snek.snekit(function)
+
+    monkeypatch.setattr(_bite, "_wrap", wrap)
+    return built
+
+
+def jit_snapshot(wrapper):
+    state = wrapper._jit_state
+    return (
+        state,
+        wrapper.call_count,
+        state.warmup_calls,
+        state.compile_attempts,
+        state.status,
+        state.specialization,
     )
+
+
+def warm(wrapper):
+    """Compile ``wrapper``, then snapshot its JIT state."""
+    for _ in range(_WARMUP_CALLS + 1):
+        wrapper(7)
+    assert wrapper._jit_state.status is _Status.COMPILED
+    return jit_snapshot(wrapper)
+
+
+def test_plain_aliases_get_the_existing_public_wrapper(monkeypatch):
+    built = counting_wrap(monkeypatch)
+    module = make_module(TRIPLE.format(wrapper_name="fast_triple"))
     plain, wrapper = module.triple, module.fast_triple
+    warmed = warm(wrapper)
+
     report = bite(module, quiet=True)
-    assert module.triple is plain
+    assert built == []
     assert module.fast_triple is wrapper
+    assert module.triple is wrapper
+    assert module.times_three is wrapper
+    assert wrapper.__wrapped__ is plain
+    assert jit_snapshot(wrapper) == warmed
     (finding,) = report
     assert finding.name == "triple"
-    assert finding.names == ("triple", "fast_triple")
+    assert finding.names == ("triple", "fast_triple", "times_three")
     assert finding.status == "already_bitten"
+    assert finding.function is plain
     assert finding.wrapper is wrapper
     assert finding.summary == (
-        "already wrapped with @snekit as fast_triple; triple left as is"
+        "already wrapped with @snekit as fast_triple; "
+        "triple, times_three now point to it too"
     )
+    assert module.triple(5) == 15
+    assert wrapper.call_count == warmed[1] + 1
 
 
-def test_wrapper_under_a_private_name_counts():
-    module = make_module(
-        "def triple(n):\n    return n * 3\n\n\n"
-        "_fast = __import__('speedysnek').snekit(triple)\n"
-    )
-    plain = module.triple
+def test_plain_names_get_an_existing_private_wrapper(monkeypatch):
+    built = counting_wrap(monkeypatch)
+    module = make_module(TRIPLE.format(wrapper_name="_fast"))
+    plain, wrapper = module.triple, module._fast
+    warmed = warm(wrapper)
+
     (finding,) = bite(module, quiet=True)
-    assert module.triple is plain
+    assert built == []
+    assert module._fast is wrapper
+    assert module.triple is wrapper
+    assert module.times_three is wrapper
+    assert jit_snapshot(wrapper) == warmed
     assert finding.status == "already_bitten"
-    assert finding.wrapper is module._fast
+    assert finding.function is plain
+    assert finding.wrapper is wrapper
+    # The private name is used, but not reported or changed.
+    assert finding.names == ("triple", "times_three")
+    assert finding.summary == (
+        "already wrapped with @snekit as _fast; triple, times_three now point to it too"
+    )
+
+
+@pytest.mark.parametrize("wrapper_name", ["fast_triple", "_fast"])
+def test_unified_aliases_stay_put_on_a_second_bite(monkeypatch, wrapper_name):
+    built = counting_wrap(monkeypatch)
+    module = make_module(TRIPLE.format(wrapper_name=wrapper_name))
+    bite(module, quiet=True)
+    wrapper = module.triple
+    after_first = snapshot(module)
+    warmed = warm(wrapper)
+
+    (finding,) = bite(module, quiet=True)
+    assert built == []
+    after_second = snapshot(module)
+    assert after_second.keys() == after_first.keys()
+    for name, value in after_first.items():
+        assert after_second[name] is value
+    assert jit_snapshot(wrapper) == warmed
+    assert finding.status == "already_bitten"
+    assert finding.wrapper is wrapper
+    assert finding.summary == "already wrapped with @snekit"
 
 
 def test_imported_wrapper_is_not_reported():
@@ -402,25 +485,104 @@ def test_failed_wrapper_preparation_changes_nothing(monkeypatch):
         assert after[name] is value
 
 
-def test_binding_changed_before_commit_is_not_clobbered(monkeypatch):
+def test_binding_changed_before_commit_changes_nothing(monkeypatch):
     module = make_module()
+    before = snapshot(module)
+    replacement = object()
+    built = []
+
+    def wrap_and_rebind(function):
+        # ``clamp`` is wrapped last, after ``sum_squares`` is ready.
+        if function.__name__ == "clamp":
+            module.__dict__["clamp"] = replacement
+        wrapper = snek.snekit(function)
+        built.append(wrapper)
+        return wrapper
+
+    monkeypatch.setattr(_bite, "_wrap", wrap_and_rebind)
+    report = bite(module, quiet=True)
+    # The newer binding is kept, and no other name was replaced either.
+    assert module.clamp is replacement
+    after = snapshot(module)
+    assert after.keys() == before.keys()
+    for name, value in before.items():
+        if name != "clamp":
+            assert after[name] is value
+    assert len(built) == 2
+    for wrapper in built:
+        assert wrapper.call_count == 0
+
+    findings = by_name(report)
+    assert findings["clamp"].status == "skipped"
+    assert findings["clamp"].wrapper is None
+    assert findings["clamp"].summary == (
+        "its module binding changed before it could be updated"
+    )
+    assert findings["sum_squares"].status == "skipped"
+    assert findings["sum_squares"].wrapper is None
+    assert findings["sum_squares"].summary == (
+        "module changed before it could be updated"
+    )
+    assert findings["format_report"].summary == (
+        "function calls and global names are not supported"
+    )
+    assert (report.bitten_count, report.skipped_count) == (0, 3)
+
+
+def test_binding_change_also_blocks_alias_unification(monkeypatch):
+    module = make_module(
+        TRIPLE.format(wrapper_name="fast_triple")
+        + "\n\ndef double(n):\n    return n * 2\n"
+    )
+    plain, wrapper, double = module.triple, module.fast_triple, module.double
     replacement = object()
 
     def wrap_and_rebind(function):
-        if function.__name__ == "clamp":
-            module.__dict__["clamp"] = replacement
+        module.__dict__["double"] = replacement
         return snek.snekit(function)
 
     monkeypatch.setattr(_bite, "_wrap", wrap_and_rebind)
     report = bite(module, quiet=True)
-    assert module.clamp is replacement
-    finding = by_name(report)["clamp"]
-    assert finding.status == "skipped"
-    assert finding.wrapper is None
-    assert finding.summary == "its module name changed before it could be replaced"
-    # The other functions were still bitten.
-    assert by_name(report)["sum_squares"].status == "bitten"
-    assert type(module.sum_squares) is NativeWrapper
+    assert module.double is replacement
+    assert module.triple is plain
+    assert module.times_three is plain
+    assert module.fast_triple is wrapper
+    findings = by_name(report)
+    assert findings["double"].summary == (
+        "its module binding changed before it could be updated"
+    )
+    assert findings["triple"].status == "skipped"
+    assert findings["triple"].wrapper is None
+    assert findings["triple"].summary == "module changed before it could be updated"
+
+    # Once the module is stable again, a new bite applies everything.
+    monkeypatch.setattr(_bite, "_wrap", snek.snekit)
+    module.double = double
+    report = bite(module, quiet=True)
+    assert module.triple is module.times_three is wrapper
+    assert module.double.__wrapped__ is double
+    assert report.bitten_count == report.already_bitten_count == 1
+
+
+def test_already_bitten_without_changes_is_still_reported(monkeypatch):
+    module = make_module(
+        "from speedysnek import snekit\n\n"
+        "@snekit\ndef old(n):\n    return n + 1\n\n"
+        "def new(n):\n    return n + 2\n"
+    )
+    existing = module.old
+
+    def wrap_and_rebind(function):
+        module.__dict__["new"] = None
+        return snek.snekit(function)
+
+    monkeypatch.setattr(_bite, "_wrap", wrap_and_rebind)
+    findings = by_name(bite(module, quiet=True))
+    # Nothing was planned for ``old``, so its status is still true.
+    assert findings["old"].status == "already_bitten"
+    assert findings["old"].wrapper is existing
+    assert findings["new"].status == "skipped"
+    assert module.old is existing
 
 
 def test_changed_alias_leaves_every_name_alone(monkeypatch):
