@@ -14,3 +14,12 @@ cranelift-frontend = "0.136.3"
 cranelift-jit = "0.136.3"
 cranelift-module = "0.136.3"
 cranelift-native = "0.136.3"
+
+# Used by CI to build the extension for the test suite. Builds from scratch
+# in about half the time of `release` while the tests run as fast, and keeps
+# debug assertions and overflow checks on. Release wheels still use
+# `release`.
+[profile.ci]
+inherits = "dev"
+opt-level = 1
+debug = false

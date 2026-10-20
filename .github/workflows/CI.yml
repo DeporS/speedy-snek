@@ -1,12 +1,21 @@
 name: CI
 
+# Branches are tested through their pull request, so a commit pushed to a PR
+# runs CI once, not twice.
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
+
+# A new push to a pull request cancels its still-running checks. Runs on
+# main always finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint:
@@ -39,10 +48,16 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      # Caches the compiled dependencies (Cranelift, PyO3) in target/. A new
+      # Cargo.lock or Rust release starts a fresh cache.
+      - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v6
         with:
           python-version: "3.14"
+      # Builds with the `ci` profile from Cargo.toml instead of `release`.
       - name: Build and install
+        env:
+          MATURIN_PEP517_ARGS: --profile ci
         run: python -m pip install ".[tests,benchmarks]"
       # Includes the benchmark suite's correctness tests and a single-value
       # smoke run of each benchmark script. No timings are compared: the
