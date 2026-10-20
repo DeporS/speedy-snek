@@ -44,6 +44,14 @@ def const(value):
     return Instruction(Op.LOAD_CONST, value)
 
 
+def load(slot):
+    return Instruction(Op.LOAD_LOCAL, slot)
+
+
+def store(slot):
+    return Instruction(Op.STORE_LOCAL, slot)
+
+
 def binary(op):
     return (arg(0), arg(1), op, RETURN)
 
@@ -64,11 +72,16 @@ def run_i64(program, args):
     Returns ``("ok", value)`` or ``("overflow", instruction_index)``.
     """
     stack = []
+    local_slots = {}
     for index, instruction in enumerate(program):
         if instruction.op is Op.LOAD_ARG:
             stack.append(args[instruction.arg])
         elif instruction.op is Op.LOAD_CONST:
             stack.append(instruction.arg)
+        elif instruction.op is Op.LOAD_LOCAL:
+            stack.append(local_slots[instruction.arg])
+        elif instruction.op is Op.STORE_LOCAL:
+            local_slots[instruction.arg] = stack.pop()
         elif instruction.op is Op.RETURN:
             return ("ok", stack.pop())
         else:
@@ -345,9 +358,25 @@ def test_explicit_arg_count():
 def test_serialize():
     program = (arg(0), const(-5), SUBTRACT, RETURN)
     assert serialize(program) == ((1, 0), (2, -5), (4,), (6,))
+    program = (arg(0), store(3), load(3), RETURN)
+    assert serialize(program) == ((1, 0), (8, 3), (7, 3), (6,))
     assert serialize(iter(program)) == serialize(list(program))
     with pytest.raises(UnsupportedProgramError):
         serialize((const(2**63), RETURN))
+
+
+def test_opcode_numbers_are_stable():
+    # Expression-only programs keep their wire format; locals are new.
+    assert (
+        _native.OP_LOAD_ARG,
+        _native.OP_LOAD_CONST,
+        _native.OP_ADD,
+        _native.OP_SUBTRACT,
+        _native.OP_MULTIPLY,
+        _native.OP_RETURN,
+        _native.OP_LOAD_LOCAL,
+        _native.OP_STORE_LOCAL,
+    ) == (1, 2, 3, 4, 5, 6, 7, 8)
 
 
 def test_opcode_table_covers_every_op():
@@ -569,6 +598,306 @@ def test_reference_succeeds_where_native_overflows():
     assert seen > 50
 
 
+# --- Local variables -----------------------------------------------------
+
+
+def calculate_score(wins, draws, penalties):
+    points = wins * 3 + draws
+    deduction = penalties * 2
+    result = points - deduction
+    return result
+
+
+def reuse_local(a, b):
+    total = a + b
+    return total * total
+
+
+def reassign(a, b):
+    value = a + b
+    value = value * 3
+    return value - a
+
+
+def overwrite_argument(a, b):
+    a = a + 1
+    return a * b
+
+
+def copy_value(a, b):
+    x = a
+    y = x
+    x = b
+    return y - x
+
+
+def intermediate_overflow(a):
+    value = a + 1
+    value = 0
+    return value
+
+
+def unused(a, b):
+    t = a * b  # noqa: F841 -- computed, never read.
+    return a - b
+
+
+LOCAL_SHAPES = [
+    calculate_score,
+    reuse_local,
+    reassign,
+    overwrite_argument,
+    copy_value,
+    intermediate_overflow,
+    unused,
+]
+
+
+def differential(func, args):
+    """Check native code against CPython, the interpreter and ``run_i64``.
+
+    Returns ``"ok"`` or ``"overflow"``.
+    """
+    instructions = analyze(func).instructions
+    compiled = compile_i64(instructions, func.__code__.co_argcount)
+    expected = func(*args)
+    assert execute(instructions, args) == expected
+    status, detail = run_i64(instructions, args)
+    if status == "ok":
+        assert compiled(*args) == detail == expected, (func, args)
+        assert compiled.fast_call(args) == expected
+    else:
+        assert_guard(compiled, args, GuardReason.OVERFLOW, instruction_index=detail)
+        assert compiled.fast_call(args) is None
+    return status
+
+
+@pytest.mark.parametrize("func", LOCAL_SHAPES, ids=lambda f: f.__name__)
+def test_locals_end_to_end(func):
+    arity = func.__code__.co_argcount
+    rng = random.Random(f"locals-{func.__name__}")
+    for _ in range(200):
+        args = tuple(rng.randint(-(2**20), 2**20) for _ in range(arity))
+        assert differential(func, args) == "ok"
+
+
+def test_local_examples():
+    assert compile_i64(analyze(calculate_score).instructions)(5, 2, 3) == 11
+    assert compile_i64(analyze(reuse_local).instructions)(3, 4) == 49
+    assert compile_i64(analyze(reassign).instructions)(3, 4) == 18
+    assert compile_i64(analyze(overwrite_argument).instructions)(3, 4) == 16
+
+
+def test_copy_is_not_an_alias():
+    # ``y = x`` copies; reassigning ``x`` afterwards leaves ``y`` alone.
+    compiled = compile_i64(analyze(copy_value).instructions)
+    assert compiled(10, 3) == 10 - 3
+    assert compiled(-5, 7) == -12
+
+
+@pytest.mark.parametrize("func", LOCAL_SHAPES, ids=lambda f: f.__name__)
+def test_locals_at_i64_boundaries(func):
+    arity = func.__code__.co_argcount
+    values = [I64_MIN, I64_MIN + 1, -(2**32), -1, 0, 1, 2**32, I64_MAX - 1, I64_MAX]
+    seen = set()
+    for position in range(arity):
+        for value in values:
+            for other in (0, 1, -1):
+                args = tuple(value if i == position else other for i in range(arity))
+                seen.add(differential(func, args))
+    assert "ok" in seen
+
+
+def test_overflow_in_an_overwritten_computation():
+    # value = a + 1 (index 2) is overwritten by 0 before anything reads it.
+    compiled = compile_i64(analyze(intermediate_overflow).instructions)
+    assert intermediate_overflow(I64_MAX) == 0
+    assert_guard(compiled, (I64_MAX,), GuardReason.OVERFLOW, instruction_index=2)
+    assert compiled.fast_call((I64_MAX,)) is None
+    assert compiled(I64_MAX - 1) == 0
+    assert compiled(I64_MIN) == 0
+
+
+def test_overflow_in_an_unused_computation():
+    # t = a * b (index 2) is never read; a - b fits.
+    compiled = compile_i64(analyze(unused).instructions)
+    assert unused(2**32, 2**32) == 0
+    assert_guard(compiled, (2**32, 2**32), GuardReason.OVERFLOW, instruction_index=2)
+    assert compiled(2**31, 2**31) == 0
+
+
+def test_overflow_in_an_intermediate_local():
+    # points = wins * 3 + draws overflows, although the final result fits.
+    compiled = compile_i64(analyze(calculate_score).instructions)
+    args = (I64_MAX // 3 + 1, 0, I64_MAX // 2)
+    assert I64_MIN <= calculate_score(*args) <= I64_MAX
+    assert_guard(compiled, args, GuardReason.OVERFLOW, instruction_index=2)
+
+
+def test_overflow_in_a_reassigned_argument():
+    compiled = compile_i64(analyze(overwrite_argument).instructions)
+    assert_guard(compiled, (I64_MAX, 0), GuardReason.OVERFLOW, instruction_index=2)
+    assert compiled(I64_MAX - 1, 1) == I64_MAX
+
+
+def test_unread_reassigned_argument_is_still_guarded():
+    # The argument rule: every argument must be an exact i64.
+    program = (const(1), store(0), load(0), RETURN)
+    compiled = compile_i64(program, arg_count=1)
+    assert compiled(5) == 1
+    assert_guard(compiled, ("x",), GuardReason.NOT_EXACT_INT, arg_index=0)
+
+
+def test_local_index_limit():
+    program = (const(5), store(_native.MAX_LOCALS - 1))
+    program += (load(_native.MAX_LOCALS - 1), RETURN)
+    assert compile_i64(program)() == 5
+
+    program = (const(5), store(_native.MAX_LOCALS), load(_native.MAX_LOCALS), RETURN)
+    assert execute(program, ()) == 5  # Fine for the interpreter.
+    with pytest.raises(UnsupportedProgramError, match="native limit") as excinfo:
+        compile_i64(program)
+    assert excinfo.value.index == 1
+
+
+@pytest.mark.parametrize(
+    "program",
+    [
+        (load(0), RETURN),
+        (const(1), store(0), load(1), RETURN),
+        (load(0), const(1), store(0), RETURN),
+        (store(0), const(1), RETURN),
+        (const(1), store(0)),
+        (const(1), store(0), RETURN),
+        (const(1), store(0), load(0), load(0), RETURN),
+    ],
+)
+def test_malformed_local_programs_are_invalid(program):
+    with pytest.raises(InvalidProgramError):
+        compile_i64(program)
+    with pytest.raises(InvalidProgramError):
+        serialize(program)
+
+
+def test_rust_rejects_uninitialized_reads_on_its_own():
+    # Bypass Python's validation entirely.
+    with pytest.raises(ValueError, match="reads local 0 before it is assigned"):
+        _native.compile_i64(((7, 0), (6,)), 0)
+    with pytest.raises(ValueError, match="reads local 1 before it is assigned"):
+        _native.compile_i64(((2, 4), (8, 0), (7, 1), (6,)), 0)
+    function = _native.compile_i64(((2, 4), (8, 0), (7, 0), (6,)), 0)
+    assert function.call(()) == (_native.STATUS_OK, 4)
+
+
+def random_local_program(rng, arg_count, statements, slots):
+    """Random straight-line IR: assignments to ``slots`` local slots, then a
+    returned expression. Leaves read arguments, constants and assigned
+    slots."""
+    program = []
+    assigned = set()
+
+    def emit(budget):
+        if budget <= 1 or rng.random() < 0.25:
+            choice = rng.random()
+            if assigned and choice < 0.45:
+                program.append(load(rng.choice(sorted(assigned))))
+            elif arg_count and choice < 0.85:
+                program.append(arg(rng.randrange(arg_count)))
+            else:
+                program.append(const(random_value(rng)))
+            return
+        left = rng.randint(1, budget - 1)
+        emit(left)
+        emit(budget - left)
+        program.append(Instruction(rng.choice([Op.ADD, Op.SUBTRACT, Op.MULTIPLY])))
+
+    for _ in range(statements):
+        emit(rng.randint(1, 5))
+        slot = rng.randrange(slots)
+        program.append(store(slot))
+        assigned.add(slot)
+    emit(rng.randint(1, 5))
+    program.append(RETURN)
+    return tuple(program)
+
+
+def test_differential_random_local_programs():
+    rng = random.Random("speedysnek-native-locals")
+    outcomes = {"ok": 0, "overflow": 0}
+    for _ in range(300):
+        arg_count = rng.randrange(4)
+        program = random_local_program(
+            rng, arg_count, rng.randint(1, 6), rng.randint(1, 4)
+        )
+        compiled = compile_i64(program, arg_count)
+        for _ in range(8):
+            args = tuple(random_value(rng) for _ in range(arg_count))
+            expected, detail = run_i64(program, args)
+            outcomes[expected] += 1
+            if expected == "ok":
+                assert compiled(*args) == execute(program, args) == detail, (
+                    program,
+                    args,
+                )
+            else:
+                assert_guard(
+                    compiled, args, GuardReason.OVERFLOW, instruction_index=detail
+                )
+    assert outcomes["ok"] > 500
+    assert outcomes["overflow"] > 300
+
+
+def random_local_source(rng, arg_count):
+    """Random Python source for a straight-line function with assignments,
+    reassignments (arguments included) and copies."""
+    params = [f"a{i}" for i in range(arg_count)]
+    names = params + ["x", "y", "total"]
+    bound = list(params)
+
+    def expr(depth=0):
+        if depth >= 2 or rng.random() < 0.35:
+            if bound and rng.random() < 0.8:
+                return rng.choice(bound)
+            return str(rng.choice([0, 1, 2, 3, 7, 255, 256, 1000, -1, -5]))
+        op = rng.choice("+-*")
+        return f"({expr(depth + 1)} {op} {expr(depth + 1)})"
+
+    lines = []
+    for _ in range(rng.randint(1, 5)):
+        target = rng.choice(names)
+        lines.append(f"    {target} = {expr()}")
+        if target not in bound:
+            bound.append(target)
+    lines.append(f"    return {expr()}")
+    return f"def f({', '.join(params)}):\n" + "\n".join(lines) + "\n"
+
+
+def test_differential_random_python_functions():
+    # Python source -> frontend -> native, against CPython itself.
+    rng = random.Random("speedysnek-native-local-source")
+    outcomes = {"ok": 0, "overflow": 0}
+    for _ in range(150):
+        namespace = {}
+        exec(random_local_source(rng, rng.randrange(4)), namespace)
+        func = namespace["f"]
+        assert analyze(func).supported, analyze(func).rejection
+        for _ in range(6):
+            args = tuple(
+                rng.choice([rng.randint(-50, 50), random_value(rng)])
+                for _ in range(func.__code__.co_argcount)
+            )
+            outcomes[differential(func, args)] += 1
+    assert outcomes["ok"] > 400
+    assert outcomes["overflow"] > 50
+
+
+def test_expression_only_programs_are_unchanged():
+    # Functions without assignments never use local slots.
+    for func in SHAPES:
+        ops = {i.op for i in analyze(func).instructions}
+        assert not ops & {Op.LOAD_LOCAL, Op.STORE_LOCAL}
+
+
 # --- Native ABI and serialized IR ----------------------------------------
 
 
@@ -602,6 +931,7 @@ def test_native_call_validates_arguments(args, error):
 
 
 LOAD_ARG_0 = (1, 0)
+MAX_LOCALS = _native.MAX_LOCALS
 
 
 @pytest.mark.parametrize(
@@ -639,6 +969,22 @@ LOAD_ARG_0 = (1, 0)
         ((LOAD_ARG_0, (6,)), True, TypeError),
         ((LOAD_ARG_0, (6,)), 1.0, TypeError),
         ((LOAD_ARG_0, (6,)), None, TypeError),
+        # Local variables, checked by Rust alone.
+        (((7,), (6,)), 0, ValueError),  # LOAD_LOCAL without operand.
+        (((2, 1), (8,), (2, 1), (6,)), 0, ValueError),  # STORE_LOCAL without.
+        (((7, -1), (6,)), 0, ValueError),  # Negative local index.
+        (((2, 1), (8, -1), (2, 1), (6,)), 0, ValueError),
+        (((2, 1), (8, 2**40), (7, 2**40), (6,)), 0, ValueError),  # Not a u32.
+        (((2, 1), (8, MAX_LOCALS), (7, MAX_LOCALS), (6,)), 0, ValueError),
+        (((7, 0), (6,)), 0, ValueError),  # Read before any store.
+        (((2, 1), (8, 0), (7, 1), (6,)), 0, ValueError),  # Another slot.
+        (((7, 0), (2, 1), (8, 0), (6,)), 0, ValueError),  # Stored only later.
+        (((8, 0), (2, 1), (6,)), 0, ValueError),  # STORE_LOCAL underflow.
+        (((2, 1), (8, 0)), 0, ValueError),  # Ends without RETURN.
+        (((2, 1), (8, 0), (6,)), 0, ValueError),  # RETURN on an empty stack.
+        (((2, 1), (8, 0), (7, 0), (7, 0), (6,)), 0, ValueError),  # Extra value.
+        (((2, 1), (6,), (8, 0)), 0, ValueError),  # Store after RETURN.
+        (((2, 1), (8, True), (7, 0), (6,)), 0, TypeError),  # bool index.
     ],
 )
 def test_malformed_serialized_programs(program, arg_count, error):
@@ -653,8 +999,8 @@ def test_malformed_input_does_not_crash_the_interpreter():
 import random
 from speedysnek import _native
 rng = random.Random(0)
-values = [0, 1, 2, 3, 4, 5, 6, 7, -1, 2**63, -(2**63) - 1, True, None, 1.5, "x", ()]
-for _ in range(5000):
+values = [0, 1, 2, 3, 4, 5, 6, 7, 8, -1, 2**63, -(2**63) - 1, True, None, 1.5, "x", ()]
+for _ in range(10000):
     program = tuple(
         tuple(rng.choice(values) for _ in range(rng.randrange(4)))
         for _ in range(rng.randrange(6))

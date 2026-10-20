@@ -35,6 +35,14 @@ def const(value):
     return Instruction(Op.LOAD_CONST, value)
 
 
+def load(slot):
+    return Instruction(Op.LOAD_LOCAL, slot)
+
+
+def store(slot):
+    return Instruction(Op.STORE_LOCAL, slot)
+
+
 def instructions_of(func):
     analysis = analyze(func)
     assert analysis.supported, analysis.rejection
@@ -106,6 +114,43 @@ def test_unread_arguments_are_ignored():
     assert execute((arg(0), RETURN), (5, 1.5, None)) == 5
 
 
+def test_store_and_load_local():
+    # x = a + b; return x * x
+    program = (arg(0), arg(1), ADD, store(0), load(0), load(0), MULTIPLY, RETURN)
+    assert execute(program, (3, 4)) == 49
+
+
+def test_store_copies_the_value():
+    # x = a; y = x; x = b; return y - x -- ``y`` keeps the old value of ``x``.
+    program = (arg(0), store(0), load(0), store(1), arg(1), store(0))
+    program += (load(1), load(0), SUBTRACT, RETURN)
+    assert execute(program, (10, 3)) == 7
+
+
+def test_reassigned_argument_slot_and_original_argument():
+    # a2 = a + 1; return a2 * a -- LOAD_ARG still reads the original ``a``.
+    program = (arg(0), const(1), ADD, store(0), load(0), arg(0), MULTIPLY, RETURN)
+    assert execute(program, (5,)) == 30
+
+
+def test_overwritten_local():
+    program = (arg(0), const(1), ADD, store(0), const(0), store(0), load(0), RETURN)
+    assert execute(program, (2**63 - 1,)) == 0
+
+
+def test_sparse_local_slots():
+    # Hand-written IR may use any non-negative slot numbers.
+    program = (const(7), store(10**9), load(10**9), RETURN)
+    assert execute(program, ()) == 7
+
+
+def test_unread_reassigned_argument_is_not_guarded():
+    # def f(a): a = 1; return a -- CPython never looks at the old ``a``.
+    program = (const(1), store(0), load(0), RETURN)
+    assert validate(program) == ()
+    assert execute(program, ("not an int",)) == 1
+
+
 def test_accepts_lists_and_other_iterables():
     assert execute([arg(0), arg(1), ADD, RETURN], [2, 3]) == 5
     assert execute(iter([arg(0), RETURN]), iter([9])) == 9
@@ -172,6 +217,55 @@ def ignores_first(a, b):
     return b * 2
 
 
+def calculate_score(wins, draws, penalties):
+    points = wins * 3 + draws
+    deduction = penalties * 2
+    result = points - deduction
+    return result
+
+
+def reuse_local(a, b):
+    total = a + b
+    return total * total
+
+
+def reassign(a, b):
+    value = a + b
+    value = value * 3
+    return value - a
+
+
+def overwrite_argument(a, b):
+    a = a + 1
+    return a * b
+
+
+def copy_value(a, b):
+    x = a
+    y = x
+    x = b
+    return y - x
+
+
+def overwritten(a):
+    value = a + 1
+    value = 0
+    return value
+
+
+def unused(a, b):
+    t = a * b  # noqa: F841 -- computed, never read.
+    return a - b
+
+
+def swap_through_temporary(a, b, c):
+    t = a
+    a = b
+    b = t
+    c = c * a - b
+    return a * 1000 + b * 10 + c
+
+
 SHAPES = [
     add,
     sub,
@@ -186,6 +280,14 @@ SHAPES = [
     nested,
     big_constants,
     ignores_first,
+    calculate_score,
+    reuse_local,
+    reassign,
+    overwrite_argument,
+    copy_value,
+    overwritten,
+    unused,
+    swap_through_temporary,
 ]
 
 
@@ -418,6 +520,30 @@ def test_bool_rejected_end_to_end():
         ((arg(0), arg(1), RETURN), "leaves 1 extra value", 2),
         ((const(1), const(2), const(3), ADD, RETURN), "leaves 1 extra value", 4),
         ((arg(0), arg(1), arg(2), RETURN), "leaves 2 extra value", 3),
+        # Local variables.
+        (
+            (load(0), RETURN),
+            "LOAD_LOCAL at index 0 reads local 0 before it is assigned",
+            0,
+        ),
+        ((arg(0), store(0), load(1), RETURN), "reads local 1 before it is assigned", 2),
+        ((load(0), arg(0), store(0), RETURN), "reads local 0 before", 0),
+        # A store later in the program does not help an earlier read.
+        ((arg(0), load(3), ADD, const(1), store(3), RETURN), "reads local 3", 1),
+        (
+            (store(0), const(1), RETURN),
+            "stack underflow at index 0: STORE_LOCAL needs 1",
+            0,
+        ),
+        (
+            (arg(0), store(0), store(1), load(0), RETURN),
+            "stack underflow at index 2",
+            2,
+        ),
+        ((arg(0), store(0), RETURN), "stack underflow at index 2: RETURN needs 1", 2),
+        ((arg(0), store(0)), "program has no RETURN", None),
+        ((arg(0), store(0), load(0), load(0), RETURN), "leaves 1 extra value", 4),
+        ((arg(0), RETURN, store(0)), "RETURN at index 1 is not the final", 1),
     ],
 )
 def test_invalid_programs(program, message, index):
@@ -451,6 +577,13 @@ def corrupt(instruction, **fields):
         (corrupt(const(1), arg=1.5), "LOAD_CONST at index 0 needs an int"),
         (corrupt(const(1), op="LOAD_CONST"), "unknown operation 'LOAD_CONST'"),
         (corrupt(const(1), op=Op.ADD), "ADD at index 0 takes no argument"),
+        (corrupt(load(0), arg=-1), "LOAD_LOCAL at index 0 has negative local index"),
+        (corrupt(load(0), arg=None), "LOAD_LOCAL at index 0 needs an int"),
+        (corrupt(load(0), arg=False), "needs an int argument, got bool"),
+        (corrupt(load(0), arg=1.0), "needs an int argument, got float"),
+        (corrupt(store(0), arg=-2), "STORE_LOCAL at index 0 has negative local"),
+        (corrupt(store(0), arg="0"), "STORE_LOCAL at index 0 needs an int"),
+        (corrupt(store(0), arg=True), "needs an int argument, got bool"),
     ],
 )
 def test_corrupted_instructions(instruction, message):
@@ -479,6 +612,10 @@ def test_validate_reports_read_arguments():
     assert validate((arg(3), arg(0), ADD, arg(3), MULTIPLY, RETURN)) == (0, 3)
     assert validate(analyze(reuse).instructions) == (0, 1, 2)
     assert validate(analyze(ignores_first).instructions) == (1,)
+    # Local slots are not arguments; a reassigned argument read only
+    # afterwards is not read as an argument at all.
+    assert validate(analyze(copy_value).instructions) == (0, 1)
+    assert validate((arg(1), store(0), load(0), RETURN)) == (1,)
 
 
 def test_error_categories_are_distinct():

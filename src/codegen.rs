@@ -17,6 +17,15 @@
 //!
 //! Failures are ordinary branches to a block that returns a status code.
 //! The generated code never traps, never unwinds and never calls anything.
+//!
+//! Like the operand stack, local slots exist only at compile time: a slot
+//! names the SSA value most recently stored in it. A `STORE_LOCAL` rebinds
+//! the slot and copies nothing at run time, and every `LOAD_LOCAL` of it
+//! reuses that one value, so an assigned expression is computed once. SSA
+//! values never change, so a later store to one slot cannot affect a value
+//! already read from it or copied to another. Every `ADD`, `SUBTRACT` and
+//! `MULTIPLY` keeps its own overflow branch, even when its result is later
+//! overwritten or never read.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -57,7 +66,7 @@ pub struct NativeCode {
 impl NativeCode {
     /// Validate `ops` and compile them for exactly `arg_count` arguments.
     pub fn compile(ops: &[Op], arg_count: usize) -> Result<Self, String> {
-        program::validate(ops, arg_count)?;
+        let local_count = program::validate(ops, arg_count)?;
 
         let isa = host_isa()?;
         let mut module = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
@@ -101,6 +110,8 @@ impl NativeCode {
         // The stack machine exists only at compile time: each stack slot is
         // an SSA value, so the generated code keeps values in registers.
         let mut stack: Vec<Value> = Vec::new();
+        // The value each local slot holds; `None` until it is first stored.
+        let mut locals: Vec<Option<Value>> = vec![None; local_count];
         for (index, op) in ops.iter().enumerate() {
             match *op {
                 Op::LoadArg(arg) => {
@@ -114,6 +125,23 @@ impl NativeCode {
                     );
                 }
                 Op::LoadConst(value) => stack.push(b.ins().iconst(types::I64, value)),
+                Op::LoadLocal(slot) => {
+                    // Unreachable after validation, but an error is better
+                    // than a panic or a made-up value.
+                    let value = locals
+                        .get(slot as usize)
+                        .copied()
+                        .flatten()
+                        .ok_or_else(|| format!("local {slot} read before assignment"))?;
+                    stack.push(value);
+                }
+                Op::StoreLocal(slot) => {
+                    let value = pop(&mut stack)?;
+                    let entry = locals
+                        .get_mut(slot as usize)
+                        .ok_or_else(|| format!("local {slot} out of range"))?;
+                    *entry = Some(value);
+                }
                 Op::Add | Op::Subtract | Op::Multiply => {
                     let right = pop(&mut stack)?;
                     let left = pop(&mut stack)?;

@@ -9,8 +9,9 @@ This is the first stage of the compiler pipeline::
            or Cranelift i64 backend  (``speedysnek._compiler``)
 
 Only straight-line functions of positional arguments, ``int`` constants,
-``+``, ``-``, ``*`` and ``return`` are supported. Everything else is
-rejected with a machine-readable :class:`RejectionReason`.
+``+``, ``-``, ``*``, assignments to local variables (including arguments)
+and ``return`` are supported. Everything else is rejected with a
+machine-readable :class:`RejectionReason`.
 
 :func:`speedysnek.snekit` calls :func:`analyze` once per decorated function,
 after warmup; a rejection makes it run the original function from then on.
