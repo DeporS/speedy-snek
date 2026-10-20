@@ -139,3 +139,10 @@ old_calculation  already bitten  already wrapped with @snekit
 - `summary`: a short, human-readable explanation;
 - `hunt`: the `HuntFinding` for the function, with the frontend's
   `reason`, `detail` and `lineno`; `None` when already bitten.
+
+## Afterwards
+
+Once the bitten functions have been called for a while,
+[`snek.peek(my_module)`](peek.md) shows what the JIT did with each one:
+still warming up, compiled, or disabled and why. It reads state only;
+it calls and changes nothing.

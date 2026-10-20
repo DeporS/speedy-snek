@@ -1719,6 +1719,9 @@ def test_backend_is_private():
         "bite",
         "BiteReport",
         "BiteFinding",
+        "peek",
+        "PeekReport",
+        "PeekFinding",
     ]
     for name in ("compile_i64", "CompiledI64", "NativeGuardFailure", "I64Function"):
         assert not hasattr(speedysnek, name)

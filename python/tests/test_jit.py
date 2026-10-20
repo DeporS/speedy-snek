@@ -18,6 +18,9 @@ def test_public_api():
         "bite",
         "BiteReport",
         "BiteFinding",
+        "peek",
+        "PeekReport",
+        "PeekFinding",
     ]
     assert speedysnek.snekit is snekit
 
