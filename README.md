@@ -9,7 +9,8 @@ Need more speed? Just `@snekit`.
 SpeedySnek is a small educational JIT compiler experiment for CPython 3.14.
 **`@snekit` performs experimental native compilation**: a decorated
 function in the supported integer subset (arithmetic, local variables,
-simple `if`/`else` and one `while` loop) is compiled once,
+simple `if`/`else` and one `while` loop or `for` loop over `range(n)`) is
+compiled once,
 after a short warmup, to signed 64-bit machine code with Cranelift.
 Everything else, including every unsupported function, argument or call,
 safely falls back to normal Python.
@@ -175,10 +176,35 @@ def sum_squares(n):
 sum_squares(10_000)   # 333283335000, native after warmup
 ```
 
+A `for` loop over `range(n)` works the same way:
+
+```python
+@snekit
+def conditional_sum(n, cutoff):
+    total = 0
+    for i in range(n):
+        if i < cutoff:
+            total += i
+        else:
+            total += i * 2
+    return total
+
+conditional_sum(10_000, 5_000)   # 87492500, native after warmup
+```
+
+Only the builtin `range` with exactly one argument is supported:
+`range(start, stop)`, `range(start, stop, step)`, keyword arguments and
+every other iterable run as plain Python. The compiled code relies on
+`range` being the builtin, so `@snekit` checks that before compiling and
+watches the function's globals and builtins afterwards: if `range` is
+shadowed, replaced or deleted later, the next call runs as plain Python
+(with whatever `range` now is), and so does every call after it. See
+[`docs/for-range.md`](docs/for-range.md).
+
 Native code holds the GIL, so one call may run at most 1,000,000 loop
-iterations natively. A call that needs more is restarted from the
-beginning in plain Python, so it does that work twice; nothing about the
-result changes. See [`docs/loops.md`](docs/loops.md).
+iterations natively, `while` or `for`. A call that needs more is restarted
+from the beginning in plain Python, so it does that work twice; nothing
+about the result changes. See [`docs/loops.md`](docs/loops.md).
 
 What compiles today:
 
@@ -189,16 +215,23 @@ What compiles today:
 - `if`, `if`/`else` and `elif`, nested or one after another, whose
   condition is a single `<`, `<=`, `>`, `>=`, `==` or `!=` between integer
   expressions;
-- one `while` loop per function, not nested in another loop, with such a
-  condition, and any of the above in its body, before it and after it;
+- one loop per function, not nested in another loop, with any of the
+  above in its body, before it and after it: either a `while` loop with
+  such a condition, or a `for` loop over the builtin `range` with one
+  argument, an integer expression of the above (`for i in range(n * 2 -
+  m):`), assigning one local variable;
 - `return` of an integer expression at the end of every path.
 
 A variable assigned in only some branches can be read after them only if
 it was assigned before the `if`; otherwise the function runs as plain
 Python, which raises `UnboundLocalError` where Python would.
 
-Still running as plain Python: `for` loops, nested or several `while`
-loops, `break`, `return` inside a loop, `while True:`, `and`, `or` and
+Still running as plain Python: `for` loops over anything but `range(n)`
+(including `range(start, stop)`, `range(start, stop, step)`, `range(stop=n)`
+and `for a, b in ...`), nested or several loops (two `for` loops, or a
+`for` and a `while`), `break`, `return` inside a loop, `while True:`,
+reading a `for` loop's variable after the loop when an empty range would
+leave it unassigned, `and`, `or` and
 `not` in conditions (except `and` between comparisons, which CPython
 compiles exactly like nested `if` statements), chained comparisons
 (`a < b < c`), conditions that are not a comparison (`if a:`, `is`, `in`),
@@ -210,8 +243,8 @@ item updates (`obj.x += 1`, `items[0] += 1`), tuple assignment, `try` and
 not source, a `return` inside a branch and a conditional expression such
 as `return a if a < b else b` are compiled when CPython emits them the
 same way as an `if` statement with a `return` in each branch. Likewise, a
-`continue` and a `while`/`else` without `break` compile, because their
-bytecode is identical to supported `if`/`else` forms.
+`continue` and a `while`/`else` or `for`/`else` without `break` compile,
+because their bytecode is identical to supported `if`/`else` forms.
 
 `@jit` is the descriptive, backwards-compatible name for the same
 decorator: `speedysnek.jit is speedysnek.snekit`, so existing
@@ -282,14 +315,19 @@ Each decorated function has its own small state machine:
   argument's Python code (no `__index__`, `__int__`, `__repr__` or
   metaclass hooks). Only an unexpected error from the native code
   disables the specialization.
-- **Disabled.** If the function is outside the supported subset (`for` and
-  nested loops, conditions other than one integer comparison, calls,
-  globals, closures, generators, async functions, keyword arguments, a
-  variable that may be read before it is assigned, …), the backend cannot
-  compile it, or the compiler fails unexpectedly, it is never compiled again
-  and every call runs the original function. Replacing the function's
-  `__code__` after compilation also disables the cached code; stale machine
-  code is never run, and there is no recompilation yet.
+- **Disabled.** If the function is outside the supported subset (`for`
+  loops over anything but `range(n)`, nested loops, conditions other than
+  one integer comparison, calls, globals, closures, generators, async
+  functions, keyword arguments, a variable that may be read before it is
+  assigned, …), the backend cannot compile it, or the compiler fails
+  unexpectedly, it is never compiled again and every call runs the
+  original function. A `for` loop over a `range` that is not the builtin
+  when the function is compiled, or whose globals or builtins cannot be
+  checked without running Python code (a dict subclass, a key that is not
+  a `str`), is disabled the same way. Replacing the function's `__code__`,
+  or changing what `range` means for it, after compilation also disables
+  the cached code; stale machine code is never run, and there is no
+  recompilation yet.
 
 Whenever native execution does not apply, the original function is called
 exactly once, and its result or exception is passed through unchanged.
@@ -334,18 +372,23 @@ conditionals in [`docs/conditionals.md`](docs/conditionals.md).
 
 Current status:
 
-- Only **integer arithmetic with `if`/`else` and one `while` loop** is
+- Only **integer arithmetic with `if`/`else` and one loop** is
   supported: positional arguments, `int` constants, `+`, `-`, `*`, plain
   assignments to local variables (`x = a + b`, including reassigning an
   argument), `+=`, `-=` and `*=` on local variables and arguments, `if`
-  statements and one `while` loop on one integer comparison, and `return`.
+  statements, one `while` loop on one integer comparison or one `for`
+  loop over `range(n)`, and `return`.
   An augmented assignment becomes the same `ADD`, `SUBTRACT` or `MULTIPLY`
   followed by `STORE_LOCAL` as the equivalent `x = x + …`: native code only
   ever sees exact `int`s, which have no in-place operators, and any other
   value falls back to Python, which calls its `__iadd__`, `__isub__` or
   `__imul__` as usual.
 - **One loop at most**: a `while` loop becomes a test, a body and a
-  `JUMP` back to the test, the only backward jump the IR allows; `for`,
+  `JUMP` back to the test, the only backward jump the IR allows. A `for`
+  loop over `range(n)` becomes the same loop over two hidden local slots,
+  the bound and a counter (the iterator never reaches the IR), and the
+  analysis records that it assumes the builtin `range`, which `@snekit`
+  guards ([`docs/for-range.md`](docs/for-range.md)). Other `for` loops,
   nested loops and loops left other than by their condition are rejected.
   Conditions must be one `COMPARE_OP` directly consumed by
   `POP_JUMP_IF_FALSE` (or, at the end of a loop body, `POP_JUMP_IF_TRUE`
@@ -516,6 +559,12 @@ found `sum_squares` and `conditional_sum` 2.2–2.8× faster than plain
 Python at 10 iterations and 20–30× faster from 1,000 iterations up, while
 a call needing more than the 1,000,000-iteration budget was about 3%
 slower, because its first million iterations run twice.
+A short [measurement of `for` loops over `range(n)`](benchmarks/experiments/for_range.md)
+found them as fast as the equivalent warmed `while` loops (for
+`conditional_sum` 15–25% faster from 100 iterations up): 1.6–2.0× faster
+than plain Python at 10 iterations and 21–24× faster at 10,000. The range
+guard took under 10 µs once, at compilation, and no measurable time on
+calls of functions that do not use `range`.
 
 [`benchmarks/README.md`](benchmarks/README.md) explains the methodology,
 how to get more stable numbers, and how to update the baseline.

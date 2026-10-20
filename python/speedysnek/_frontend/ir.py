@@ -188,6 +188,7 @@ class RejectionReason(enum.StrEnum):
     UNSUPPORTED_CONSTANT = enum.auto()
     UNSUPPORTED_VARIABLE = enum.auto()
     UNSUPPORTED_CONDITION = enum.auto()
+    UNSUPPORTED_ITERATION = enum.auto()
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,17 +214,29 @@ class Analysis:
     A supported function has normalized ``instructions`` and no
     ``rejection``. A rejected function has a ``rejection`` and no
     instructions: partial translations are never exposed.
+
+    ``assumed_builtins`` names the builtins whose binding the instructions
+    take for granted: ``("range",)`` for a ``for`` loop over ``range``,
+    which the instructions replace with integer arithmetic. They are only
+    equivalent to the function while each name resolves, through the
+    function's globals and then its builtins, to the genuine builtin.
+    Whoever runs the instructions in place of the function must check that
+    (``speedysnek.snekit`` does).
     """
 
     instructions: tuple[Instruction, ...] = ()
     rejection: Rejection | None = None
+    assumed_builtins: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "instructions", tuple(self.instructions))
+        object.__setattr__(self, "assumed_builtins", tuple(self.assumed_builtins))
         if (self.rejection is None) == (not self.instructions):
             raise ValueError(
                 "an Analysis needs instructions or a rejection, but not both"
             )
+        if self.rejection is not None and self.assumed_builtins:
+            raise ValueError("a rejected Analysis assumes no builtins")
 
     @property
     def supported(self) -> bool:

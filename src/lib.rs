@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 
 mod codegen;
+mod guard;
 mod program;
 
 /// A Python module implemented in Rust.
@@ -18,6 +19,12 @@ mod program;
 ///
 /// `NativeWrapper` is the object `@snekit` returns. It runs the fast path's
 /// Rust code directly, without calling `try_call` through Python.
+///
+/// A function with a `for` loop over `range` is compiled to a program that
+/// no longer mentions `range`. `RangeGuard` proves that the function's
+/// `range` is the builtin and watches its globals and builtins for
+/// changes; a `GuardedI64Function` pairs it with the machine code, and the
+/// wrapper checks it before every native call (see `guard.rs`).
 #[pymodule]
 mod _native {
     use std::ffi::c_int;
@@ -35,6 +42,8 @@ mod _native {
     use pyo3::types::{PyDict, PyInt, PyTuple, PyType};
     use pyo3::{PyTraverseError, PyVisit};
 
+    use crate::guard::{Guard, Unguardable};
+
     use crate::codegen::{
         DEFAULT_BACKEDGE_BUDGET, MAX_BACKEDGE_BUDGET, NativeCode, STATUS_BAD_ARITY,
         STATUS_BUDGET_EXHAUSTED, STATUS_OK, STATUS_OVERFLOW,
@@ -50,6 +59,14 @@ mod _native {
         CodegenError,
         PyRuntimeError,
         "Cranelift could not compile a valid program for this host."
+    );
+
+    create_exception!(
+        _native,
+        UnguardableBinding,
+        PyException,
+        "A function's range cannot be proven to be the builtin range without \
+         running Python code, or is not the builtin range."
     );
 
     #[pymodule_init]
@@ -82,6 +99,10 @@ mod _native {
         // Lets benchmarks record, and warn about, unrepresentative builds.
         m.add("DEBUG_BUILD", cfg!(debug_assertions))?;
         m.add("CodegenError", m.py().get_type::<CodegenError>())?;
+        m.add(
+            "UnguardableBinding",
+            m.py().get_type::<UnguardableBinding>(),
+        )?;
         Ok(())
     }
 
@@ -220,6 +241,83 @@ mod _native {
         }
     }
 
+    /// A proof that `range`, as one function looks it up, is the builtin
+    /// `range`, which stays valid until the function's globals or builtins
+    /// change in a way that could affect it.
+    ///
+    /// `RangeGuard(globals, builtins)` takes the function's `__globals__` and
+    /// `__builtins__`. It raises `UnguardableBinding` if they are not exact
+    /// dicts, if either has a key that is not an exact `str`, or if `range`
+    /// does not resolve to the builtin `range` type. It runs no Python code.
+    #[pyclass(frozen, module = "speedysnek._native")]
+    struct RangeGuard {
+        guard: Guard,
+    }
+
+    #[pymethods]
+    impl RangeGuard {
+        #[new]
+        fn new(globals: &Bound<'_, PyAny>, builtins: &Bound<'_, PyAny>) -> PyResult<Self> {
+            match Guard::new(globals.py(), globals, builtins)? {
+                Ok(guard) => Ok(RangeGuard { guard }),
+                Err(Unguardable(reason)) => Err(UnguardableBinding::new_err(reason)),
+            }
+        }
+
+        /// Whether the binding still holds. Once false, it stays false.
+        #[getter]
+        fn valid(&self) -> bool {
+            self.guard.valid()
+        }
+    }
+
+    /// An `I64Function` that may only stand in for its Python function
+    /// while a `RangeGuard` holds.
+    ///
+    /// The `NativeWrapper` checks the guard before every native call and
+    /// reports a failed guard to the JIT state instead of running the code.
+    /// `try_call` has `I64Function.try_call`'s contract, with a failed
+    /// guard as one more guard miss.
+    #[pyclass(frozen, module = "speedysnek._native")]
+    struct GuardedI64Function {
+        function: Py<I64Function>,
+        guard: Py<RangeGuard>,
+    }
+
+    #[pymethods]
+    impl GuardedI64Function {
+        #[new]
+        fn new(function: Py<I64Function>, guard: Py<RangeGuard>) -> Self {
+            GuardedI64Function { function, guard }
+        }
+
+        #[getter]
+        fn function(&self, py: Python<'_>) -> Py<I64Function> {
+            self.function.clone_ref(py)
+        }
+
+        #[getter]
+        fn guard(&self, py: Python<'_>) -> Py<RangeGuard> {
+            self.guard.clone_ref(py)
+        }
+
+        #[getter]
+        fn arg_count(&self) -> usize {
+            self.function.get().code.arg_count()
+        }
+
+        #[pyo3(signature = (args, /))]
+        fn try_call(&self, args: &Bound<'_, PyAny>) -> PyResult<Option<i64>> {
+            let args = args
+                .cast_exact::<PyTuple>()
+                .map_err(|_| PyTypeError::new_err("args must be a tuple"))?;
+            if !self.guard.get().guard.valid() {
+                return Ok(None);
+            }
+            self.function.get().try_call_tuple(args)
+        }
+    }
+
     /// `types.MethodType`, used to bind a `NativeWrapper` like a function.
     static METHOD_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 
@@ -231,8 +329,9 @@ mod _native {
     /// It runs the decorator's per-call logic without a Python frame.
     /// Compilation and every state transition stay in the Python
     /// `_JitState`; this object only reads `state.specialization` and
-    /// `state.status` and calls the state's `cold_call`, `invalidate` and
-    /// `native_failed` methods. It binds as a method like a function.
+    /// `state.status` and calls the state's `cold_call`, `invalidate`,
+    /// `binding_changed` and `native_failed` methods. It binds as a method
+    /// like a function.
     ///
     /// Metadata copied by `functools.update_wrapper` lives in the instance
     /// `__dict__`, except `__annotate__` and `__annotations__`, which behave
@@ -352,9 +451,12 @@ mod _native {
                 state.call_method0(intern!(py, "invalidate"))?;
             } else if kwargs.is_none_or(|kwargs| kwargs.is_empty()) {
                 match native_call(&spec, args) {
-                    Ok(Some(result)) => return Ok(result),
-                    // A guard miss.
-                    Ok(None) => {}
+                    Ok(Native::Result(result)) => return Ok(result),
+                    Ok(Native::Miss) => {}
+                    // `range` may no longer be the builtin: never again.
+                    Ok(Native::BindingChanged) => {
+                        state.call_method0(intern!(py, "binding_changed"))?;
+                    }
                     // Unexpected: disable, then fall back.
                     Err(error) if error.is_instance_of::<PyException>(py) => {
                         state
@@ -552,38 +654,62 @@ mod _native {
         }
     }
 
-    /// The native attempt: `Some(result)`, or `None` for a guard miss or a
-    /// call with another arity.
+    /// What a native attempt did.
+    enum Native<'py> {
+        /// The native code ran and returned this.
+        Result(Bound<'py, PyAny>),
+        /// A guard miss, or a call with another arity: nothing ran.
+        Miss,
+        /// The specialization's `RangeGuard` failed: nothing ran, and the
+        /// specialization must not be used again.
+        BindingChanged,
+    }
+
+    /// The native attempt.
     ///
     /// A real specialization's `function` is an `I64Function`, run through
-    /// the same helper as `try_call`. `function` is a strong reference, so
-    /// the machine code stays alive for the whole call even if the
+    /// the same helper as `try_call`, or, for a function that uses `range`,
+    /// a `GuardedI64Function`, whose guard is checked first. Only the second
+    /// kind pays for the check. `function` is a strong reference, so the
+    /// machine code stays alive for the whole call even if the
     /// specialization is replaced meanwhile. Any other `function` (only test
     /// doubles use one) means: call `spec.fast_call`, which has `try_call`'s
     /// contract.
     fn native_call<'py>(
         spec: &Bound<'py, PyAny>,
         args: &Bound<'py, PyTuple>,
-    ) -> PyResult<Option<Bound<'py, PyAny>>> {
+    ) -> PyResult<Native<'py>> {
         let py = spec.py();
         let function = spec.getattr(intern!(py, "function"))?;
-        if let Ok(function) = function.cast::<I64Function>() {
-            let function = function.get();
-            // As in the Python wrapper, a call with another arity (an
-            // omitted default) makes no native call at all.
-            if args.len() != function.code.arg_count() {
-                return Ok(None);
+        let function = if let Ok(function) = function.cast::<I64Function>() {
+            function.get()
+        } else if let Ok(guarded) = function.cast::<GuardedI64Function>() {
+            let guarded = guarded.get();
+            if !guarded.guard.get().guard.valid() {
+                return Ok(Native::BindingChanged);
             }
-            return match function.try_call_tuple(args)? {
-                Some(value) => Ok(Some(value.into_pyobject(py)?.into_any())),
-                None => Ok(None),
-            };
+            // Borrowed from `guarded`, which `function` keeps alive.
+            guarded.function.get()
+        } else {
+            if args.len() != spec.getattr(intern!(py, "arg_count"))?.extract::<usize>()? {
+                return Ok(Native::Miss);
+            }
+            let result = spec.getattr(intern!(py, "fast_call"))?.call1((args,))?;
+            return Ok(if result.is_none() {
+                Native::Miss
+            } else {
+                Native::Result(result)
+            });
+        };
+        // As in the Python wrapper, a call with another arity (an omitted
+        // default) makes no native call at all.
+        if args.len() != function.code.arg_count() {
+            return Ok(Native::Miss);
         }
-        if args.len() != spec.getattr(intern!(py, "arg_count"))?.extract::<usize>()? {
-            return Ok(None);
+        match function.try_call_tuple(args)? {
+            Some(value) => Ok(Native::Result(value.into_pyobject(py)?.into_any())),
+            None => Ok(Native::Miss),
         }
-        let result = spec.getattr(intern!(py, "fast_call"))?.call1((args,))?;
-        Ok((!result.is_none()).then_some(result))
     }
 
     /// Arguments that `try_call` passes without a heap allocation.

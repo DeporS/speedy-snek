@@ -374,7 +374,7 @@ def test_rejects_loops_outside_the_subset():
     assert_rejected(
         while_truthy, RejectionReason.UNSUPPORTED_CONDITION, "POP_JUMP_IF_FALSE", 12
     )
-    assert_rejected(for_loop, RejectionReason.CONTROL_FLOW, "FOR_ITER", 6)
+    assert_rejected(for_loop, RejectionReason.UNSUPPORTED_ITERATION, "FOR_ITER", 6)
 
 
 def test_rejects_reading_a_non_argument_local():

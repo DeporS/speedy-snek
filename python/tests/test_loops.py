@@ -464,27 +464,15 @@ def assert_rejected(func, reason, opname, message):
     [
         (
             """
-            def f(n):
-                t = 0
-                for i in range(n):
-                    t += i
-                return t
-            """,
-            RejectionReason.CONTROL_FLOW,
-            "FOR_ITER",
-            "unsupported jump FOR_ITER",
-        ),
-        (
-            """
             def f(a):
                 t = 0
                 for i in a:
                     t += i
                 return t
             """,
-            RejectionReason.CONTROL_FLOW,
+            RejectionReason.UNSUPPORTED_ITERATION,
             "FOR_ITER",
-            "unsupported jump FOR_ITER",
+            "only for loops over range(n) are supported",
         ),
         (
             """
@@ -501,7 +489,7 @@ def assert_rejected(func, reason, opname, message):
             """,
             RejectionReason.CONTROL_FLOW,
             "JUMP_BACKWARD",
-            "only one while loop per function",
+            "only one loop per function",
         ),
         (
             """
@@ -515,7 +503,7 @@ def assert_rejected(func, reason, opname, message):
             """,
             RejectionReason.CONTROL_FLOW,
             "JUMP_BACKWARD",
-            "only one while loop per function",
+            "only one loop per function",
         ),
         (
             # A short tail after ``break`` is copied into the body.

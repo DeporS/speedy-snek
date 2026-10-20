@@ -39,10 +39,13 @@ or a stack value left at a join, raises
 reference interpreter. The Rust extension validates the serialized program
 again on its own.
 
-**Loops.** A program may contain one ``while`` loop. Native code holds the
-GIL and cannot be interrupted, so a call may take at most a fixed number
-of backward jumps, the *backedge budget* (``_native.DEFAULT_BACKEDGE_BUDGET``,
-one million). The next backward jump stops the call: the fast path returns
+**Loops.** A program may contain one loop: a ``while`` loop, or a ``for``
+loop over ``range``, which the frontend lowers to the same shape (the
+program itself never refers to ``range``; ``@snekit`` guards that
+binding). Native code holds the GIL and cannot be interrupted, so a call
+may take at most a fixed number of backward jumps, the *backedge budget*
+(``_native.DEFAULT_BACKEDGE_BUDGET``, one million). The next backward
+jump stops the call: the fast path returns
 ``None`` and the diagnostic path raises :class:`NativeGuardFailure` with
 reason ``BUDGET_EXHAUSTED``. No partial result is returned. The budget is
 fixed when a program is compiled; :func:`compile_i64`'s
