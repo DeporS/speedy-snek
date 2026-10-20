@@ -66,14 +66,31 @@ def assert_guard(compiled, args, reason, *, arg_index=None, instruction_index=No
     return failure
 
 
+# Signed comparisons for ``run_i64``, written out independently of the
+# interpreter.
+COMPARE = {
+    Op.LESS_THAN: lambda left, right: left < right,
+    Op.LESS_EQUAL: lambda left, right: left <= right,
+    Op.GREATER_THAN: lambda left, right: left > right,
+    Op.GREATER_EQUAL: lambda left, right: left >= right,
+    Op.EQUAL: lambda left, right: left == right,
+    Op.NOT_EQUAL: lambda left, right: left != right,
+}
+
+
 def run_i64(program, args):
-    """An independent i64 oracle: Python ints, checked after every operation.
+    """An independent i64 oracle: Python ints, checked after every operation
+    that runs. It follows jumps, so operations on a path not taken are
+    never checked.
 
     Returns ``("ok", value)`` or ``("overflow", instruction_index)``.
     """
     stack = []
     local_slots = {}
-    for index, instruction in enumerate(program):
+    index = 0
+    # A valid program only jumps forward; the bound catches a broken one.
+    for _ in range(len(program)):
+        instruction = program[index]
         if instruction.op is Op.LOAD_ARG:
             stack.append(args[instruction.arg])
         elif instruction.op is Op.LOAD_CONST:
@@ -84,6 +101,17 @@ def run_i64(program, args):
             local_slots[instruction.arg] = stack.pop()
         elif instruction.op is Op.RETURN:
             return ("ok", stack.pop())
+        elif instruction.op is Op.JUMP:
+            index = instruction.arg
+            continue
+        elif instruction.op is Op.JUMP_IF_FALSE:
+            if not stack.pop():
+                index = instruction.arg
+                continue
+        elif instruction.op in COMPARE:
+            right = stack.pop()
+            left = stack.pop()
+            stack.append(COMPARE[instruction.op](left, right))
         else:
             right = stack.pop()
             left = stack.pop()
@@ -96,6 +124,7 @@ def run_i64(program, args):
             if not I64_MIN <= value <= I64_MAX:
                 return ("overflow", index)
             stack.append(value)
+        index += 1
     raise AssertionError("program did not return")
 
 
@@ -366,7 +395,8 @@ def test_serialize():
 
 
 def test_opcode_numbers_are_stable():
-    # Expression-only programs keep their wire format; locals are new.
+    # Expression-only programs keep their wire format; locals and then
+    # conditionals were added after them.
     assert (
         _native.OP_LOAD_ARG,
         _native.OP_LOAD_CONST,
@@ -376,7 +406,15 @@ def test_opcode_numbers_are_stable():
         _native.OP_RETURN,
         _native.OP_LOAD_LOCAL,
         _native.OP_STORE_LOCAL,
-    ) == (1, 2, 3, 4, 5, 6, 7, 8)
+        _native.OP_JUMP,
+        _native.OP_JUMP_IF_FALSE,
+        _native.OP_LESS_THAN,
+        _native.OP_LESS_EQUAL,
+        _native.OP_GREATER_THAN,
+        _native.OP_GREATER_EQUAL,
+        _native.OP_EQUAL,
+        _native.OP_NOT_EQUAL,
+    ) == tuple(range(1, 17))
 
 
 def test_opcode_table_covers_every_op():
@@ -1015,6 +1053,510 @@ print("ok")
         [sys.executable, "-c", code], capture_output=True, text=True, check=True
     )
     assert result.stdout.strip() == "ok"
+
+
+# --- Conditionals --------------------------------------------------------
+
+LESS_THAN = Instruction(Op.LESS_THAN)
+CMP_OPS = [
+    Op.LESS_THAN,
+    Op.LESS_EQUAL,
+    Op.GREATER_THAN,
+    Op.GREATER_EQUAL,
+    Op.EQUAL,
+    Op.NOT_EQUAL,
+]
+CMP_SYMBOLS = dict(zip(CMP_OPS, ["<", "<=", ">", ">=", "==", "!="], strict=True))
+
+
+def jump(target):
+    return Instruction(Op.JUMP, target)
+
+
+def jump_if_false(target):
+    return Instruction(Op.JUMP_IF_FALSE, target)
+
+
+def define(source):
+    namespace = {}
+    exec(source, namespace)
+    return namespace["f"]
+
+
+def cond_calculate_score(wins, penalties):
+    score = wins * 3 - penalties
+    if score < 0:
+        score = 0
+    else:
+        score += 5
+    return score
+
+
+def choose(a, b):
+    if a >= b:
+        result = a - b
+    else:
+        result = b - a
+    return result
+
+
+def adjust(a, b):
+    result = a
+    if a < b:
+        result += b
+    return result * 2
+
+
+def selected_branch(a, b):
+    result = a
+    if a < b:
+        result += 1
+    else:
+        result *= b
+    return result
+
+
+def nested_branches(a, b, c):
+    r = 0
+    if a < b:
+        if b < c:
+            r = c - a
+        else:
+            r = b * 2
+    else:
+        r = a - c
+    if r == 0:
+        r += 7
+    return r
+
+
+def sequential_branches(a, b):
+    if a < 0:
+        a = 0 - a
+    if b < 0:
+        b = 0 - b
+    return a * b
+
+
+def keep_or_replace(a, b):
+    x = a * 3
+    if a != b:
+        x = b
+    return x + a
+
+
+def swap_if_less(a, b):
+    c = a
+    if a < b:
+        a = b
+        b = c
+    return a - b * 2
+
+
+BRANCH_SHAPES = [
+    cond_calculate_score,
+    choose,
+    adjust,
+    selected_branch,
+    nested_branches,
+    sequential_branches,
+    keep_or_replace,
+    swap_if_less,
+]
+
+
+@pytest.mark.parametrize("func", BRANCH_SHAPES, ids=lambda f: f.__name__)
+def test_conditionals_end_to_end(func):
+    # Like ``differential``, but compiled once for every input.
+    instructions = analyze(func).instructions
+    compiled = compile_i64(instructions, func.__code__.co_argcount)
+    arity = func.__code__.co_argcount
+    rng = random.Random(f"branches-{func.__name__}")
+    edges = [I64_MIN, I64_MIN + 1, -1, 0, 1, I64_MAX - 1, I64_MAX]
+    inputs = [tuple(rng.randint(-50, 50) for _ in range(arity)) for _ in range(150)]
+    inputs += [tuple(random_value(rng) for _ in range(arity)) for _ in range(150)]
+    inputs += [tuple(rng.choice(edges) for _ in range(arity)) for _ in range(50)]
+    outcomes = {"ok": 0, "overflow": 0}
+    for args in inputs:
+        expected = func(*args)
+        assert execute(instructions, args) == expected
+        status, detail = run_i64(instructions, args)
+        outcomes[status] += 1
+        if status == "ok":
+            assert compiled(*args) == detail == expected, (func, args)
+            assert compiled.fast_call(args) == expected
+        else:
+            assert_guard(compiled, args, GuardReason.OVERFLOW, instruction_index=detail)
+            assert compiled.fast_call(args) is None
+    assert outcomes["ok"] > 150
+
+
+def test_conditional_examples():
+    score = compile_i64(analyze(cond_calculate_score).instructions)
+    assert (score(1, 5), score(4, 2)) == (0, 15)
+    pick = compile_i64(analyze(choose).instructions)
+    assert (pick(5, 3), pick(3, 5), pick(4, 4)) == (2, 2, 0)
+    tweak = compile_i64(analyze(adjust).instructions)
+    assert (tweak(1, 2), tweak(2, 1)) == (6, 4)
+
+
+@pytest.mark.parametrize("op", CMP_OPS, ids=lambda op: op.name)
+def test_comparisons_at_signed_boundaries(op):
+    f = define(
+        f"def f(a, b):\n    r = 0\n    if a {CMP_SYMBOLS[op]} b:\n        r = 1\n"
+        f"    return r\n"
+    )
+    compiled = compile_i64(analyze(f).instructions)
+    values = [I64_MIN, I64_MIN + 1, -2, -1, 0, 1, 2, I64_MAX - 1, I64_MAX]
+    for a in values:
+        for b in values:
+            result = compiled(a, b)
+            assert type(result) is int and result == f(a, b), (op, a, b)
+            assert compiled.fast_call((a, b)) == result
+
+
+def test_comparisons_are_signed_and_never_subtract():
+    lt = compile_i64(
+        (
+            arg(0),
+            arg(1),
+            LESS_THAN,
+            jump_if_false(6),
+            const(1),
+            RETURN,
+            const(0),
+            RETURN,
+        )
+    )
+    # Unsigned comparison would get these wrong; ``a - b < 0`` would
+    # overflow on the first two.
+    assert lt(I64_MIN, I64_MAX) == 1
+    assert lt(I64_MAX, I64_MIN) == 0
+    assert lt(I64_MIN, 1) == 1
+    assert lt(-1, 0) == 1
+    assert lt(0, -1) == 0
+    assert lt(I64_MIN, I64_MIN) == 0
+
+
+def test_overflow_on_the_branch_not_taken_is_not_a_guard_failure():
+    compiled = compile_i64(analyze(selected_branch).instructions)
+    # a < b: only ``result += 1`` runs; ``result *= b`` would overflow.
+    assert compiled(2, I64_MAX) == 3
+    assert compiled.fast_call((2, I64_MAX)) == 3
+    # a >= b: only ``result *= b`` runs; ``result += 1`` would overflow.
+    assert compiled(I64_MAX, 1) == I64_MAX
+    assert compiled.fast_call((I64_MAX, 1)) == I64_MAX
+
+
+def test_overflow_on_the_selected_branch_is_a_guard_failure():
+    instructions = analyze(selected_branch).instructions
+    compiled = compile_i64(instructions)
+    status, index = run_i64(instructions, (I64_MAX, 2))
+    assert status == "overflow"
+    assert_guard(compiled, (I64_MAX, 2), GuardReason.OVERFLOW, instruction_index=index)
+    assert instructions[index].op is Op.MULTIPLY
+    assert compiled.fast_call((I64_MAX, 2)) is None
+    # The code is unchanged and keeps working.
+    assert compiled(1, 2) == 2
+    assert compiled(3, 2) == 6
+
+
+def test_overwritten_overflow_on_the_selected_branch_still_fails():
+    def f(a, b):
+        r = 0
+        if a < b:
+            r = b * b
+            r = 1
+        return r
+
+    instructions = analyze(f).instructions
+    compiled = compile_i64(instructions)
+    assert compiled(1, 2) == 1
+    assert compiled(3, 2) == 0
+    # Not taken: no overflow check runs.
+    assert compiled(I64_MAX, 2) == 0
+    status, index = run_i64(instructions, (1, I64_MAX))
+    assert status == "overflow" and instructions[index].op is Op.MULTIPLY
+    assert_guard(compiled, (1, I64_MAX), GuardReason.OVERFLOW, instruction_index=index)
+
+
+def test_values_are_preserved_across_joins():
+    f = compile_i64(analyze(keep_or_replace).instructions)
+    assert f(2, 2) == 8  # Not assigned on this path: keeps a * 3.
+    assert f(2, 5) == 7
+    swap = compile_i64(analyze(swap_if_less).instructions)
+    assert swap(1, 5) == 5 - 1 * 2  # Swapped through the copy.
+    assert swap(5, 1) == 5 - 1 * 2  # Unchanged.
+
+
+def test_hand_written_paths_with_separate_returns():
+    program = (
+        arg(0),
+        arg(1),
+        Instruction(Op.EQUAL),
+        jump_if_false(4),  # Both outcomes continue at index 4.
+        arg(0),
+        const(0),
+        Instruction(Op.NOT_EQUAL),
+        jump_if_false(10),
+        arg(0),
+        RETURN,
+        const(-1),  # 10
+        RETURN,
+    )
+    compiled = compile_i64(program)
+    assert (compiled(3, 3), compiled(0, 0), compiled(3, 4)) == (3, -1, 3)
+
+
+def random_branch_program(rng, arg_count, slots):
+    """Random acyclic IR built from assignments, if/else statements, early
+    returns and a final return. Every read slot is assigned on every path."""
+    program = []
+
+    def emit(budget, assigned):
+        if budget <= 1 or rng.random() < 0.3:
+            choice = rng.random()
+            if assigned and choice < 0.45:
+                program.append(load(rng.choice(sorted(assigned))))
+            elif arg_count and choice < 0.85:
+                program.append(arg(rng.randrange(arg_count)))
+            else:
+                program.append(const(random_value(rng)))
+            return
+        left = rng.randint(1, budget - 1)
+        emit(left, assigned)
+        emit(budget - left, assigned)
+        program.append(Instruction(rng.choice([Op.ADD, Op.SUBTRACT, Op.MULTIPLY])))
+
+    def block(statements, assigned, depth):
+        """Emit statements; return the slots assigned on every path out, or
+        None if every path returned."""
+        assigned = set(assigned)
+        for _ in range(statements):
+            choice = rng.random()
+            if depth and choice < 0.4:
+                emit(rng.randint(1, 3), assigned)
+                emit(rng.randint(1, 3), assigned)
+                program.append(Instruction(rng.choice(CMP_OPS)))
+                branch = len(program)
+                program.append(None)
+                then = block(rng.randint(0, 2), assigned, depth - 1)
+                skip = None
+                if rng.random() < 0.6:
+                    if then is not None:
+                        skip = len(program)
+                        program.append(None)
+                    program[branch] = jump_if_false(len(program))
+                    other = block(rng.randint(0, 2), assigned, depth - 1)
+                else:
+                    program[branch] = jump_if_false(len(program))
+                    other = assigned
+                if skip is not None:
+                    program[skip] = jump(len(program))
+                paths = [path for path in (then, other) if path is not None]
+                if not paths:
+                    return None
+                assigned = set.intersection(*paths)
+            elif choice < 0.48:
+                emit(rng.randint(1, 4), assigned)
+                program.append(RETURN)
+                return None
+            else:
+                emit(rng.randint(1, 4), assigned)
+                slot = rng.randrange(slots)
+                program.append(store(slot))
+                assigned.add(slot)
+        return assigned
+
+    assigned = block(rng.randint(1, 5), set(), 2)
+    if assigned is not None:
+        emit(rng.randint(1, 4), assigned)
+        program.append(RETURN)
+    return tuple(program)
+
+
+def test_differential_random_branch_programs():
+    rng = random.Random("speedysnek-native-branches")
+    outcomes = {"ok": 0, "overflow": 0}
+    jumps = 0
+    for _ in range(250):
+        arg_count = rng.randrange(1, 4)
+        program = random_branch_program(rng, arg_count, rng.randint(1, 3))
+        jumps += sum(i.op is Op.JUMP or i.op is Op.JUMP_IF_FALSE for i in program)
+        compiled = compile_i64(program, arg_count)
+        for _ in range(6):
+            if rng.random() < 0.5:
+                args = tuple(rng.randint(-3, 3) for _ in range(arg_count))
+            else:
+                args = tuple(random_value(rng) for _ in range(arg_count))
+            expected, detail = run_i64(program, args)
+            outcomes[expected] += 1
+            reference = execute(program, args)
+            if expected == "ok":
+                assert compiled(*args) == reference == detail, (program, args)
+                assert compiled.fast_call(args) == detail
+            else:
+                assert_guard(
+                    compiled, args, GuardReason.OVERFLOW, instruction_index=detail
+                )
+                assert compiled.fast_call(args) is None
+    assert outcomes["ok"] > 500
+    assert outcomes["overflow"] > 100
+    assert jumps > 300
+
+
+def test_serialize_conditionals():
+    program = (arg(0), arg(1), LESS_THAN, jump_if_false(5), jump(5), const(1), RETURN)
+    assert serialize(program) == ((1, 0), (1, 1), (11,), (10, 5), (9, 5), (2, 1), (6,))
+    wire = {
+        op: serialize(
+            (arg(0), arg(0), Instruction(op), jump_if_false(4), const(1), RETURN)
+        )[2][0]
+        for op in CMP_OPS
+    }
+    assert list(wire.values()) == [11, 12, 13, 14, 15, 16]
+
+
+def test_jump_limit():
+    limit = _native.MAX_JUMPS
+    chain = tuple(jump(index + 1) for index in range(limit))
+    compiled = compile_i64(chain + (const(5), RETURN))
+    assert compiled() == 5
+    too_many = tuple(jump(index + 1) for index in range(limit + 1)) + (const(5), RETURN)
+    with pytest.raises(UnsupportedProgramError, match="native limit") as excinfo:
+        compile_i64(too_many)
+    assert excinfo.value.index == limit
+    with pytest.raises(ValueError, match="maximum of 4096 jumps"):
+        _native.compile_i64(_compiler._encode(too_many), 0)
+
+
+# Wire opcodes for the hand-written programs below.
+J, JIF, LT, LE, GT, GE, EQ, NE = range(9, 17)
+
+
+@pytest.mark.parametrize(
+    ("program", "message"),
+    [
+        # Targets.
+        (((9, 0), (2, 1), (6,)), "goes back to index 0"),  # Jumps to itself.
+        (((2, 1), (8, 0), (9, 1), (6,)), "goes back to index 1"),  # A loop.
+        (((9, 1), (9, 0), (2, 1), (6,)), "goes back to index 0"),  # A cycle.
+        (((2, 0), (2, 0), (LT,), (JIF, 2), (2, 1), (6,)), "goes back to index 2"),
+        (((9, 3), (2, 1), (6,)), "index 3, past the end"),
+        (((9, 2**31), (2, 1), (6,)), "past the end"),
+        (((9, -1), (2, 1), (6,)), "invalid target -1"),
+        (((9, 2**40), (2, 1), (6,)), "invalid target"),
+        (((9,), (2, 1), (6,)), "requires an operand"),
+        (((10,), (2, 1), (6,)), "requires an operand"),
+        (((2, 0), (2, 0), (11, 0), (10, 5), (2, 1), (6,)), "takes no operand"),
+        # Reachability and termination.
+        (((9, 2), (2, 1), (2, 2), (6,)), "index 1 is unreachable"),
+        (((2, 1), (6,), (2, 2), (6,)), "index 2 is unreachable"),
+        (((2, 0), (2, 0), (LT,), (JIF, 6), (2, 1), (6,), (2, 2)), "falls off the end"),
+        # Conditions.
+        (((2, 0), (2, 0), (LT,), (6,)), "comparison at index 2 must be immediately"),
+        (((2, 0), (2, 0), (EQ,), (8, 0), (2, 1), (6,)), "must be immediately"),
+        (
+            ((2, 0), (JIF, 3), (2, 1), (2, 2), (6,)),
+            "needs a condition but found an integer",
+        ),
+        (((JIF, 2), (2, 1), (6,)), "stack underflow at index 0"),
+        (((2, 0), (GE,), (JIF, 4), (2, 1), (6,)), "stack underflow at index 1"),
+        # The stack must be empty at jumps and joins.
+        (((2, 1), (9, 2), (6,)), "index 1 leaves 1 value"),
+        (
+            ((2, 9), (2, 0), (2, 0), (LT,), (JIF, 6), (2, 1), (6,)),
+            "index 4 leaves 1 value",
+        ),
+        (
+            ((2, 0), (2, 0), (LT,), (JIF, 5), (2, 1), (2, 2), (3,), (6,)),
+            "jump target at index 5 is reached from index 4 with 1 value",
+        ),
+        # Locals must be assigned on every path into a read.
+        (
+            ((2, 0), (2, 0), (LT,), (JIF, 6), (2, 1), (8, 0), (7, 0), (6,)),
+            "index 6 reads local 0 before it is assigned on every path",
+        ),
+        (
+            (
+                (2, 0),
+                (2, 0),
+                (NE,),
+                (JIF, 7),
+                (2, 1),
+                (8, 0),
+                (9, 9),
+                (2, 2),
+                (8, 1),
+                (7, 0),
+                (6,),
+            ),
+            "index 9 reads local 0",
+        ),
+        (
+            ((2, 0), (2, 0), (LT,), (JIF, 5), (7, 3), (2, 1), (6,)),
+            "index 4 reads local 3",
+        ),
+    ],
+)
+def test_rust_validates_control_flow_on_its_own(program, message):
+    # Bypass Python's validation entirely.
+    with pytest.raises(ValueError, match=message):
+        _native.compile_i64(program, 0)
+
+
+def test_rust_accepts_well_formed_branches_on_its_own():
+    # r = 1; if 0 < a: r = a; return r   (wire format, written by hand)
+    program = (
+        (2, 1),
+        (8, 0),
+        (2, 0),
+        (1, 0),
+        (LT,),
+        (JIF, 8),
+        (1, 0),
+        (8, 0),
+        (7, 0),
+        (6,),
+    )
+    function = _native.compile_i64(program, 1)
+    assert function.call((5,)) == (_native.STATUS_OK, 5)
+    assert function.call((-5,)) == (_native.STATUS_OK, 1)
+    assert function.try_call((I64_MIN,)) == 1
+
+
+def test_malformed_control_flow_does_not_crash_the_interpreter():
+    # Random programs over every opcode, run in a child process: a panic
+    # would surface as PanicException, an abort or segfault as a non-zero
+    # exit code. Small targets make jumps, cycles and joins likely.
+    code = """
+import random
+from speedysnek import _native
+rng = random.Random(1)
+opcodes = list(range(0, 18))
+operands = [-1, 0, 1, 2, 3, 4, 5, 6, 7, 2**32, 2**63 - 1]
+compiled = 0
+for _ in range(20000):
+    program = []
+    for _ in range(rng.randrange(1, 12)):
+        opcode = rng.choice(opcodes)
+        if rng.random() < 0.5:
+            program.append((opcode, rng.choice(operands)))
+        else:
+            program.append((opcode,))
+    try:
+        function = _native.compile_i64(tuple(program), rng.choice([0, 1, 2]))
+    except (TypeError, ValueError):
+        continue
+    compiled += 1
+    for args in [(), (0,), (1, -1), (2**63 - 1, -(2**63))]:
+        function.try_call(args)
+print("ok", compiled)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True
+    )
+    assert result.stdout.startswith("ok")
 
 
 # --- Ownership, lifetime and determinism ---------------------------------

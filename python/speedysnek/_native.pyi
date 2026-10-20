@@ -12,6 +12,14 @@ OP_MULTIPLY: int
 OP_RETURN: int
 OP_LOAD_LOCAL: int
 OP_STORE_LOCAL: int
+OP_JUMP: int
+OP_JUMP_IF_FALSE: int
+OP_LESS_THAN: int
+OP_LESS_EQUAL: int
+OP_GREATER_THAN: int
+OP_GREATER_EQUAL: int
+OP_EQUAL: int
+OP_NOT_EQUAL: int
 
 # Status codes returned by ``I64Function.call``.
 STATUS_OK: int
@@ -20,6 +28,7 @@ STATUS_BAD_ARITY: int
 
 MAX_ARGS: int
 MAX_LOCALS: int
+MAX_JUMPS: int
 
 # ``True`` when the extension was built with debug assertions, as by a plain
 # ``maturin develop``. Benchmarks record it; debug builds are not

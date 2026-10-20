@@ -37,6 +37,42 @@ its own: reads before the assignment use ``LOAD_ARG``, reads after it use
 A value stored in a slot is a copy: storing into one slot never changes
 another.
 
+Conditions and forward jumps express ``if`` statements:
+
+- ``LESS_THAN``, ``LESS_EQUAL``, ``GREATER_THAN``, ``GREATER_EQUAL``,
+  ``EQUAL`` and ``NOT_EQUAL`` pop the right operand, then the left operand,
+  compare them as signed integers and push a *condition*. A condition is
+  not an integer: it has exactly one permitted use, by the ``JUMP_IF_FALSE``
+  that must immediately follow the comparison. It is never stored,
+  returned or used in arithmetic, so it never becomes a Python value.
+- ``JUMP_IF_FALSE t`` pops a condition and continues at instruction index
+  ``t`` if it is false, or with the next instruction if it is true.
+- ``JUMP t`` continues at instruction index ``t``.
+- ``RETURN`` ends the path it is on. A program may contain several: CPython
+  copies a short final ``return`` into each branch.
+
+Jump targets are instruction indexes in the same program and always lie
+ahead of the jump, so there are no loops. The operand stack is empty at
+every jump and at every jump target: values flow between branches only
+through local slots. So ``def f(a, b): r = a; if a < b: r += b; return r``
+becomes::
+
+    0  LOAD_ARG 0
+    1  STORE_LOCAL 0
+    2  LOAD_ARG 0
+    3  LOAD_ARG 1
+    4  LESS_THAN
+    5  JUMP_IF_FALSE 10
+    6  LOAD_LOCAL 0
+    7  LOAD_ARG 1
+    8  ADD
+    9  STORE_LOCAL 0
+    10 LOAD_LOCAL 0
+    11 RETURN
+
+A slot can be read only where every path that leads there has stored it.
+The full rules are in ``speedysnek._interpreter.validate``.
+
 All types here are immutable.
 """
 
@@ -57,13 +93,36 @@ class Op(enum.Enum):
     SUBTRACT = "SUBTRACT"
     MULTIPLY = "MULTIPLY"
     RETURN = "RETURN"
+    LESS_THAN = "LESS_THAN"
+    LESS_EQUAL = "LESS_EQUAL"
+    GREATER_THAN = "GREATER_THAN"
+    GREATER_EQUAL = "GREATER_EQUAL"
+    EQUAL = "EQUAL"
+    NOT_EQUAL = "NOT_EQUAL"
+    JUMP = "JUMP"
+    JUMP_IF_FALSE = "JUMP_IF_FALSE"
 
 
-# Operations that carry an integer operand.
-_OPS_WITH_ARG = frozenset({Op.LOAD_ARG, Op.LOAD_CONST, Op.LOAD_LOCAL, Op.STORE_LOCAL})
+# Operations that pop two integers and push a condition.
+COMPARISONS = frozenset(
+    {
+        Op.LESS_THAN,
+        Op.LESS_EQUAL,
+        Op.GREATER_THAN,
+        Op.GREATER_EQUAL,
+        Op.EQUAL,
+        Op.NOT_EQUAL,
+    }
+)
+
+# Operations whose operand is the index of the instruction they jump to.
+JUMPS = frozenset({Op.JUMP, Op.JUMP_IF_FALSE})
 
 # Operations whose integer operand is an index, which cannot be negative.
-_OPS_WITH_INDEX = frozenset({Op.LOAD_ARG, Op.LOAD_LOCAL, Op.STORE_LOCAL})
+_OPS_WITH_INDEX = frozenset({Op.LOAD_ARG, Op.LOAD_LOCAL, Op.STORE_LOCAL}) | JUMPS
+
+# Operations that carry an integer operand.
+_OPS_WITH_ARG = _OPS_WITH_INDEX | {Op.LOAD_CONST}
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,7 +131,8 @@ class Instruction:
 
     ``arg`` is the argument index for ``LOAD_ARG``, the integer value for
     ``LOAD_CONST``, the local slot for ``LOAD_LOCAL`` and ``STORE_LOCAL``,
-    and ``None`` for every other operation.
+    the target instruction index for ``JUMP`` and ``JUMP_IF_FALSE``, and
+    ``None`` for every other operation.
     """
 
     op: Op
@@ -108,6 +168,7 @@ class RejectionReason(enum.StrEnum):
     UNSUPPORTED_OPERATOR = enum.auto()
     UNSUPPORTED_CONSTANT = enum.auto()
     UNSUPPORTED_VARIABLE = enum.auto()
+    UNSUPPORTED_CONDITION = enum.auto()
 
 
 @dataclass(frozen=True, slots=True)

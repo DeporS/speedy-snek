@@ -8,10 +8,12 @@ This is the first stage of the compiler pipeline::
         -> reference interpreter  (``speedysnek._interpreter``)
            or Cranelift i64 backend  (``speedysnek._compiler``)
 
-Only straight-line functions of positional arguments, ``int`` constants,
-``+``, ``-``, ``*``, assignments to local variables (including arguments),
-``+=``, ``-=`` and ``*=`` on them, and ``return`` are supported. Everything
-else is rejected with a machine-readable :class:`RejectionReason`.
+Only functions of positional arguments, ``int`` constants, ``+``, ``-``,
+``*``, assignments to local variables (including arguments), ``+=``, ``-=``
+and ``*=`` on them, ``if``/``else`` statements whose condition is one
+integer comparison (``<``, ``<=``, ``>``, ``>=``, ``==``, ``!=``), and
+``return`` are supported. Everything else, including loops, is rejected
+with a machine-readable :class:`RejectionReason`.
 
 :func:`speedysnek.snekit` calls :func:`analyze` once per decorated function,
 after warmup; a rejection makes it run the original function from then on.

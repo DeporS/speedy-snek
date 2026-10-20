@@ -8,7 +8,8 @@ Need more speed? Just `@snekit`.
 
 SpeedySnek is a small educational JIT compiler experiment for CPython 3.14.
 **`@snekit` performs experimental native compilation**: a decorated
-function in the supported straight-line integer subset is compiled once,
+function in the supported integer subset (arithmetic, local variables and
+simple `if`/`else`) is compiled once,
 after a short warmup, to signed 64-bit machine code with Cranelift.
 Everything else, including every unsupported function, argument or call,
 safely falls back to normal Python.
@@ -144,13 +145,47 @@ def calculate_score(wins, draws, penalties):
     return points
 ```
 
-What compiles today: positional `int` arguments, `int` constants, `+`,
-`-`, `*`, assignments to local variables (including reassigning an
-argument), `+=`, `-=` and `*=` on local variables and arguments, and one
-final `return`. Branches (`if`, conditional expressions), loops, function
-calls, globals, other augmented operators (`/=`, `//=`, `%=`, …),
-attribute or item updates (`obj.x += 1`, `items[0] += 1`), tuple
-assignment and everything else still run as plain Python.
+`if` statements work too, when the condition is one comparison of
+integers. Only the branch that is selected runs:
+
+```python
+@snekit
+def calculate_score(wins, penalties):
+    score = wins * 3 - penalties
+    if score < 0:
+        score = 0
+    else:
+        score += 5
+    return score
+```
+
+What compiles today:
+
+- positional `int` arguments and `int` constants;
+- `+`, `-` and `*`;
+- assignments to local variables (including reassigning an argument), and
+  `+=`, `-=` and `*=` on local variables and arguments;
+- `if`, `if`/`else` and `elif`, nested or one after another, whose
+  condition is a single `<`, `<=`, `>`, `>=`, `==` or `!=` between integer
+  expressions;
+- `return` of an integer expression at the end of every path.
+
+A variable assigned in only some branches can be read after them only if
+it was assigned before the `if`; otherwise the function runs as plain
+Python, which raises `UnboundLocalError` where Python would.
+
+Still running as plain Python: loops (`while`, `for`), `and`, `or` and
+`not` in conditions (except `and` between comparisons, which CPython
+compiles exactly like nested `if` statements), chained comparisons
+(`a < b < c`), conditions that are not a comparison (`if a:`, `is`, `in`),
+comparison results used as values (`x = a < b`, `return a < b`),
+conditional expressions inside a larger expression, function calls,
+globals, other augmented operators (`/=`, `//=`, `%=`, …), attribute or
+item updates (`obj.x += 1`, `items[0] += 1`), tuple assignment, `try` and
+`with`, and everything else. Because SpeedySnek reads CPython's bytecode,
+not source, a `return` inside a branch and a conditional expression such
+as `return a if a < b else b` are compiled when CPython emits them the
+same way as an `if` statement with a `return` in each branch.
 
 `@jit` is the descriptive, backwards-compatible name for the same
 decorator: `speedysnek.jit is speedysnek.snekit`, so existing
@@ -220,9 +255,10 @@ Each decorated function has its own small state machine:
   argument's Python code (no `__index__`, `__int__`, `__repr__` or
   metaclass hooks). Only an unexpected error from the native code
   disables the specialization.
-- **Disabled.** If the function is outside the supported subset (branches,
-  loops, calls, globals, closures, generators, async functions, keyword
-  arguments, a variable that may be read before it is assigned, …), the
+- **Disabled.** If the function is outside the supported subset (loops,
+  conditions other than one integer comparison, calls, globals, closures,
+  generators, async functions, keyword arguments, a variable that may be
+  read before it is assigned, …), the
   backend cannot compile it, or the compiler fails
   unexpectedly, it is never compiled again and every call runs the original
   function. Replacing the function's `__code__` after compilation also
@@ -264,22 +300,28 @@ for instruction in analyze(add).instructions:
 
 Local variables become numbered local slots: `STORE_LOCAL n` and
 `LOAD_LOCAL n`. `LOAD_ARG n` always means the argument as passed, and an
-argument that the function reassigns gets a local slot of its own. The
-details are in `python/speedysnek/_frontend/ir.py` and `cpython314.py`.
+argument that the function reassigns gets a local slot of its own. An `if`
+becomes a comparison such as `LESS_THAN` followed by `JUMP_IF_FALSE t`,
+where `t` is the index of a later instruction. The details are in
+`python/speedysnek/_frontend/ir.py` and `cpython314.py`, and the design of
+conditionals in [`docs/conditionals.md`](docs/conditionals.md).
 
 Current status:
 
-- Only **straight-line integer arithmetic** is supported: positional
-  arguments, `int` constants, `+`, `-`, `*`, plain assignments to local
-  variables (`x = a + b`, including reassigning an argument), `+=`, `-=`
-  and `*=` on local variables and arguments, and `return`. An augmented
+- Only **integer arithmetic with acyclic `if`/`else`** is supported:
+  positional arguments, `int` constants, `+`, `-`, `*`, plain assignments
+  to local variables (`x = a + b`, including reassigning an argument),
+  `+=`, `-=` and `*=` on local variables and arguments, `if` statements on
+  one integer comparison, and `return`. An augmented
   assignment becomes the same `ADD`, `SUBTRACT` or `MULTIPLY` followed by
   `STORE_LOCAL` as the equivalent `x = x + …`: native code only ever sees
   exact `int`s, which have no in-place operators, and any other value
   falls back to Python, which calls its `__iadd__`, `__isub__` or
   `__imul__` as usual.
-- **Control flow and loops remain unsupported**: no `if`, conditional
-  expressions, `while` or `for`.
+- **Loops remain unsupported**: no `while` or `for`, and no jump
+  backwards. Conditions must be one `COMPARE_OP` directly consumed by
+  `POP_JUMP_IF_FALSE`; `or`, `not`, truthiness, `is`, `in`, chained
+  comparisons and comparison results used as values are rejected.
 - Anything else (division, calls, globals, attributes, other augmented
   operators, augmented assignment to attributes, items or globals, tuple
   or chained assignment, `del`, closures, generators, async functions,
@@ -312,12 +354,15 @@ execute(program, args=(5,))  # 10
 
 - It is a **correctness oracle**, not a performance optimization: the native
   backend must produce exactly the same results.
-- It executes only **exact-`int` arithmetic**. Every argument the program
-  reads must satisfy `type(value) is int` (so `bool`, `float`, `str` and
-  `int` subclasses are rejected); otherwise it raises `GuardFailure`.
+- It executes only **exact-`int` arithmetic and comparisons**, following
+  the branch each comparison selects. Every argument the program reads,
+  on any path, must satisfy `type(value) is int` (so `bool`, `float`,
+  `str` and `int` subclasses are rejected); otherwise it raises
+  `GuardFailure`.
 - The whole program is validated before it runs. Malformed instructions
-  (empty program, stack underflow, a local slot read before it is stored,
-  missing or misplaced `RETURN`, leftover stack values, …) raise
+  (empty program, stack underflow, a local slot read before it is stored
+  on every path, a backward or out-of-range jump, unreachable code, a
+  path without `RETURN`, leftover stack values, …) raise
   `InvalidProgramError`, which means a compiler bug.
 - Arithmetic uses Python `int`, so **arbitrary precision is intentional**:
   `2**63 + 1` is not wrapped to a 64-bit value.
@@ -342,16 +387,19 @@ compiled(10, 20)  # 60, computed by generated machine code
 
 - It is **private and experimental**. `@snekit` uses it to compile hot
   functions.
-- It supports only the current arithmetic subset (`+`, `-`, `*` on
-  arguments, constants and local variables). Local slots exist only at
-  compile time: a slot names a value that was already computed, so an
-  assignment copies nothing at run time and reading a local twice reuses
-  one computation.
+- It supports only the current subset (`+`, `-`, `*` on arguments,
+  constants and local variables, and signed comparisons that steer
+  forward jumps). Local slots are Cranelift variables: a slot names a
+  value that was already computed, so an assignment copies nothing at run
+  time and reading a local twice reuses one computation; where branches
+  join, SSA block parameters carry each path's value.
 - It never returns a wrapped 64-bit value. Constants outside the signed
   64-bit range are rejected at compile time (`UnsupportedProgramError`).
   At call time, arguments that are not exact `int`s in that range, a wrong
   number of arguments, or any `+`, `-` or `*` that overflows are a guard
   miss, including one whose result is later overwritten or never read.
+  Only operations on the branch that runs are checked: an overflow that
+  would happen only on a branch not taken is not a guard miss.
 - A compiled program has two entry points:
   - `compiled(*args)`, the **diagnostic** path, raises
     `NativeGuardFailure` with the exact reason for a miss (wrong arity, not
@@ -427,6 +475,10 @@ the Python wrapper (about 90–100 ns less per call) and guard misses about
 0.55×, with no slower case
 ([experiment](benchmarks/experiments/native_wrapper.md)). The committed
 baseline predates this change.
+A short [measurement of functions with `if`/`else`](benchmarks/experiments/conditionals.md)
+found them running natively at the same fixed cost per call as
+straight-line functions of similar size, so small ones are still about 2×
+slower than plain Python.
 
 [`benchmarks/README.md`](benchmarks/README.md) explains the methodology,
 how to get more stable numbers, and how to update the baseline.

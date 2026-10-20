@@ -42,8 +42,14 @@ wrap-around or overflow check.
 
 Local slots hold plain ``int`` values: ``STORE_LOCAL`` copies a value into
 a slot, so storing into one slot never changes another. Validation proves
-that every ``LOAD_LOCAL`` reads a slot an earlier ``STORE_LOCAL`` wrote; an
-unassigned slot is never read, and never has a default value.
+that every ``LOAD_LOCAL`` reads a slot that a ``STORE_LOCAL`` wrote on
+every path leading to it; an unassigned slot is never read, and never has
+a default value.
+
+Comparisons compare Python ``int`` values, so they are exact for any size.
+Their result, a condition, is held as a Python ``bool`` only until the
+``JUMP_IF_FALSE`` right after the comparison consumes it; it is never
+returned or stored. Only the selected branch runs.
 
 :func:`speedysnek.snekit` never uses the interpreter: it runs either native code
 or the original function. The interpreter remains the tests' oracle, and is
@@ -54,7 +60,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from ._frontend.ir import Instruction, Op
+from ._frontend.ir import COMPARISONS, JUMPS, Instruction, Op
 
 __all__ = ["GuardFailure", "InvalidProgramError", "execute", "validate"]
 
@@ -83,16 +89,25 @@ class GuardFailure(Exception):
         self.arg_index = arg_index
 
 
-# How many values each operation pops from and pushes onto the stack.
+# The kinds of values on the operand stack. Comparisons produce conditions;
+# everything else produces and consumes integers.
+_INT = "an integer"
+_CONDITION = "a condition"
+
+# The kinds each operation pops (top of the stack last) and pushes. Jumps
+# are handled separately.
 _STACK_EFFECT = {
-    Op.LOAD_ARG: (0, 1),
-    Op.LOAD_CONST: (0, 1),
-    Op.LOAD_LOCAL: (0, 1),
-    Op.STORE_LOCAL: (1, 0),
-    Op.ADD: (2, 1),
-    Op.SUBTRACT: (2, 1),
-    Op.MULTIPLY: (2, 1),
-    Op.RETURN: (1, 0),
+    Op.LOAD_ARG: ((), (_INT,)),
+    Op.LOAD_CONST: ((), (_INT,)),
+    Op.LOAD_LOCAL: ((), (_INT,)),
+    Op.STORE_LOCAL: ((_INT,), ()),
+    Op.ADD: ((_INT, _INT), (_INT,)),
+    Op.SUBTRACT: ((_INT, _INT), (_INT,)),
+    Op.MULTIPLY: ((_INT, _INT), (_INT,)),
+    Op.RETURN: ((_INT,), ()),
+    Op.JUMP: ((), ()),
+    Op.JUMP_IF_FALSE: ((_CONDITION,), ()),
+    **{op: ((_INT, _INT), (_CONDITION,)) for op in COMPARISONS},
 }
 
 
@@ -100,9 +115,22 @@ def validate(instructions: Iterable[Instruction]) -> tuple[int, ...]:
     """Check that ``instructions`` form a well-formed program.
 
     A well-formed program is a non-empty sequence of :class:`Instruction`
-    objects that never pops from an empty stack, never reads a local slot
-    before storing into it, and ends with its only ``RETURN``, which finds
-    exactly one value on the stack.
+    objects in which:
+
+    - every ``JUMP`` and ``JUMP_IF_FALSE`` targets an instruction index
+      ahead of itself, inside the program, so control flow has no cycles;
+    - every instruction is reachable from the first one;
+    - no instruction pops from an empty stack, and every operation finds
+      the kind of value it needs: arithmetic, ``STORE_LOCAL``, comparisons
+      and ``RETURN`` pop integers, and only ``JUMP_IF_FALSE`` pops a
+      condition;
+    - every comparison is immediately followed by ``JUMP_IF_FALSE``;
+    - the stack is empty after every jump and on every path into a jump
+      target, so paths join only through local slots;
+    - every ``LOAD_LOCAL`` reads a slot that is stored on every path from
+      the start of the program to it;
+    - every path ends with a ``RETURN`` that finds exactly one value on the
+      stack; none runs past the last instruction.
 
     Returns the sorted indexes of the arguments the program reads, which
     are the arguments the runtime guards must check. Raises
@@ -125,10 +153,14 @@ def execute(instructions: Iterable[Instruction], args: Iterable[object]) -> int:
     args = tuple(args)
     _check_guards(args, read_args)
 
-    stack: list[int] = []
+    stack: list[int | bool] = []
     # A dict, not a list: slot numbers in hand-written IR may be sparse.
     local_slots: dict[int, int] = {}
-    for instruction in program:
+    # Validation guarantees that every jump goes forward, so this loop ends.
+    pc = 0
+    while True:
+        instruction = program[pc]
+        pc += 1
         match instruction.op:
             case Op.LOAD_ARG:
                 stack.append(args[instruction.arg])
@@ -150,10 +182,31 @@ def execute(instructions: Iterable[Instruction], args: Iterable[object]) -> int:
                 right = stack.pop()
                 left = stack.pop()
                 stack.append(left * right)
+            case Op.LESS_THAN:
+                right = stack.pop()
+                stack.append(stack.pop() < right)
+            case Op.LESS_EQUAL:
+                right = stack.pop()
+                stack.append(stack.pop() <= right)
+            case Op.GREATER_THAN:
+                right = stack.pop()
+                stack.append(stack.pop() > right)
+            case Op.GREATER_EQUAL:
+                right = stack.pop()
+                stack.append(stack.pop() >= right)
+            case Op.EQUAL:
+                right = stack.pop()
+                stack.append(stack.pop() == right)
+            case Op.NOT_EQUAL:
+                right = stack.pop()
+                stack.append(stack.pop() != right)
+            case Op.JUMP:
+                pc = instruction.arg
+            case Op.JUMP_IF_FALSE:
+                if not stack.pop():
+                    pc = instruction.arg
             case Op.RETURN:
                 return stack.pop()
-    # _validate guarantees the program ends with RETURN.
-    raise AssertionError("unreachable: validated program did not return")
 
 
 def _as_tuple(instructions: Iterable[Instruction]) -> tuple[object, ...]:
@@ -175,62 +228,121 @@ def _validate(program: tuple[object, ...]) -> tuple[int, ...]:
         _check_instruction(index, instruction)
 
     # Every entry is now a well-formed Instruction.
-    returns = [i for i, instr in enumerate(program) if instr.op is Op.RETURN]
-    last = len(program) - 1
-    if not returns:
+    if not any(instr.op is Op.RETURN for instr in program):
         raise InvalidProgramError("program has no RETURN")
-    if len(returns) > 1:
-        raise InvalidProgramError(
-            f"program has {len(returns)} RETURN instructions "
-            f"(at indexes {', '.join(map(str, returns))}); exactly one is allowed",
-            index=returns[1],
-        )
-    if returns[0] != last:
-        follow = last - returns[0]
-        raise InvalidProgramError(
-            f"RETURN at index {returns[0]} is not the final instruction; "
-            f"{follow} instruction(s) follow it",
-            index=returns[0],
-        )
-
-    # Simulate the stack depth and the assigned local slots. Straight-line
-    # code has exactly one possible state at every instruction, so one pass
-    # covers every execution.
-    depth = 0
-    read_args: set[int] = set()
-    assigned: set[int] = set()
+    count = len(program)
     for index, instruction in enumerate(program):
-        pops, pushes = _STACK_EFFECT[instruction.op]
-        if depth < pops:
+        if instruction.op in JUMPS:
+            target = instruction.arg
+            if target <= index:
+                raise InvalidProgramError(
+                    f"{instruction.op.name} at index {index} jumps back to index "
+                    f"{target}; only forward jumps are allowed",
+                    index=index,
+                )
+            if target >= count:
+                raise InvalidProgramError(
+                    f"{instruction.op.name} at index {index} jumps to index "
+                    f"{target}, past the end of the program",
+                    index=index,
+                )
+
+    # Every edge goes forward, so visiting instructions in index order sees
+    # every predecessor of an instruction before the instruction itself:
+    # one pass covers every path. The state is the operand stack's kinds
+    # and the local slots stored on every path so far.
+    #
+    # ``assigned`` is None where the previous instruction does not fall
+    # through (a JUMP or RETURN). ``joins`` holds, for every jump target
+    # not yet reached, the slots stored on every jump into it; the stack is
+    # always empty there.
+    stack: list[str] = []
+    assigned: frozenset[int] | None = frozenset()
+    joins: dict[int, frozenset[int]] = {}
+    read_args: set[int] = set()
+    for index, instruction in enumerate(program):
+        op = instruction.op
+        jumped = joins.pop(index, None)
+        if jumped is not None:
+            if assigned is None:
+                assigned = jumped
+            else:
+                if stack:
+                    raise InvalidProgramError(
+                        f"jump target at index {index} is reached from index "
+                        f"{index - 1} with {len(stack)} value(s) on the stack; "
+                        f"the stack must be empty where paths join",
+                        index=index,
+                    )
+                assigned &= jumped
+        elif assigned is None:
             raise InvalidProgramError(
-                f"stack underflow at index {index}: {instruction.op.name} "
-                f"needs {pops} value(s) but the stack has {depth}",
+                f"instruction at index {index} is unreachable", index=index
+            )
+
+        pops, pushes = _STACK_EFFECT[op]
+        if len(stack) < len(pops):
+            raise InvalidProgramError(
+                f"stack underflow at index {index}: {op.name} "
+                f"needs {len(pops)} value(s) but the stack has {len(stack)}",
                 index=index,
             )
-        if instruction.op is Op.RETURN and depth != pops:
-            raise InvalidProgramError(
-                f"RETURN at index {index} leaves {depth - pops} extra value(s) "
-                f"on the stack; it must find exactly one",
-                index=index,
-            )
-        if instruction.op is Op.LOAD_LOCAL and instruction.arg not in assigned:
+        operands = stack[len(stack) - len(pops) :]
+        for needed, found in zip(pops, operands, strict=True):
+            if needed is not found:
+                raise InvalidProgramError(
+                    f"{op.name} at index {index} needs {needed} but found {found}",
+                    index=index,
+                )
+        del stack[len(stack) - len(pops) :]
+        stack.extend(pushes)
+
+        if op is Op.LOAD_LOCAL and instruction.arg not in assigned:
             raise InvalidProgramError(
                 f"LOAD_LOCAL at index {index} reads local {instruction.arg} "
-                f"before it is assigned",
+                f"before it is assigned on every path",
                 index=index,
             )
-        if instruction.op is Op.LOAD_ARG:
+        if op is Op.LOAD_ARG:
             read_args.add(instruction.arg)
-        elif instruction.op is Op.STORE_LOCAL:
-            assigned.add(instruction.arg)
-        depth += pushes - pops
+        elif op is Op.STORE_LOCAL:
+            assigned |= {instruction.arg}
+        elif op in COMPARISONS:
+            following = program[index + 1].op if index + 1 < count else None
+            if following is not Op.JUMP_IF_FALSE:
+                raise InvalidProgramError(
+                    f"{op.name} at index {index} must be immediately followed "
+                    f"by JUMP_IF_FALSE",
+                    index=index,
+                )
+        elif op is Op.RETURN or op in JUMPS:
+            if stack:
+                raise InvalidProgramError(
+                    f"{op.name} at index {index} leaves {len(stack)} extra "
+                    f"value(s) on the stack; it must leave none",
+                    index=index,
+                )
+            if op in JUMPS:
+                target = instruction.arg
+                previous = joins.get(target)
+                joins[target] = assigned if previous is None else previous & assigned
+            if op is not Op.JUMP_IF_FALSE:
+                assigned = None
 
+    if assigned is not None:
+        raise InvalidProgramError(
+            f"the instruction at index {count - 1} falls off the end of the "
+            f"program; every path must end with RETURN",
+            index=count - 1,
+        )
     return tuple(sorted(read_args))
 
 
-# Operations whose argument is an int: a constant, or an argument or local
-# index (which cannot be negative).
-_OPS_WITH_INT = frozenset({Op.LOAD_ARG, Op.LOAD_CONST, Op.LOAD_LOCAL, Op.STORE_LOCAL})
+# Operations whose argument is an int: a constant, or an argument, local or
+# instruction index (which cannot be negative).
+_OPS_WITH_INT = frozenset(
+    {Op.LOAD_ARG, Op.LOAD_CONST, Op.LOAD_LOCAL, Op.STORE_LOCAL} | JUMPS
+)
 
 
 def _check_instruction(index: int, instruction: object) -> None:
@@ -257,7 +369,12 @@ def _check_instruction(index: int, instruction: object) -> None:
                 index=index,
             )
         if op is not Op.LOAD_CONST and arg < 0:
-            kind = "argument" if op is Op.LOAD_ARG else "local"
+            if op is Op.LOAD_ARG:
+                kind = "argument"
+            elif op in JUMPS:
+                kind = "target"
+            else:
+                kind = "local"
             raise InvalidProgramError(
                 f"{op.name} at index {index} has negative {kind} index {arg}",
                 index=index,

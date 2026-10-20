@@ -19,6 +19,7 @@ from speedysnek._frontend import (
     RejectionReason,
     analyze,
 )
+from speedysnek._interpreter import execute, validate
 
 LOAD_ARG_0 = Instruction(Op.LOAD_ARG, 0)
 LOAD_ARG_1 = Instruction(Op.LOAD_ARG, 1)
@@ -329,7 +330,7 @@ def test_rejects_attribute_access():
     assert_rejected(f, RejectionReason.UNSUPPORTED_OPCODE, "LOAD_ATTR", 4)
 
 
-def test_rejects_if():
+def test_rejects_conditions_that_are_not_comparisons():
     def f(a):
         if a:
             return 1
@@ -338,8 +339,23 @@ def test_rejects_if():
     def ternary(a, b):
         return a if b else 1
 
-    assert_rejected(f, RejectionReason.CONTROL_FLOW, "POP_JUMP_IF_FALSE", 12)
-    assert_rejected(ternary, RejectionReason.CONTROL_FLOW, "POP_JUMP_IF_FALSE", 12)
+    def identity(a, b):
+        if a is b:
+            return 1
+        return 2
+
+    def membership(a, b):
+        if a in b:
+            return 1
+        return 2
+
+    # Each condition is reported at its jump, not at TO_BOOL, IS_OP or
+    # CONTAINS_OP.
+    for func, offset in ((f, 12), (ternary, 12), (identity, 6), (membership, 8)):
+        rejection = assert_rejected(
+            func, RejectionReason.UNSUPPORTED_CONDITION, "POP_JUMP_IF_FALSE", offset
+        )
+        assert "only a comparison can be an if condition" in rejection.message
 
 
 def test_rejects_loops():
@@ -348,12 +364,19 @@ def test_rejects_loops():
             a = a - 1
         return a
 
+    def while_comparison(a):
+        while a > 0:
+            a -= 1
+        return a
+
     def for_loop(a):
         for _ in a:
             pass
         return 0
 
-    assert_rejected(while_loop, RejectionReason.CONTROL_FLOW, "POP_JUMP_IF_FALSE", 12)
+    # The backward jump is reported before the loop condition.
+    assert_rejected(while_loop, RejectionReason.CONTROL_FLOW, "JUMP_BACKWARD", 36)
+    assert_rejected(while_comparison, RejectionReason.CONTROL_FLOW, "JUMP_BACKWARD", 34)
     assert_rejected(for_loop, RejectionReason.CONTROL_FLOW, "FOR_ITER", 6)
 
 
@@ -948,8 +971,19 @@ def test_rejects_try_except():
         except:  # noqa: E722
             return 0
 
-    # The protected body is straight-line; the handler after it is not.
-    assert_rejected(f, RejectionReason.UNSUPPORTED_OPCODE, "PUSH_EXC_INFO", 20)
+    def with_branch(a, b):
+        try:
+            if a < b:
+                a = b
+        except Exception:
+            pass
+        return a
+
+    # The exception table adds edges the analysis does not model, so it is
+    # rejected before any instruction is looked at.
+    for func in (f, with_branch):
+        rejection = assert_rejected(func, RejectionReason.CONTROL_FLOW)
+        assert "exception handling" in rejection.message
 
 
 @pytest.mark.parametrize(
@@ -979,6 +1013,466 @@ def test_rejects_other_python_versions(monkeypatch):
         return a + b
 
     assert_rejected(add, RejectionReason.UNSUPPORTED_PYTHON_VERSION)
+
+
+# --- Conditionals --------------------------------------------------------
+
+LOAD_ARG_2 = Instruction(Op.LOAD_ARG, 2)
+
+
+def jump(target):
+    return Instruction(Op.JUMP, target)
+
+
+def jump_if_false(target):
+    return Instruction(Op.JUMP_IF_FALSE, target)
+
+
+def assert_valid(func):
+    """``func`` is supported and its IR passes the reference validator."""
+    analysis = analyze(func)
+    assert analysis.supported, analysis.rejection
+    validate(analysis.instructions)
+    return analysis.instructions
+
+
+def test_if_else_with_duplicated_return():
+    def calculate_score(wins, penalties):
+        score = wins * 3 - penalties
+        if score < 0:
+            score = 0
+        else:
+            score += 5
+        return score
+
+    # CPython 3.14 copies the short ``return score`` into both branches,
+    # so each branch ends with its own RETURN and there is no join.
+    assert_supported(
+        calculate_score,
+        [
+            LOAD_ARG_0,
+            const(3),
+            MULTIPLY,
+            LOAD_ARG_1,
+            SUBTRACT,
+            store(0),
+            load(0),
+            const(0),
+            Instruction(Op.LESS_THAN),
+            jump_if_false(14),
+            const(0),
+            store(0),
+            load(0),
+            RETURN,
+            load(0),
+            const(5),
+            ADD,
+            store(0),
+            load(0),
+            RETURN,
+        ],
+    )
+
+
+def test_if_else_assigning_one_local():
+    def choose(a, b):
+        if a >= b:
+            result = a - b
+        else:
+            result = b - a
+        return result
+
+    assert_supported(
+        choose,
+        [
+            LOAD_ARG_0,
+            LOAD_ARG_1,
+            Instruction(Op.GREATER_EQUAL),
+            jump_if_false(10),
+            LOAD_ARG_0,
+            LOAD_ARG_1,
+            SUBTRACT,
+            store(0),
+            load(0),
+            RETURN,
+            LOAD_ARG_1,
+            LOAD_ARG_0,
+            SUBTRACT,
+            store(0),
+            load(0),
+            RETURN,
+        ],
+    )
+
+
+def test_if_without_else_joins():
+    def adjust(a, b):
+        result = a
+        if a < b:
+            result += b
+        return result * 2
+
+    # The tail is too long to copy, so the jump goes to a shared join.
+    assert_supported(
+        adjust,
+        [
+            LOAD_ARG_0,
+            store(0),
+            LOAD_ARG_0,
+            LOAD_ARG_1,
+            Instruction(Op.LESS_THAN),
+            jump_if_false(10),
+            load(0),
+            LOAD_ARG_1,
+            ADD,
+            store(0),
+            load(0),
+            const(2),
+            MULTIPLY,
+            RETURN,
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    ("operator", "op"),
+    [
+        ("<", Op.LESS_THAN),
+        ("<=", Op.LESS_EQUAL),
+        (">", Op.GREATER_THAN),
+        (">=", Op.GREATER_EQUAL),
+        ("==", Op.EQUAL),
+        ("!=", Op.NOT_EQUAL),
+    ],
+)
+def test_every_comparison(operator, op):
+    f = define(
+        f"def f(a, b):\n    r = 0\n    if a {operator} b:\n        r = 1\n"
+        f"    return r\n"
+    )
+    assert_supported(
+        f,
+        [
+            const(0),
+            store(0),
+            LOAD_ARG_0,
+            LOAD_ARG_1,
+            Instruction(op),
+            jump_if_false(8),
+            const(1),
+            store(0),
+            load(0),
+            RETURN,
+        ],
+    )
+
+
+def test_comparison_operands_are_expressions():
+    def f(a, b):
+        r = 0
+        if 0 < a * 2 - b:
+            r = 1
+        return r
+
+    assert assert_valid(f)[2:9] == (
+        const(0),
+        LOAD_ARG_0,
+        const(2),
+        MULTIPLY,
+        LOAD_ARG_1,
+        SUBTRACT,
+        Instruction(Op.LESS_THAN),
+    )
+
+
+def test_nested_and_sequential_branches():
+    def f(a, b, c):
+        r = 0
+        if a < b:
+            if b < c:
+                r = 1
+            else:
+                r = 2
+        else:
+            r = 3
+        if a == c:
+            r += 10
+        return r
+
+    assert_supported(
+        f,
+        [
+            const(0),
+            store(0),
+            LOAD_ARG_0,
+            LOAD_ARG_1,
+            Instruction(Op.LESS_THAN),
+            jump_if_false(16),  # else: r = 3
+            LOAD_ARG_1,
+            LOAD_ARG_2,
+            Instruction(Op.LESS_THAN),
+            jump_if_false(13),  # inner else: r = 2
+            const(1),
+            store(0),
+            jump(18),
+            const(2),
+            store(0),
+            jump(18),
+            const(3),
+            store(0),
+            LOAD_ARG_0,  # 18: the second if.
+            LOAD_ARG_2,
+            Instruction(Op.EQUAL),
+            jump_if_false(26),
+            load(0),
+            const(10),
+            ADD,
+            store(0),
+            load(0),  # 26
+            RETURN,
+        ],
+    )
+
+
+def test_elif_chain():
+    def f(a, b):
+        if a < b:
+            r = 1
+        elif a > b:
+            r = 2
+        else:
+            r = 3
+        return r
+
+    instructions = assert_valid(f)
+    assert [i.op for i in instructions].count(Op.RETURN) == 3
+    assert [i.op for i in instructions].count(Op.JUMP_IF_FALSE) == 2
+
+
+def test_empty_branch_jumps_to_the_next_instruction():
+    def f(a, b):
+        if a < b:
+            pass
+        return a
+
+    # ``pass`` is a NOP; both outcomes continue at index 4.
+    assert_supported(
+        f,
+        [
+            LOAD_ARG_0,
+            LOAD_ARG_1,
+            Instruction(Op.LESS_THAN),
+            jump_if_false(4),
+            LOAD_ARG_0,
+            RETURN,
+        ],
+    )
+
+
+def test_argument_reassigned_on_one_path_is_copied_on_entry():
+    def f(a, b):
+        if a < b:
+            a = b
+        return a
+
+    # After the join ``a`` is the argument on one path and a stored value
+    # on the other, so its slot starts out holding the argument.
+    assert_supported(
+        f,
+        [
+            LOAD_ARG_0,
+            store(0),
+            LOAD_ARG_0,
+            LOAD_ARG_1,
+            Instruction(Op.LESS_THAN),
+            jump_if_false(8),
+            LOAD_ARG_1,
+            store(0),
+            load(0),
+            RETURN,
+        ],
+    )
+
+
+def test_argument_reassigned_on_every_path_needs_no_copy():
+    def f(a, b):
+        if a < b:
+            a = b
+        else:
+            a = 0
+        return a + b
+
+    instructions = assert_valid(f)
+    assert instructions[:3] == (LOAD_ARG_0, LOAD_ARG_1, Instruction(Op.LESS_THAN))
+
+
+def test_swap_through_a_copy_across_a_join():
+    def f(a, b):
+        c = a
+        if a < b:
+            a = b
+            b = c
+        return a - b
+
+    instructions = assert_valid(f)
+    # ``a`` (slot 1) and ``b`` (slot 2) are copied in on entry; ``c`` is
+    # slot 0, the first variable stored.
+    assert instructions[:4] == (LOAD_ARG_0, store(1), LOAD_ARG_1, store(2))
+    for a, b in [(1, 2), (2, 1), (3, 3)]:
+        assert execute(instructions, (a, b)) == f(a, b)
+
+
+def test_straight_line_functions_have_no_jumps_or_copies():
+    def f(a, b):
+        a = a + 1
+        a += b
+        return a * b
+
+    instructions = assert_valid(f)
+    assert instructions[0] == LOAD_ARG_0
+    assert not any(i.op is Op.JUMP or i.op is Op.JUMP_IF_FALSE for i in instructions)
+
+
+def test_rejects_possibly_unbound_read_after_a_join():
+    def possibly_unbound(a, b):
+        if a < b:
+            result = a
+        return result
+
+    rejection = assert_rejected(
+        possibly_unbound,
+        RejectionReason.UNSUPPORTED_VARIABLE,
+        "LOAD_FAST_CHECK",
+        18,
+    )
+    assert "'result' may be read before it is assigned" in rejection.message
+    # The original function still behaves as CPython defines it.
+    assert possibly_unbound(1, 2) == 1
+    with pytest.raises(UnboundLocalError):
+        possibly_unbound(2, 1)
+
+
+def test_rejects_read_assigned_only_in_the_other_branch():
+    def f(a, b):
+        if a < b:
+            x = 1
+        else:
+            y = 2  # noqa: F841
+            return x  # noqa: F821 -- unbound on this path.
+        return x
+
+    assert_rejected(f, RejectionReason.UNSUPPORTED_VARIABLE, "LOAD_FAST_CHECK", 26)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "x = a < b\n    return x",
+        "return a < b",
+        "return (a < b) + 1",
+    ],
+)
+def test_rejects_comparison_results_as_values(body):
+    rejection = assert_rejected(
+        define(f"def f(a, b):\n    {body}\n"),
+        RejectionReason.UNSUPPORTED_CONDITION,
+        "COMPARE_OP",
+        4,
+    )
+    assert "only supported as an if condition" in rejection.message
+
+
+def test_rejects_or_and_not():
+    # Both compile to POP_JUMP_IF_TRUE.
+    for condition in ("a < b or b < 0", "not a < b"):
+        f = define(
+            f"def f(a, b):\n    r = 0\n    if {condition}:\n        r = 1\n"
+            f"    return r\n"
+        )
+        assert_rejected(f, RejectionReason.CONTROL_FLOW, "POP_JUMP_IF_TRUE", 12)
+
+
+def test_and_of_comparisons_is_the_same_bytecode_as_nested_ifs():
+    nested = define(
+        "def f(a, b, c):\n    x = 0\n    if a < b:\n        if b < c:\n"
+        "            x = 1\n    return x\n"
+    )
+    conjunction = define(
+        "def f(a, b, c):\n    x = 0\n    if a < b and b < c:\n        x = 1\n"
+        "    return x\n"
+    )
+    assert analyze(conjunction).instructions == assert_valid(nested)
+
+
+def test_conditional_expressions_compiled_like_statements():
+    # CPython emits the same bytecode shape for these as for if statements
+    # with a return or an assignment in each branch, so they are accepted.
+    ternary = define("def f(a, b):\n    return a if a < b else b\n")
+    statement = define("def f(a, b):\n    if a < b:\n        return a\n    return b\n")
+    assert assert_valid(ternary) == assert_valid(statement)
+    assigned = define("def f(a, b):\n    x = a if a < b else b\n    return x\n")
+    assert_valid(assigned)
+
+
+def test_rejects_conditional_expressions_inside_expressions():
+    # A value on the stack at the jump or at the join.
+    after = define("def f(a, b):\n    x = (a if a < b else b) + 1\n    return x\n")
+    before = define("def f(a, b):\n    x = 1 + (a if a < b else b)\n    return x\n")
+    assert_rejected(after, RejectionReason.CONTROL_FLOW, "JUMP_FORWARD", 16)
+    assert_rejected(before, RejectionReason.CONTROL_FLOW, "POP_JUMP_IF_FALSE", 10)
+
+
+def test_rejects_chained_comparisons():
+    f = define(
+        "def f(a, b, c):\n    x = 0\n    if a < b < c:\n        x = 1\n    return x\n"
+    )
+    assert_rejected(f, RejectionReason.UNSUPPORTED_OPCODE, "SWAP", 8)
+
+
+def test_rejects_unsupported_comparison_operands_and_paths():
+    cases = [
+        # A float or bool constant.
+        (
+            "if a < 1.5:\n        a = 1\n    return a",
+            RejectionReason.UNSUPPORTED_CONSTANT,
+        ),
+        (
+            "if a == True:\n        a = 1\n    return a",
+            RejectionReason.UNSUPPORTED_CONSTANT,
+        ),
+        # A path that returns None.
+        (
+            "if a < b:\n        return\n    return a",
+            RejectionReason.UNSUPPORTED_CONSTANT,
+        ),
+        ("if a < b:\n        a = 1", RejectionReason.UNSUPPORTED_CONSTANT),
+        # A call in a branch.
+        (
+            "if a < b:\n        a = abs(b)\n    return a",
+            RejectionReason.UNSUPPORTED_OPCODE,
+        ),
+    ]
+    for body, reason in cases:
+        rejection = analyze(define(f"def f(a, b):\n    {body}\n")).rejection
+        assert rejection is not None and rejection.reason is reason, body
+
+
+def test_branch_ir_matches_python_on_small_inputs():
+    sources = [
+        "if a < b:\n        a = b\n    return a",
+        "r = a\n    if a < b:\n        r += b\n    else:\n        r -= b\n"
+        "    return r * 2",
+        "if a < 0:\n        a = 0 - a\n    if b < 0:\n        b = 0 - b\n"
+        "    return a + b",
+        "r = 0\n    if a != b:\n        if a > b:\n            r = a\n"
+        "        r += 1\n    return r",
+    ]
+    for body in sources:
+        f = define(f"def f(a, b):\n    {body}\n")
+        instructions = assert_valid(f)
+        for a in range(-2, 3):
+            for b in range(-2, 3):
+                assert execute(instructions, (a, b)) == f(a, b), (body, a, b)
 
 
 # --- The instruction model -----------------------------------------------
@@ -1039,6 +1533,7 @@ def test_analysis_has_instructions_xor_rejection():
 def test_rejection_reasons_are_stable_strings():
     assert RejectionReason.UNSUPPORTED_OPCODE == "unsupported_opcode"
     assert RejectionReason.CONTROL_FLOW == "control_flow"
+    assert RejectionReason.UNSUPPORTED_CONDITION == "unsupported_condition"
 
 
 def test_frontend_is_private():
