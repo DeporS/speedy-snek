@@ -133,12 +133,24 @@ for _ in range(100):
     score = calculate_score(10, 4, 3)   # 28, native after warmup
 ```
 
+Updating a variable in place with `+=`, `-=` or `*=` works the same way:
+
+```python
+@snekit
+def calculate_score(wins, draws, penalties):
+    points = wins * 3
+    points += draws
+    points -= penalties * 2
+    return points
+```
+
 What compiles today: positional `int` arguments, `int` constants, `+`,
 `-`, `*`, assignments to local variables (including reassigning an
-argument) and one final `return`. Branches (`if`, conditional
-expressions), loops, function calls, globals, augmented assignment
-(`x += 1`), tuple assignment and everything else still run as plain
-Python.
+argument), `+=`, `-=` and `*=` on local variables and arguments, and one
+final `return`. Branches (`if`, conditional expressions), loops, function
+calls, globals, other augmented operators (`/=`, `//=`, `%=`, …),
+attribute or item updates (`obj.x += 1`, `items[0] += 1`), tuple
+assignment and everything else still run as plain Python.
 
 `@jit` is the descriptive, backwards-compatible name for the same
 decorator: `speedysnek.jit is speedysnek.snekit`, so existing
@@ -259,12 +271,19 @@ Current status:
 
 - Only **straight-line integer arithmetic** is supported: positional
   arguments, `int` constants, `+`, `-`, `*`, plain assignments to local
-  variables (`x = a + b`, including reassigning an argument) and `return`.
+  variables (`x = a + b`, including reassigning an argument), `+=`, `-=`
+  and `*=` on local variables and arguments, and `return`. An augmented
+  assignment becomes the same `ADD`, `SUBTRACT` or `MULTIPLY` followed by
+  `STORE_LOCAL` as the equivalent `x = x + …`: native code only ever sees
+  exact `int`s, which have no in-place operators, and any other value
+  falls back to Python, which calls its `__iadd__`, `__isub__` or
+  `__imul__` as usual.
 - **Control flow and loops remain unsupported**: no `if`, conditional
   expressions, `while` or `for`.
-- Anything else (division, calls, globals, attributes, augmented
-  assignment, tuple or chained assignment, `del`, closures, generators,
-  async functions, non-`int` constants, …) is rejected with a
+- Anything else (division, calls, globals, attributes, other augmented
+  operators, augmented assignment to attributes, items or globals, tuple
+  or chained assignment, `del`, closures, generators, async functions,
+  non-`int` constants, …) is rejected with a
   machine-readable reason and, where applicable, the offending CPython
   opcode and bytecode offset. So is reading a local variable that may not
   be assigned yet; the original function then raises its usual
