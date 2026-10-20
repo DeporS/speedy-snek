@@ -44,6 +44,10 @@ DEBUG_BUILD: bool
 class CodegenError(RuntimeError):
     """Cranelift could not compile a valid program for this host."""
 
+class UnguardableBinding(Exception):
+    """A function's ``range`` is not the builtin ``range``, or cannot be
+    proven to be without running Python code."""
+
 @final
 class I64Function:
     """Natively compiled code for one program over signed 64-bit integers."""
@@ -74,6 +78,42 @@ class I64Function:
         must be an exact tuple (``TypeError`` otherwise); any exception
         means a bug, not a guard miss.
         """
+
+@final
+class RangeGuard:
+    """Proof that ``range``, looked up in ``globals`` and then ``builtins``
+    as a function's ``LOAD_GLOBAL`` does, is the builtin ``range`` type.
+
+    Both must be exact dicts whose keys are all exact ``str``; otherwise,
+    or if ``range`` resolves to anything else, the constructor raises
+    ``UnguardableBinding``. A dict watcher clears ``valid`` before any
+    change to either dict that could affect the lookup. It runs no Python
+    code.
+    """
+
+    def __init__(
+        self, globals: dict[str, Any], builtins: dict[str, Any], /
+    ) -> None: ...
+    @property
+    def valid(self) -> bool:
+        """Whether the binding still holds. Once false, it stays false."""
+
+@final
+class GuardedI64Function:
+    """An ``I64Function`` that may only run while ``guard`` holds.
+
+    ``NativeWrapper`` checks the guard before each native call;
+    ``try_call`` returns ``None`` once it fails.
+    """
+
+    def __init__(self, function: I64Function, guard: RangeGuard, /) -> None: ...
+    @property
+    def function(self) -> I64Function: ...
+    @property
+    def guard(self) -> RangeGuard: ...
+    @property
+    def arg_count(self) -> int: ...
+    def try_call(self, args: tuple[object, ...], /) -> int | None: ...
 
 @final
 class NativeWrapper:

@@ -28,8 +28,26 @@ machine with three states (:class:`_Status`):
   the original arguments. The specialization stays cached for later calls.
 - ``DISABLED``: the frontend rejected the function, the backend could not
   compile it, the compilation machinery failed, a native call failed
-  unexpectedly, or ``__code__`` was replaced after compilation. Every later
-  call runs the original function.
+  unexpectedly, ``__code__`` was replaced after compilation, or the
+  function's ``range`` could not be guarded or stopped being the builtin.
+  Every later call runs the original function.
+
+**The range guard.** A ``for`` loop over ``range(n)`` compiles to integer
+arithmetic that assumes ``range`` is the builtin (the frontend reports it
+in ``Analysis.assumed_builtins``). Compilation then creates a
+``_native.RangeGuard`` from the function's ``__globals__`` and
+``__builtins__``: it proves, without running Python code, that ``range``
+resolves to the genuine builtin ``range`` type, and a dict watcher
+invalidates it on any later change to either dict that could affect that
+lookup. If the proof fails, the function is ``DISABLED``
+(``RANGE_UNGUARDED``) and always runs as Python. Otherwise the
+specialization's ``function`` is a ``_native.GuardedI64Function``, whose
+guard the wrapper checks before every native call. When it has failed,
+that call runs the original function once, with the original arguments,
+and the specialization is disabled for good (``RANGE_CHANGED``), exactly
+as when ``__code__`` is replaced: restoring the old binding does not
+re-enable it. Functions that do not use ``range`` get no guard and no
+check.
 
 The wrapper is a :class:`speedysnek._native.NativeWrapper`: the per-call
 logic runs in Rust, so a call through it enters no Python frame. It
@@ -42,6 +60,7 @@ Python code at all::
 
     wrapper(*args)                      (NativeWrapper.__call__, in Rust)
         -> check __code__, keywords and arity
+        -> check the range guard        (only for a for loop over range)
         -> spec.function's fast path    (the same Rust code as try_call)
             -> validate every argument once: exact int, in i64
             -> run the machine code, which checks every operation for overflow
@@ -104,6 +123,11 @@ class _DisabledReason(enum.Enum):
     INTERRUPTED = "interrupted"
     # ``__code__`` was replaced during or after compilation.
     CODE_CHANGED = "code_changed"
+    # The function uses ``range``, which could not be proven to be the
+    # builtin without running Python code, or is not; see ``compile_error``.
+    RANGE_UNGUARDED = "range_unguarded"
+    # The function's ``range`` binding may have changed after compilation.
+    RANGE_CHANGED = "range_changed"
     # A native call raised an ``Exception``; guard misses never raise. See
     # ``native_error``.
     NATIVE_ERROR = "native_error"
@@ -117,22 +141,32 @@ class _Specialization:
     hot path needs is resolved here, once.
     """
 
-    __slots__ = ("arg_count", "code", "fast_call", "function", "native")
+    __slots__ = ("arg_count", "code", "fast_call", "function", "guard", "native")
 
-    def __init__(self, code: CodeType, native: Any) -> None:
+    def __init__(self, code: CodeType, native: Any, guard: Any = None) -> None:
         self.code = code
         # The ``CompiledI64``, kept for diagnostics; the wrapper never calls it.
         self.native = native
         self.arg_count = native.arg_count
-        # The bound ``I64Function.try_call``: ``fast_call(args)`` returns
-        # the result ``int``, or ``None`` for a guard miss. The wrapper only
-        # calls it when ``function`` is not an ``I64Function``; benchmarks
-        # time it as the fast path seen from Python.
-        self.fast_call = native.fast_call
-        # The ``I64Function`` itself: the wrapper runs its fast path
-        # directly, in Rust. Any other value (only test doubles use one)
-        # makes the wrapper call ``fast_call`` instead.
-        self.function = native.function
+        # The ``RangeGuard`` the native code depends on, or ``None``.
+        self.guard = guard
+        if guard is None:
+            # The ``I64Function`` itself: the wrapper runs its fast path
+            # directly, in Rust. Any other value (only test doubles use
+            # one) makes the wrapper call ``fast_call`` instead.
+            self.function = native.function
+            # The bound ``I64Function.try_call``: ``fast_call(args)``
+            # returns the result ``int``, or ``None`` for a guard miss. The
+            # wrapper only calls it for a test double; benchmarks time it
+            # as the fast path seen from Python.
+            self.fast_call = native.fast_call
+        else:
+            from ._native import GuardedI64Function
+
+            # The wrapper checks the guard, then runs the same fast path;
+            # ``try_call`` also treats a failed guard as a guard miss.
+            self.function = GuardedI64Function(native.function, guard)
+            self.fast_call = self.function.try_call
 
 
 class _JitState:
@@ -195,6 +229,12 @@ class _JitState:
             if self.status is _Status.COMPILED:
                 self._disable(_DisabledReason.CODE_CHANGED)
 
+    def binding_changed(self) -> None:
+        """The range guard failed: ``range`` may no longer be the builtin."""
+        with self._lock:
+            if self.status is _Status.COMPILED:
+                self._disable(_DisabledReason.RANGE_CHANGED)
+
     def native_failed(self, error: Exception) -> None:
         """A native call raised; guard misses return ``None`` instead."""
         with self._lock:
@@ -231,6 +271,20 @@ class _JitState:
 
         from . import _compiler
 
+        guard = None
+        if "range" in analysis.assumed_builtins:
+            from ._native import RangeGuard, UnguardableBinding
+
+            try:
+                # ``FunctionType`` cannot be subclassed, so reading these
+                # attributes runs no Python code. Created before compiling,
+                # so the guard sees every change from here on.
+                guard = RangeGuard(func.__globals__, func.__builtins__)
+            except UnguardableBinding as error:
+                self.compile_error = error
+                self._disable(_DisabledReason.RANGE_UNGUARDED)
+                return
+
         try:
             # Pass the full positional arity: arguments the bytecode never
             # reads are still part of every call.
@@ -248,7 +302,7 @@ class _JitState:
         self.compiled = compiled
         self.compiled_code = code
         # Publish the complete specialization before changing the status.
-        self.specialization = _Specialization(code, compiled)
+        self.specialization = _Specialization(code, compiled, guard)
         self.status = _Status.COMPILED
 
     def _disable(self, reason: _DisabledReason) -> None:

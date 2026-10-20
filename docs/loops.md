@@ -318,7 +318,9 @@ above. `JUMP_IF_FALSE` still only jumps forward. One status is new:
 
 ## Out of scope
 
-`for` and iterators (`GET_ITER`, `FOR_ITER`); nested or consecutive loops;
+`for` loops other than over `range(n)` (that one is compiled; see
+[`for-range.md`](for-range.md)) and iterators in general (`GET_ITER`,
+`FOR_ITER`); nested or consecutive loops;
 `break`, `return` inside a loop, and loop `else` combined with `break`;
 `while True:` and other conditions that are not one comparison (`while a:`,
 `while a < b and b < c`, `while not a >= b`); calls; globals; closures;

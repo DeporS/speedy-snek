@@ -61,9 +61,15 @@ three runs):
 | `conditional_sum` | 330–532 | 467–695 |
 | `ops_020` (no loop) | 262–477 | 598–942 |
 
-This happens once per function, on the ninth call; with the eight warmup
-calls, a loop function needs well under a millisecond of extra work before
-its first native call.
+This happens once per function, during the ninth call. Analysis and
+compilation together took about 0.6–1.0 ms for `sum_squares`, 0.8–1.2 ms
+for `conditional_sum` and 0.9–1.4 ms for `ops_020`, so a function needs
+roughly a millisecond of extra work before its first native call, not
+"well under a millisecond" as an earlier version of this note said. That
+one-time cost is separate from the eight warmup calls before it: they run
+the original function at Python speed through the cold wrapper, which a
+later measurement ([`for_range.md`](for_range.md#compilation-and-warmup))
+put at 0.1–0.2 µs extra per call, under 2 µs for all eight.
 
 ### Straight-line regression check
 

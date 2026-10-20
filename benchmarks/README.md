@@ -307,6 +307,8 @@ that are not part of the pyperf suite and do not update the baseline:
 |---|---|
 | [`wrapper_overhead`](experiments/wrapper_overhead.md) | A wrapper generated for the function's positional signature does not make warmed `@snekit` calls cheaper; not adopted. Also attributes the wrapper's remaining cost. |
 | [`native_wrapper`](experiments/native_wrapper.md) | Moving the wrapper's per-call logic into a PyO3 callable makes warmed calls 0.58–0.66× as long and guard misses about 0.55×, with no slower case; adopted. Lists the observable differences of a non-function wrapper. |
+| [`loops`](experiments/loops.md) | Warmed `while` loops run 20–30× faster than plain Python from 1,000 iterations up; the backedge budget is cheap, and a call that exhausts it is about 3% slower than plain Python. Analysis plus compilation takes about a millisecond per function. |
+| [`for_range`](experiments/for_range.md) | Warmed `for` loops over `range(n)` run as fast as the equivalent `while` loops (21–24× faster than plain Python at 10,000 iterations); the range guard costs under 10 µs once and nothing measurable on functions that do not use `range`. |
 
 `benchmarks/tests/test_wrapper_experiment.py` keeps the experiment's
 prototype honest against the production wrapper.

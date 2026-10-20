@@ -1309,7 +1309,8 @@ def _tuple_assignment(a, b):
 
 def _loop_with_locals(a):
     total = 0
-    for i in range(a):
+    # Only range with one argument is supported.
+    for i in range(1, a):
         total = total + i
     return total
 
@@ -1343,7 +1344,7 @@ UNSUPPORTED = [
     (_global, (4,), RejectionReason.UNSUPPORTED_OPCODE),
     (_augmented, (4,), RejectionReason.UNSUPPORTED_OPERATOR),
     (_tuple_assignment, (4, 5), RejectionReason.UNSUPPORTED_OPCODE),
-    (_loop_with_locals, (4,), RejectionReason.CONTROL_FLOW),
+    (_loop_with_locals, (4,), RejectionReason.UNSUPPORTED_ITERATION),
     (_divide, (9, 2), RejectionReason.UNSUPPORTED_OPERATOR),
     (_varargs, (1, 2), RejectionReason.UNSUPPORTED_SIGNATURE),
     (abs, (-3,), RejectionReason.NOT_A_FUNCTION),

@@ -10,11 +10,14 @@ This is the first stage of the compiler pipeline::
 
 Only functions of positional arguments, ``int`` constants, ``+``, ``-``,
 ``*``, assignments to local variables (including arguments), ``+=``, ``-=``
-and ``*=`` on them, ``if``/``else`` statements and one ``while`` loop whose
-condition is one integer comparison (``<``, ``<=``, ``>``, ``>=``, ``==``,
-``!=``), and ``return`` are supported. Everything else, including ``for``
-loops and nested loops, is rejected with a machine-readable
-:class:`RejectionReason`.
+and ``*=`` on them, ``if``/``else`` statements, one loop, and ``return``
+are supported. The loop is either a ``while`` loop whose condition is one
+integer comparison (``<``, ``<=``, ``>``, ``>=``, ``==``, ``!=``) or a
+``for`` loop over the builtin ``range`` with one argument, which becomes
+the same loop over two hidden integer slots; such an analysis lists
+``"range"`` in :attr:`Analysis.assumed_builtins`. Everything else,
+including other ``for`` loops and nested loops, is rejected with a
+machine-readable :class:`RejectionReason`.
 
 :func:`speedysnek.snekit` calls :func:`analyze` once per decorated function,
 after warmup; a rejection makes it run the original function from then on.
