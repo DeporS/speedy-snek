@@ -28,18 +28,31 @@ it. Anything outside the tier raises instead of returning a wrong value:
 - :class:`NativeGuardFailure` at call time: the call does not fit the tier.
   Its :attr:`~NativeGuardFailure.reason` says why: the wrong number of
   arguments, an argument that is not an exact ``int`` (``bool`` and ``int``
-  subclasses included), an argument outside the signed 64-bit range, or an
-  ``ADD``, ``SUBTRACT`` or ``MULTIPLY`` whose exact result does not fit.
+  subclasses included), an argument outside the signed 64-bit range, an
+  ``ADD``, ``SUBTRACT`` or ``MULTIPLY`` whose exact result does not fit, or
+  a loop that used up the call's backedge budget.
 
 Malformed IR, including a ``LOAD_LOCAL`` of a slot that is not stored on
-every path to it, a backward jump or a stack value left at a join, raises
+every path to it, a backward jump that is not a supported loop's backedge
+or a stack value left at a join, raises
 :class:`~speedysnek._interpreter.InvalidProgramError`, exactly as in the
 reference interpreter. The Rust extension validates the serialized program
 again on its own.
 
+**Loops.** A program may contain one ``while`` loop. Native code holds the
+GIL and cannot be interrupted, so a call may take at most a fixed number
+of backward jumps, the *backedge budget* (``_native.DEFAULT_BACKEDGE_BUDGET``,
+one million). The next backward jump stops the call: the fast path returns
+``None`` and the diagnostic path raises :class:`NativeGuardFailure` with
+reason ``BUDGET_EXHAUSTED``. No partial result is returned. The budget is
+fixed when a program is compiled; :func:`compile_i64`'s
+``backedge_budget`` argument can only lower it, for tests. Programs
+without a loop get no budget check at all. See ``docs/loops.md``.
+
 Local slots are Cranelift variables: within a block a slot names a value
 that was already computed, so assignments copy nothing at run time, and
-where branches join, SSA block parameters carry each path's value.
+where branches join, or a loop's backedges meet its entry at the loop
+header, SSA block parameters carry each path's value.
 Comparisons are signed and only steer the following branch; they never
 produce a Python value. Only the selected branch runs. Every ``ADD``,
 ``SUBTRACT`` and ``MULTIPLY`` checks for overflow when it runs, whether or
@@ -85,6 +98,7 @@ from ._frontend.ir import JUMPS, Instruction, Op
 from ._interpreter import InvalidProgramError, validate
 
 __all__ = [
+    "DEFAULT_BACKEDGE_BUDGET",
     "I64_MAX",
     "I64_MIN",
     "CompiledI64",
@@ -97,6 +111,12 @@ __all__ = [
 
 I64_MIN = -(2**63)
 I64_MAX = 2**63 - 1
+
+DEFAULT_BACKEDGE_BUDGET = _native.DEFAULT_BACKEDGE_BUDGET
+
+# The budget ``compile_i64`` uses when it is not given one. Private: tests
+# lower it to make ``@snekit`` compile loops with a small budget.
+_BACKEDGE_BUDGET = DEFAULT_BACKEDGE_BUDGET
 
 # The wire format's opcode numbers are defined once, in Rust
 # (``src/program.rs``), and read from the extension here.
@@ -139,6 +159,7 @@ class GuardReason(enum.StrEnum):
     NOT_EXACT_INT = enum.auto()
     OUT_OF_I64_RANGE = enum.auto()
     OVERFLOW = enum.auto()
+    BUDGET_EXHAUSTED = enum.auto()
 
 
 class NativeGuardFailure(Exception):
@@ -147,7 +168,8 @@ class NativeGuardFailure(Exception):
     ``reason`` is a :class:`GuardReason`. ``arg_index`` names the offending
     argument for ``NOT_EXACT_INT`` and ``OUT_OF_I64_RANGE``, and
     ``instruction_index`` names the overflowing instruction for
-    ``OVERFLOW``; otherwise they are ``None``.
+    ``OVERFLOW`` and the backward jump that found the budget used up for
+    ``BUDGET_EXHAUSTED``; otherwise they are ``None``.
     """
 
     def __init__(
@@ -229,7 +251,10 @@ def _encode(program: tuple[Instruction, ...]) -> tuple[tuple[int, ...], ...]:
 
 
 def compile_i64(
-    instructions: Iterable[Instruction], arg_count: int | None = None
+    instructions: Iterable[Instruction],
+    arg_count: int | None = None,
+    *,
+    backedge_budget: int | None = None,
 ) -> CompiledI64:
     """Compile normalized instructions to native code over signed i64.
 
@@ -237,6 +262,11 @@ def compile_i64(
     takes. It defaults to the smallest count that covers every ``LOAD_ARG``;
     pass the function's real arity when it has arguments the program never
     reads.
+
+    ``backedge_budget`` is the number of backward jumps one call may take.
+    It defaults to ``_BACKEDGE_BUDGET`` (``DEFAULT_BACKEDGE_BUDGET``) and
+    must lie between 0 and ``DEFAULT_BACKEDGE_BUDGET``; it only matters for
+    a program with a loop.
 
     Raises :class:`~speedysnek._interpreter.InvalidProgramError` for
     malformed IR (or an ``arg_count`` smaller than the program needs) and
@@ -257,9 +287,19 @@ def compile_i64(
         raise UnsupportedProgramError(
             f"{arg_count} arguments exceed the native limit of {_native.MAX_ARGS}"
         )
+    if backedge_budget is None:
+        backedge_budget = _BACKEDGE_BUDGET
+    if type(backedge_budget) is not int:
+        raise TypeError(
+            f"backedge_budget must be an int, got {type(backedge_budget).__name__}"
+        )
+    if not 0 <= backedge_budget <= _native.MAX_BACKEDGE_BUDGET:
+        raise ValueError(
+            f"backedge_budget must be between 0 and {_native.MAX_BACKEDGE_BUDGET}"
+        )
 
     try:
-        function = _native.compile_i64(_encode(program), arg_count)
+        function = _native.compile_i64(_encode(program), arg_count, backedge_budget)
     except _native.CodegenError as error:
         raise UnsupportedProgramError(str(error)) from error
     return CompiledI64(function, program)
@@ -287,6 +327,11 @@ class CompiledI64:
         return self._function.arg_count
 
     @property
+    def backedge_budget(self) -> int | None:
+        """The backward jumps one call may take, or ``None`` without a loop."""
+        return self._function.backedge_budget
+
+    @property
     def instructions(self) -> tuple[Instruction, ...]:
         """The normalized instructions this code was compiled from."""
         return self._instructions
@@ -306,7 +351,8 @@ class CompiledI64:
 
         It takes the positional arguments as one tuple and returns the
         result ``int``, or ``None`` if the call does not fit the native tier
-        (the cases :class:`NativeGuardFailure` describes). It raises nothing
+        (the cases :class:`NativeGuardFailure` describes, budget exhaustion
+        included). It raises nothing
         for such a call and does not say why. The bound method keeps the
         machine code alive.
 
@@ -359,6 +405,13 @@ class CompiledI64:
             raise NativeGuardFailure(
                 f"{op} at index {value} overflows a signed 64-bit integer",
                 GuardReason.OVERFLOW,
+                instruction_index=value,
+            )
+        if status == _native.STATUS_BUDGET_EXHAUSTED:
+            raise NativeGuardFailure(
+                f"the loop took more than {self.backedge_budget} backward jumps; "
+                f"the backward JUMP at index {value} stopped it",
+                GuardReason.BUDGET_EXHAUSTED,
                 instruction_index=value,
             )
         # The arity was checked above, so the native check cannot fail.

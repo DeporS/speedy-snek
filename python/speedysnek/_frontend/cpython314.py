@@ -106,13 +106,58 @@ r * 2``::
 - ``if a < b and b < c:`` is the same bytecode as two nested ``if``
   statements, and is accepted as such.
 
-Only these forms are recognized: ``POP_JUMP_IF_FALSE`` directly after a
-``COMPARE_OP`` (bookkeeping aside), and ``JUMP_FORWARD``. Everything else
-is rejected:
+Loops. ``while i < n:`` compiles to a header that tests the condition
+and jumps forward out of the loop when it is false, the body, and a
+``JUMP_BACKWARD`` to the header. For ``def f(n): i = 0; while i < n: i +=
+1; return i``::
 
-- any other jump (``CONTROL_FLOW``): loops (``JUMP_BACKWARD``,
-  ``FOR_ITER``), ``or`` and ``not`` (``POP_JUMP_IF_TRUE``), ``is None``
-  tests (``POP_JUMP_IF_NONE``), and any backward jump;
+    LOAD_SMALL_INT           0
+    STORE_FAST               1 (i)
+    L1: LOAD_FAST_BORROW_LOAD_FAST_BORROW 16 (i, n)
+    COMPARE_OP              18 (bool(<))
+    POP_JUMP_IF_FALSE       12 (to L2)
+    NOT_TAKEN
+    LOAD_FAST_BORROW         1 (i)
+    LOAD_SMALL_INT           1
+    BINARY_OP               13 (+=)
+    STORE_FAST               1 (i)
+    JUMP_BACKWARD           17 (to L1)
+    L2: LOAD_FAST_BORROW     1 (i)
+    RETURN_VALUE
+
+- CPython 3.14 does not copy the test to the bottom of the loop, and
+  ``POP_JUMP_IF_FALSE`` and ``POP_JUMP_IF_TRUE`` never jump backward: a
+  ``JUMP_BACKWARD`` is the only backward jump.
+- CPython copies the ``JUMP_BACKWARD`` into each branch of an ``if``/``else``
+  that ends the body, so a loop can have several, all to the same header.
+- An ``if`` without ``else`` that ends the body is inverted:
+  ``COMPARE_OP``, ``POP_JUMP_IF_TRUE`` to the ``if`` body, ``NOT_TAKEN``,
+  ``JUMP_BACKWARD``. That is the only ``POP_JUMP_IF_TRUE`` accepted, and it
+  becomes ``JUMP_IF_FALSE`` after the negated comparison (``<`` becomes
+  ``>=``, ``==`` becomes ``!=``, ...), which is exact for integers.
+- ``continue`` is a ``JUMP_BACKWARD`` to the header too, so ``if c:
+  continue`` followed by more code is the same bytecode as an ``if c:
+  pass`` / ``else:`` that ends the body, and is accepted. A loop ``else``
+  without ``break`` is the same bytecode as code after the loop.
+
+One loop of this shape is accepted: every ``JUMP_BACKWARD`` goes to the
+same header; the first jump or return from the header on is a
+``POP_JUMP_IF_FALSE`` after a ``COMPARE_OP``, whose target, the exit, lies
+after every ``JUMP_BACKWARD``; nothing jumps into the loop past its header;
+and nothing in the loop leaves it other than that test (``break``, a
+``return`` in the loop, and an ``and`` or ``or`` in the ``while``
+condition all would). ``docs/loops.md`` explains the shape in detail.
+
+Only these jumps are recognized: ``POP_JUMP_IF_FALSE`` directly after a
+``COMPARE_OP`` (bookkeeping aside), ``POP_JUMP_IF_TRUE`` in the shape
+above, ``JUMP_FORWARD`` and ``JUMP_BACKWARD``. Everything else is
+rejected:
+
+- any other jump (``CONTROL_FLOW``): ``for`` loops (``FOR_ITER``), ``or``
+  and ``not`` (``POP_JUMP_IF_TRUE`` elsewhere), ``is None`` tests
+  (``POP_JUMP_IF_NONE``);
+- a second loop, nested or not, and a loop of any other shape
+  (``CONTROL_FLOW``), including ``while True:``;
 - a condition that is not a comparison (``UNSUPPORTED_CONDITION``):
   truthiness (``TO_BOOL``), ``is`` (``IS_OP``), ``in`` (``CONTAINS_OP``);
 - a ``COMPARE_OP`` whose result is not consumed by the jump right after it
@@ -124,12 +169,17 @@ is rejected:
   (``try``, ``with``), whose handlers add edges this analysis does not
   model (``CONTROL_FLOW``).
 
-Local variables. All jumps go forward, so bytecode order visits every
-predecessor of an instruction before the instruction itself, and a single
-pass computes, for every variable at every instruction, what it may hold
-on the paths that reach it: the argument as passed, a value the function
-stored, or nothing. At a join the possibilities of the incoming paths are
-combined. The frontend maps variables like this:
+Local variables. All jumps but a loop's backedges go forward, so bytecode
+order visits every other predecessor of an instruction before the
+instruction itself, and a pass in that order computes, for every variable
+at every instruction, what it may hold on the paths that reach it: the
+argument as passed, a value the function stored, or nothing. At a join the
+possibilities of the incoming paths are combined. With a loop, the pass is
+repeated, each time also combining what the backedges brought back on the
+previous pass into the header, until that no longer changes; on the first
+pass the header only sees the state on entry, so a value stored later in
+the body never counts as assigned on the first iteration. The frontend
+maps variables like this:
 
 - the first ``STORE_FAST`` to a name, in bytecode order, gives it the next
   free local slot, counting from 0, and stores go to ``STORE_LOCAL`` with
@@ -142,7 +192,8 @@ combined. The frontend maps variables like this:
 - a read of an argument that is stored on some paths but not others is
   ``LOAD_LOCAL`` too, and the program starts with ``LOAD_ARG``,
   ``STORE_LOCAL`` to put the argument in that slot. Straight-line code
-  never needs this;
+  never needs this; a loop that updates an argument, as in ``while n > 0:
+  n -= 1``, always does;
 - a read of a name that may be unbound is rejected
   (``UNSUPPORTED_VARIABLE``): running the original function then raises
   CPython's usual ``UnboundLocalError`` on the paths where it is unbound.
@@ -179,9 +230,11 @@ _LOAD_LOCAL_PAIR = frozenset(
 # Instructions that push a constant; ``argval`` is its value.
 _LOAD_CONSTANT = frozenset({"LOAD_SMALL_INT", "LOAD_CONST"})
 
-# The jumps that ``if`` statements compile to. Both always jump forward in
-# CPython 3.14; this is checked anyway.
-_FORWARD_JUMPS = frozenset({"POP_JUMP_IF_FALSE", "JUMP_FORWARD"})
+# The jumps that ``if`` statements and ``while`` loops compile to. Only
+# ``JUMP_BACKWARD`` goes backward in CPython 3.14; this is checked anyway.
+_FORWARD_JUMPS = frozenset({"POP_JUMP_IF_FALSE", "POP_JUMP_IF_TRUE", "JUMP_FORWARD"})
+_JUMPS = _FORWARD_JUMPS | {"JUMP_BACKWARD"}
+_CONDITIONAL_JUMPS = frozenset({"POP_JUMP_IF_FALSE", "POP_JUMP_IF_TRUE"})
 
 # ``COMPARE_OP`` operators, keyed by ``argval``.
 _COMPARISONS = {
@@ -191,6 +244,17 @@ _COMPARISONS = {
     ">=": Op.GREATER_EQUAL,
     "==": Op.EQUAL,
     "!=": Op.NOT_EQUAL,
+}
+
+# The comparison that is true exactly when the key is false. Exact for
+# integers, which are totally ordered; nothing else reaches the IR.
+_NEGATED = {
+    Op.LESS_THAN: Op.GREATER_EQUAL,
+    Op.LESS_EQUAL: Op.GREATER_THAN,
+    Op.GREATER_THAN: Op.LESS_EQUAL,
+    Op.GREATER_EQUAL: Op.LESS_THAN,
+    Op.EQUAL: Op.NOT_EQUAL,
+    Op.NOT_EQUAL: Op.EQUAL,
 }
 
 # Supported ``BINARY_OP`` operators, keyed by ``argrepr``. The in-place
@@ -210,7 +274,7 @@ _SUPPORTED = (
     _LOAD_LOCAL
     | _LOAD_LOCAL_PAIR
     | _LOAD_CONSTANT
-    | _FORWARD_JUMPS
+    | _JUMPS
     | {"STORE_FAST", "BINARY_OP", "COMPARE_OP", "RETURN_VALUE"}
 )
 
@@ -219,9 +283,9 @@ def translate(code: CodeType) -> Analysis:
     """Translate the bytecode of ``code`` into normalized instructions.
 
     The caller has already checked the code object's flags and signature.
-    Unsupported jumps are reported first, then conditions that are not a
-    comparison; after that, the first unsupported instruction in bytecode
-    order is reported.
+    Unsupported jumps are reported first, then a loop of an unsupported
+    shape, then conditions that are not a comparison; after that, the first
+    unsupported instruction in bytecode order is reported.
     """
     bytecode = list(dis.get_instructions(code))
 
@@ -235,44 +299,181 @@ def translate(code: CodeType) -> Analysis:
             )
         )
 
-    # Loops and unsupported jumps are rejected before anything else so
-    # that, for example, ``while a:`` reports its backward jump rather than
-    # its condition.
+    # Unsupported jumps are rejected before anything else so that, for
+    # example, a ``for`` loop reports its FOR_ITER rather than a call.
+    header = None
     for instr in bytecode:
         if instr.opcode not in dis.hasjump:
             continue
-        if instr.opname not in _FORWARD_JUMPS:
+        if instr.opname not in _JUMPS:
             return _reject(
                 RejectionReason.CONTROL_FLOW,
                 instr,
-                f"unsupported jump {instr.opname}: only if statements "
-                f"on integer comparisons are supported",
+                f"unsupported jump {instr.opname}: only if statements and while "
+                f"loops on integer comparisons are supported",
             )
-        if instr.argval <= instr.offset:
+        if (instr.opname == "JUMP_BACKWARD") != (instr.argval <= instr.offset):
             return _reject(
                 RejectionReason.CONTROL_FLOW,
                 instr,
-                f"{instr.opname} jumps backward; loops are not supported",
+                f"{instr.opname} jumps the wrong way",
             )
+        if instr.opname == "JUMP_BACKWARD":
+            if header is not None and instr.argval != header:
+                return _reject(
+                    RejectionReason.CONTROL_FLOW,
+                    instr,
+                    "only one while loop per function is supported, "
+                    "not nested loops or several loops",
+                )
+            header = instr.argval
+    significant = [instr for instr in bytecode if instr.opname not in _BOOKKEEPING]
+    rejection = _check_loop(significant, header)
+    if rejection is not None:
+        return rejection
     # Every condition must be a comparison, consumed directly by the jump.
     # ``if a:`` reports the jump rather than its TO_BOOL.
-    significant = [instr for instr in bytecode if instr.opname not in _BOOKKEEPING]
     for position, instr in enumerate(significant):
-        if instr.opname == "POP_JUMP_IF_FALSE" and (
+        if instr.opname in _CONDITIONAL_JUMPS and (
             position == 0 or significant[position - 1].opname != "COMPARE_OP"
         ):
             found = significant[position - 1].opname if position else "nothing"
             return _reject(
                 RejectionReason.UNSUPPORTED_CONDITION,
                 instr,
-                f"only a comparison can be an if condition, found {found}",
+                f"only a comparison can be an if or while condition, found {found}",
             )
 
-    translator = _Translator(code)
-    rejection = translator.run(bytecode, significant)
-    if rejection is not None:
-        return rejection
-    return Analysis(instructions=translator.instructions())
+    # Local slots, in order of first assignment in the bytecode. A loop can
+    # read a variable before its first assignment in bytecode order (on the
+    # next iteration), so they are numbered before translating.
+    slots: dict[str, int] = {}
+    for instr in bytecode:
+        if instr.opname == "STORE_FAST":
+            slots.setdefault(instr.argval, len(slots))
+
+    # Without a loop, one pass sees every path. With one, the pass is
+    # repeated, feeding what the backedges bring back into the header,
+    # until that stops changing. Each repetition adds at least one of three
+    # possibilities to some variable, so this ends after at most
+    # ``2 * len(co_varnames) + 2`` passes.
+    backedge: _State | None = None
+    for _ in range(2 * len(code.co_varnames) + 2):
+        translator = _Translator(code, slots, header, backedge)
+        rejection = translator.run(bytecode, significant)
+        if rejection is not None:
+            # Later passes only add possibilities, so they would reject too.
+            return rejection
+        if header is None or translator.backedge == backedge:
+            return Analysis(instructions=translator.instructions())
+        backedge = translator.backedge
+    return Analysis(
+        rejection=Rejection(
+            reason=RejectionReason.CONTROL_FLOW,
+            message="the analysis of the loop did not converge",
+        )
+    )
+
+
+def _check_loop(
+    significant: list[dis.Instruction], header: int | None
+) -> Analysis | None:
+    """Check that the loop starting at offset ``header``, if any, has the
+    one supported shape (see the module documentation).
+
+    ``POP_JUMP_IF_TRUE`` is only accepted around a backedge, so it is
+    checked here too.
+    """
+
+    def following(position: int) -> dis.Instruction | None:
+        return significant[position + 1] if position + 1 < len(significant) else None
+
+    if header is None:
+        for instr in significant:
+            if instr.opname == "POP_JUMP_IF_TRUE":
+                return _reject_jump_if_true(instr)
+        return None
+
+    # The test: the first jump or return from the header on.
+    test = next(
+        instr
+        for instr in significant
+        if instr.offset >= header
+        and (instr.opcode in dis.hasjump or instr.opname == "RETURN_VALUE")
+    )
+    if test.opname != "POP_JUMP_IF_FALSE":
+        return _reject(
+            RejectionReason.CONTROL_FLOW,
+            test,
+            f"a while loop must start with one comparison that leaves the loop "
+            f"when it is false, found {test.opname} (while True is not "
+            f"supported, nor not or or in a while condition)",
+        )
+    exit_ = test.argval
+    last_backedge = max(
+        instr.offset for instr in significant if instr.opname == "JUMP_BACKWARD"
+    )
+    if exit_ <= last_backedge:
+        return _reject(
+            RejectionReason.CONTROL_FLOW,
+            test,
+            "the while condition does not jump past the end of the loop",
+        )
+
+    for position, instr in enumerate(significant):
+        inside = header <= instr.offset < exit_
+        if instr.opname == "RETURN_VALUE" and inside:
+            # CPython compiles a ``break`` followed by a short tail as a
+            # copy of that tail, RETURN_VALUE included.
+            return _reject(
+                RejectionReason.CONTROL_FLOW,
+                instr,
+                "return or break inside a while loop is not supported",
+            )
+        if instr.opcode not in dis.hasjump or instr is test:
+            continue
+        if instr.opname == "POP_JUMP_IF_TRUE":
+            # Only the inverted ``if`` at the end of the body: if the
+            # comparison is false, the next instruction starts the next
+            # iteration.
+            after = following(position)
+            if not (inside and after is not None and after.opname == "JUMP_BACKWARD"):
+                return _reject_jump_if_true(instr)
+        target = instr.argval
+        if instr.opname == "JUMP_BACKWARD":
+            continue  # Inside the loop, to the header: checked above.
+        if inside and target >= exit_:
+            return _reject(
+                RejectionReason.CONTROL_FLOW,
+                instr,
+                "a jump out of a while loop (break, or and in the while "
+                "condition) is not supported; only the condition may end it",
+            )
+        if not inside and header < target < exit_:
+            return _reject(
+                RejectionReason.CONTROL_FLOW,
+                instr,
+                "a jump into the middle of a while loop is not supported",
+            )
+    # The body must not fall through into the exit. CPython ends it with a
+    # JUMP_BACKWARD, so this only guards against surprises.
+    before_exit = [instr for instr in significant if instr.offset < exit_][-1]
+    if before_exit.opname != "JUMP_BACKWARD":
+        return _reject(
+            RejectionReason.CONTROL_FLOW,
+            test,
+            "the body of the while loop does not end with its backward jump",
+        )
+    return None
+
+
+def _reject_jump_if_true(instr: dis.Instruction) -> Analysis:
+    return _reject(
+        RejectionReason.CONTROL_FLOW,
+        instr,
+        "unsupported jump POP_JUMP_IF_TRUE: only if statements and while loops "
+        "on integer comparisons are supported, not or and not",
+    )
 
 
 # What a variable can hold on the paths that reach an instruction: the
@@ -295,6 +496,15 @@ class _State:
         self.depth = depth
         self.bindings = bindings
 
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, _State)
+            and self.depth == other.depth
+            and self.bindings == other.bindings
+        )
+
+    __hash__ = None  # type: ignore[assignment]
+
     def copy(self) -> _State:
         return _State(self.depth, dict(self.bindings))
 
@@ -313,13 +523,24 @@ class _State:
 class _Translator:
     """Translate one code object's bytecode, in offset order.
 
-    Every jump goes forward (checked before this runs), so offset order
-    visits all predecessors of an instruction before the instruction itself
-    and one pass sees every path.
+    Every jump goes forward except the loop's backedges to ``header``, so
+    offset order visits all forward predecessors of an instruction before
+    the instruction itself. ``backedge`` is what the backedges brought back
+    to the header on the previous pass, or ``None`` on the first; after
+    :meth:`run`, ``self.backedge`` is what they bring back on this one.
     """
 
-    def __init__(self, code: CodeType) -> None:
+    def __init__(
+        self,
+        code: CodeType,
+        slots: dict[str, int],
+        header: int | None,
+        backedge: _State | None,
+    ) -> None:
         self.code = code
+        self.header = header
+        self.entering_backedge = backedge
+        self.backedge: _State | None = None
         # Emitted instructions. A jump's operand is still a bytecode
         # offset here; ``instructions`` turns it into an index.
         self.emitted: list[Instruction] = []
@@ -327,7 +548,7 @@ class _Translator:
         # instruction emitted at or after it.
         self.index_at_offset: dict[int, int] = {}
         # Local slots by variable name, in order of first assignment.
-        self.slots: dict[str, int] = {}
+        self.slots = slots
         # Arguments read where they may hold either the argument or a stored
         # value; their slot is initialized from the argument on entry.
         self.copied_args: set[str] = set()
@@ -343,7 +564,7 @@ class _Translator:
                 for index, name in enumerate(code.co_varnames)
             },
         )
-        # States arriving by jumps at targets not reached yet.
+        # States arriving by forward jumps at targets not reached yet.
         incoming: dict[int, _State] = {}
         next_significant = {
             id(instr): significant[position + 1]
@@ -368,6 +589,16 @@ class _Translator:
                     )
                 else:
                     state = state.join(arrived)
+            if instr.offset == self.header and state is not None:
+                if state.depth:
+                    return _reject(
+                        RejectionReason.CONTROL_FLOW,
+                        instr,
+                        "a while loop entered with a value on the stack "
+                        "is not supported",
+                    )
+                if self.entering_backedge is not None:
+                    state = state.join(self.entering_backedge)
             if name in _BOOKKEEPING:
                 if state is not None:
                     self.index_at_offset[instr.offset] = len(self.emitted)
@@ -393,8 +624,9 @@ class _Translator:
                     if rejection is not None:
                         return rejection
             elif name == "STORE_FAST":
-                slot = self.slots.setdefault(instr.argval, len(self.slots))
-                self.emit(Instruction(Op.STORE_LOCAL, slot), state, -1)
+                self.emit(
+                    Instruction(Op.STORE_LOCAL, self.slots[instr.argval]), state, -1
+                )
                 state.bindings[instr.argval] = frozenset({_STORED})
             elif name in _LOAD_CONSTANT:
                 value = instr.argval
@@ -425,16 +657,19 @@ class _Translator:
                         f"unsupported comparison {instr.argval!r}",
                     )
                 following = next_significant[id(instr)]
-                if following is None or following.opname != "POP_JUMP_IF_FALSE":
+                if following is None or following.opname not in _CONDITIONAL_JUMPS:
                     return _reject(
                         RejectionReason.UNSUPPORTED_CONDITION,
                         instr,
-                        "a comparison is only supported as an if condition, "
-                        "not as a value",
+                        "a comparison is only supported as an if or while "
+                        "condition, not as a value",
                     )
+                if following.opname == "POP_JUMP_IF_TRUE":
+                    # It becomes JUMP_IF_FALSE on the opposite comparison.
+                    op = _NEGATED[op]
                 self.emit(Instruction(op), state, -1)
-            elif name in _FORWARD_JUMPS:
-                op = Op.JUMP_IF_FALSE if name == "POP_JUMP_IF_FALSE" else Op.JUMP
+            elif name in _JUMPS:
+                op = Op.JUMP_IF_FALSE if name in _CONDITIONAL_JUMPS else Op.JUMP
                 self.emit(
                     Instruction(op, instr.argval),
                     state,
@@ -447,11 +682,20 @@ class _Translator:
                         "jumps with a value on the stack (a conditional "
                         "expression inside an expression) are not supported",
                     )
-                target = instr.argval
-                previous = incoming.get(target)
-                incoming[target] = (
-                    state.copy() if previous is None else previous.join(state)
-                )
+                if name == "JUMP_BACKWARD":
+                    # To the header, already translated; what arrives there
+                    # is joined in on the next pass.
+                    self.backedge = (
+                        state.copy()
+                        if self.backedge is None
+                        else self.backedge.join(state)
+                    )
+                else:
+                    target = instr.argval
+                    previous = incoming.get(target)
+                    incoming[target] = (
+                        state.copy() if previous is None else previous.join(state)
+                    )
                 if op is Op.JUMP:
                     state = None
             else:  # RETURN_VALUE

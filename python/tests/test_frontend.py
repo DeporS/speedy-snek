@@ -355,18 +355,14 @@ def test_rejects_conditions_that_are_not_comparisons():
         rejection = assert_rejected(
             func, RejectionReason.UNSUPPORTED_CONDITION, "POP_JUMP_IF_FALSE", offset
         )
-        assert "only a comparison can be an if condition" in rejection.message
+        assert "only a comparison can be an if or while condition" in rejection.message
 
 
-def test_rejects_loops():
-    def while_loop(a):
+def test_rejects_loops_outside_the_subset():
+    # Supported while loops are tested in test_loops.py.
+    def while_truthy(a):
         while a:
             a = a - 1
-        return a
-
-    def while_comparison(a):
-        while a > 0:
-            a -= 1
         return a
 
     def for_loop(a):
@@ -374,9 +370,10 @@ def test_rejects_loops():
             pass
         return 0
 
-    # The backward jump is reported before the loop condition.
-    assert_rejected(while_loop, RejectionReason.CONTROL_FLOW, "JUMP_BACKWARD", 36)
-    assert_rejected(while_comparison, RejectionReason.CONTROL_FLOW, "JUMP_BACKWARD", 34)
+    # A while condition must be a comparison, like an if condition.
+    assert_rejected(
+        while_truthy, RejectionReason.UNSUPPORTED_CONDITION, "POP_JUMP_IF_FALSE", 12
+    )
     assert_rejected(for_loop, RejectionReason.CONTROL_FLOW, "FOR_ITER", 6)
 
 
@@ -1379,7 +1376,7 @@ def test_rejects_comparison_results_as_values(body):
         "COMPARE_OP",
         4,
     )
-    assert "only supported as an if condition" in rejection.message
+    assert "only supported as an if or while condition" in rejection.message
 
 
 def test_rejects_or_and_not():

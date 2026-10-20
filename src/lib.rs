@@ -35,7 +35,10 @@ mod _native {
     use pyo3::types::{PyDict, PyInt, PyTuple, PyType};
     use pyo3::{PyTraverseError, PyVisit};
 
-    use crate::codegen::{NativeCode, STATUS_BAD_ARITY, STATUS_OK, STATUS_OVERFLOW};
+    use crate::codegen::{
+        DEFAULT_BACKEDGE_BUDGET, MAX_BACKEDGE_BUDGET, NativeCode, STATUS_BAD_ARITY,
+        STATUS_BUDGET_EXHAUSTED, STATUS_OK, STATUS_OVERFLOW,
+    };
     use crate::program::{
         MAX_ARGS, MAX_JUMPS, MAX_LOCALS, OP_ADD, OP_EQUAL, OP_GREATER_EQUAL, OP_GREATER_THAN,
         OP_JUMP, OP_JUMP_IF_FALSE, OP_LESS_EQUAL, OP_LESS_THAN, OP_LOAD_ARG, OP_LOAD_CONST,
@@ -70,6 +73,9 @@ mod _native {
         m.add("STATUS_OK", STATUS_OK)?;
         m.add("STATUS_OVERFLOW", STATUS_OVERFLOW)?;
         m.add("STATUS_BAD_ARITY", STATUS_BAD_ARITY)?;
+        m.add("STATUS_BUDGET_EXHAUSTED", STATUS_BUDGET_EXHAUSTED)?;
+        m.add("DEFAULT_BACKEDGE_BUDGET", DEFAULT_BACKEDGE_BUDGET)?;
+        m.add("MAX_BACKEDGE_BUDGET", MAX_BACKEDGE_BUDGET)?;
         m.add("MAX_ARGS", MAX_ARGS)?;
         m.add("MAX_LOCALS", MAX_LOCALS)?;
         m.add("MAX_JUMPS", MAX_JUMPS)?;
@@ -102,6 +108,13 @@ mod _native {
         #[getter]
         fn arg_count(&self) -> usize {
             self.code.arg_count()
+        }
+
+        /// The backward jumps one call may take, or `None` for a program
+        /// without a loop.
+        #[getter]
+        fn backedge_budget(&self) -> Option<u64> {
+            self.code.backedge_budget()
         }
 
         /// How many fast calls this function has handled, through
@@ -146,15 +159,18 @@ mod _native {
         ///   exactly ``arg_count`` items, each an exact ``int`` in the
         ///   signed 64-bit range, and no operation overflows.
         /// - Returns ``None`` for every other call: wrong arity, ``bool``,
-        ///   ``int`` subclasses, any non-``int``, values outside i64, and
-        ///   overflow in any intermediate or final operation. ``None`` is
-        ///   unambiguous because every compiled program returns an ``int``.
+        ///   ``int`` subclasses, any non-``int``, values outside i64,
+        ///   overflow in any intermediate or final operation, and a loop
+        ///   that used up its backedge budget. ``None`` is unambiguous
+        ///   because every compiled program returns an ``int``; no partial
+        ///   result is ever returned.
         /// - A guard miss raises nothing and runs no Python code on the
         ///   arguments: no ``__int__``, ``__index__``, ``__repr__`` or
         ///   (metaclass) attribute lookup.
         /// - Any exception it does raise is unexpected.
         ///
-        /// The GIL stays held throughout.
+        /// The GIL stays held throughout; the backedge budget bounds how
+        /// long a loop can hold it.
         #[pyo3(signature = (args, /))]
         fn try_call(&self, args: &Bound<'_, PyAny>) -> PyResult<Option<i64>> {
             let args = args
@@ -195,7 +211,7 @@ mod _native {
             }
             match self.code.call(values) {
                 (STATUS_OK, value) => Ok(Some(value)),
-                (STATUS_OVERFLOW, _) => Ok(None),
+                (STATUS_OVERFLOW | STATUS_BUDGET_EXHAUSTED, _) => Ok(None),
                 // The arity was checked above, so this is a backend bug.
                 (status, _) => Err(PyRuntimeError::new_err(format!(
                     "unexpected native status {status}"
@@ -576,12 +592,18 @@ mod _native {
     /// Compile a serialized program (see `src/program.rs`) for exactly
     /// `arg_count` arguments.
     ///
-    /// Raises ``TypeError`` or ``ValueError`` for a malformed program and
-    /// ``CodegenError`` if Cranelift fails.
+    /// A loop may take at most `backedge_budget` backward jumps per call
+    /// (`DEFAULT_BACKEDGE_BUDGET` if omitted); it must lie in
+    /// `0..=MAX_BACKEDGE_BUDGET`, so it can only be lowered.
+    ///
+    /// Raises ``TypeError`` or ``ValueError`` for a malformed program or
+    /// budget and ``CodegenError`` if Cranelift fails.
     #[pyfunction]
+    #[pyo3(signature = (program, arg_count, /, backedge_budget = None))]
     fn compile_i64(
         program: &Bound<'_, PyAny>,
         arg_count: &Bound<'_, PyAny>,
+        backedge_budget: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<I64Function> {
         let out_of_range = || PyValueError::new_err(format!("arg_count must be in 0..={MAX_ARGS}"));
         let arg_count = match exact_i64(arg_count) {
@@ -594,10 +616,27 @@ mod _native {
                 return Err(PyTypeError::new_err("arg_count must be an exact int"));
             }
         };
+        let budget_out_of_range = || {
+            PyValueError::new_err(format!(
+                "backedge_budget must be in 0..={MAX_BACKEDGE_BUDGET}"
+            ))
+        };
+        let backedge_budget = match backedge_budget.map(exact_i64) {
+            None => DEFAULT_BACKEDGE_BUDGET,
+            Some(Ok(n)) => u64::try_from(n)
+                .ok()
+                .filter(|n| *n <= MAX_BACKEDGE_BUDGET)
+                .ok_or_else(budget_out_of_range)?,
+            Some(Err(IntError::OutOfRange)) => return Err(budget_out_of_range()),
+            Some(Err(IntError::NotExactInt)) => {
+                return Err(PyTypeError::new_err("backedge_budget must be an exact int"));
+            }
+        };
         let ops = decode(program)?;
         // `NativeCode::compile` validates again; this gives a clear error.
         crate::program::validate(&ops, arg_count).map_err(PyValueError::new_err)?;
-        let code = NativeCode::compile(&ops, arg_count).map_err(CodegenError::new_err)?;
+        let code =
+            NativeCode::compile(&ops, arg_count, backedge_budget).map_err(CodegenError::new_err)?;
         Ok(I64Function {
             code,
             try_calls: AtomicU64::new(0),

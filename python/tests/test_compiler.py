@@ -78,18 +78,23 @@ COMPARE = {
 }
 
 
-def run_i64(program, args):
+def run_i64(program, args, budget=_native.DEFAULT_BACKEDGE_BUDGET):
     """An independent i64 oracle: Python ints, checked after every operation
     that runs. It follows jumps, so operations on a path not taken are
-    never checked.
+    never checked. A backward ``JUMP`` spends one unit of ``budget``, as in
+    native code.
 
-    Returns ``("ok", value)`` or ``("overflow", instruction_index)``.
+    Returns ``("ok", value)``, ``("overflow", instruction_index)`` or
+    ``("budget", backward_jump_index)``.
     """
     stack = []
     local_slots = {}
     index = 0
-    # A valid program only jumps forward; the bound catches a broken one.
-    for _ in range(len(program)):
+    backedges = 0
+    # Between two backward jumps a valid program only jumps forward, so it
+    # runs at most ``len(program)`` instructions; the bound catches a broken
+    # one.
+    for _ in range((budget + 1) * len(program)):
         instruction = program[index]
         if instruction.op is Op.LOAD_ARG:
             stack.append(args[instruction.arg])
@@ -102,6 +107,10 @@ def run_i64(program, args):
         elif instruction.op is Op.RETURN:
             return ("ok", stack.pop())
         elif instruction.op is Op.JUMP:
+            if instruction.arg <= index:
+                backedges += 1
+                if backedges > budget:
+                    return ("budget", index)
             index = instruction.arg
             continue
         elif instruction.op is Op.JUMP_IF_FALSE:
@@ -1438,10 +1447,13 @@ J, JIF, LT, LE, GT, GE, EQ, NE = range(9, 17)
     ("program", "message"),
     [
         # Targets.
-        (((9, 0), (2, 1), (6,)), "goes back to index 0"),  # Jumps to itself.
-        (((2, 1), (8, 0), (9, 1), (6,)), "goes back to index 1"),  # A loop.
-        (((9, 1), (9, 0), (2, 1), (6,)), "goes back to index 0"),  # A cycle.
-        (((2, 0), (2, 0), (LT,), (JIF, 2), (2, 1), (6,)), "goes back to index 2"),
+        (((9, 0), (2, 1), (6,)), "must start with its condition"),  # Jumps to itself.
+        (((2, 1), (8, 0), (9, 1), (6,)), "loop at index 1 must start"),  # No test.
+        (((9, 1), (9, 0), (2, 1), (6,)), "first jump or RETURN from there, at index 0"),
+        (
+            ((2, 0), (2, 0), (LT,), (JIF, 2), (2, 1), (6,)),
+            "JUMP_IF_FALSE at index 3 goes back",
+        ),
         (((9, 3), (2, 1), (6,)), "index 3, past the end"),
         (((9, 2**31), (2, 1), (6,)), "past the end"),
         (((9, -1), (2, 1), (6,)), "invalid target -1"),
@@ -1528,7 +1540,8 @@ def test_rust_accepts_well_formed_branches_on_its_own():
 def test_malformed_control_flow_does_not_crash_the_interpreter():
     # Random programs over every opcode, run in a child process: a panic
     # would surface as PanicException, an abort or segfault as a non-zero
-    # exit code. Small targets make jumps, cycles and joins likely.
+    # exit code, and a native loop that ignored its budget as a timeout.
+    # Small targets make jumps, cycles and joins likely.
     code = """
 import random
 from speedysnek import _native
@@ -1554,7 +1567,12 @@ for _ in range(20000):
 print("ok", compiled)
 """
     result = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, check=True
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=True,
+        # Some random programs are loops; the backedge budget must end them.
+        timeout=300,
     )
     assert result.stdout.startswith("ok")
 

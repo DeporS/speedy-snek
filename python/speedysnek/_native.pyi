@@ -25,6 +25,12 @@ OP_NOT_EQUAL: int
 STATUS_OK: int
 STATUS_OVERFLOW: int
 STATUS_BAD_ARITY: int
+STATUS_BUDGET_EXHAUSTED: int
+
+# Backward jumps one call of a compiled loop may take. The maximum equals
+# the default: ``compile_i64``'s budget can only lower it.
+DEFAULT_BACKEDGE_BUDGET: int
+MAX_BACKEDGE_BUDGET: int
 
 MAX_ARGS: int
 MAX_LOCALS: int
@@ -45,6 +51,9 @@ class I64Function:
     @property
     def arg_count(self) -> int: ...
     @property
+    def backedge_budget(self) -> int | None:
+        """Backward jumps one call may take; ``None`` without a loop."""
+    @property
     def try_calls(self) -> int:
         """How many fast calls this function has handled, guard misses
         included: through ``try_call`` or directly from a ``NativeWrapper``.
@@ -60,9 +69,10 @@ class I64Function:
 
         Returns the result, or ``None`` for a wrong argument count, an
         argument that is not an exact ``int`` in the signed 64-bit range,
-        or overflow. A guard miss raises nothing and runs no Python code on
-        the arguments. ``args`` must be an exact tuple (``TypeError``
-        otherwise); any exception means a bug, not a guard miss.
+        overflow, or a loop that used up its backedge budget. A guard miss
+        raises nothing and runs no Python code on the arguments. ``args``
+        must be an exact tuple (``TypeError`` otherwise); any exception
+        means a bug, not a guard miss.
         """
 
 @final
@@ -85,8 +95,17 @@ class NativeWrapper:
     def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
     def __get__(self, instance: object, owner: type | None = None, /) -> Any: ...
 
-def compile_i64(program: tuple[tuple[int, ...], ...], arg_count: int, /) -> I64Function:
-    """Compile a serialized program for exactly ``arg_count`` arguments."""
+def compile_i64(
+    program: tuple[tuple[int, ...], ...],
+    arg_count: int,
+    /,
+    backedge_budget: int | None = None,
+) -> I64Function:
+    """Compile a serialized program for exactly ``arg_count`` arguments.
+
+    A loop may take at most ``backedge_budget`` backward jumps per call
+    (default ``DEFAULT_BACKEDGE_BUDGET``, at most ``MAX_BACKEDGE_BUDGET``).
+    """
 
 def sum_as_string(a: int, b: int) -> str:
     """Temporary smoke-test function: return ``str(a + b)``."""
