@@ -74,4 +74,5 @@ one reason can reveal the next.
 
 Once the report looks right, [`snek.bite(my_module)`](bite.md) wraps the
 module's ready functions with `@snekit`, using the same rules and the same
-explanations.
+explanations. After the functions have been called for a while,
+[`snek.peek()`](peek.md) shows what the JIT did with each of them.

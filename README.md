@@ -102,6 +102,41 @@ Nothing is compiled until a function has warmed up, and calls still fall
 back to Python whenever the native path does not apply. See
 [the bite guide](docs/bite.md) for aliases, repeat bites and the report.
 
+## Take a peek
+
+Want to know what the snek did with a function? Peek at it:
+
+```python
+snek.bite(calculations)
+
+for _ in range(100):
+    calculations.sum_squares(10_000)
+
+snek.peek(calculations.sum_squares)
+```
+
+```text
+🐍 Snek peeked at sum_squares.
+
+status:           compiled
+calls observed:   100
+warmup calls:     8
+compile attempts: 1
+native attempts:  92
+compiler:         Cranelift i64 specialization
+```
+
+A function is **cold** while it warms up, **compiled** once native code is
+in use, or **disabled** when it cannot be compiled or its compiled code
+was invalidated, with the reason. `snek.peek(calculations)` reports every
+wrapped function in the module.
+
+`peek()` only reads state the wrappers already keep: it calls, compiles
+and changes nothing. It reports state and observed counts, not a
+benchmark or a promise of speed. A native attempt is not a native result:
+a call can still fall back to Python. See [the peek guide](docs/peek.md)
+for every field and its limits.
+
 ## How it works
 
 1. **Warm up.** The first eight calls run the original function.
@@ -205,6 +240,7 @@ For implementation details and development:
 - [Python frontend](python/speedysnek/_frontend) — analyzes supported Python bytecode.
 - [Hunting](docs/hunt.md) — the `snek.hunt()` discovery report.
 - [Biting](docs/bite.md) — applying `@snekit` to a module with `snek.bite()`.
+- [Peeking](docs/peek.md) — what the JIT did with each function, with `snek.peek()`.
 - [Rust implementation](src) — native wrapper, guards and code generation.
 - [Loop design](docs/loops.md) — execution limits and fallback behavior.
 - [Range support](docs/for-range.md) — lowering and builtin binding checks.
