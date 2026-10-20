@@ -46,10 +46,13 @@ snek.peek(calculations)              # every wrapper in a module
 - **A plain Python function**: one finding with status `not_bitten`. If
   it is the original of a function that `bite()` has since wrapped (a
   reference taken before biting), the finding says which module name
-  holds the wrapper.
+  holds the wrapper. If it is marked with
+  [`@nosnek`](bite.md#opting-out-with-nosnek), the summary says so, and
+  that SpeedySnek will not wrap it automatically, and `reason` is
+  `"opted_out"`. It is not reported as disabled: it was never wrapped.
 - **A module**: one finding per `@snekit` wrapper of the module's own
-  functions under a public name, in definition order. Plain functions,
-  wrappers imported from other modules, private names, classes and
+  functions under a public name, in definition order. Plain functions
+  (`@nosnek` ones included), wrappers imported from other modules, private names, classes and
   callable objects are left out. A module with no wrappers gives an empty
   report.
 
@@ -173,7 +176,8 @@ clamp
   `"Cranelift i64 specialization"`; it stays set after the code is
   invalidated, and the printed report then marks it "no longer used";
 - `reason`, `detail`: for a disabled function, the stable reason code
-  and the underlying diagnostic message;
+  and the underlying diagnostic message (`reason` is also `"opted_out"`
+  for a plain function marked with `@nosnek`);
 - `lineno`: the source line of a rejected instruction, where known;
 - `rejection`, `compile_error`, `native_error`: the frontend rejection or
   the stored exception, where there is one.

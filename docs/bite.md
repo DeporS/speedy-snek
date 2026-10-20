@@ -36,6 +36,48 @@ inspected exactly as `hunt()` inspects it:
 - **already bitten**: the module already holds a `@snekit` wrapper of it,
   so no new wrapper is made.
 
+Functions marked with [`@nosnek`](#opting-out-with-nosnek) are skipped
+without being inspected.
+
+## Opting out with `@nosnek`
+
+`@nosnek` says "this function is intentionally Python-only; leave it
+alone":
+
+```python
+import speedysnek as snek
+
+@snek.nosnek
+def update_database():
+    ...
+```
+
+`bite()` reports a marked function as skipped, with the summary
+`marked with @nosnek` (and `finding.hunt.reason == "opted_out"`). It does
+not inspect or wrap it, it leaves every name bound to it, aliases
+included, exactly as it is, and it loads neither the frontend, the native
+extension nor the compiler for it. Skipping it is intentional, not an
+error: the module's other ready functions are bitten as usual.
+
+`@nosnek` is a marker, not a wrapper. It returns the same function
+object, with the same `__code__` and attributes, and adds nothing to its
+calls. It accepts only plain Python functions; a class, a builtin, a
+callable object or a `@snekit` wrapper raises `TypeError`. Applying it
+twice is harmless. Put it on the function the module actually binds,
+outside any other decorator that returns a new function.
+
+You do not need it for functions SpeedySnek cannot compile: those are
+skipped anyway. Use it for functions you deliberately want to keep out of
+automatic wrapping, even if the compiler could handle them.
+
+Mark functions before calling `bite()`. Marking only stops future
+automatic wrapping: a `@snekit` wrapper made before the function was
+marked keeps working as it did, and an explicit `@snekit` on a marked
+function still wraps it. When the module already holds such a wrapper,
+`bite()` reports the function as skipped and leaves both the wrapper and
+the plain names as they are. The mark is a convenience for your own
+code, not a security boundary.
+
 ## Only the module's names change
 
 `bite()` rebinds names in the module's namespace. It does not modify
@@ -138,7 +180,8 @@ old_calculation  already bitten  already wrapped with @snekit
   is true for the first);
 - `summary`: a short, human-readable explanation;
 - `hunt`: the `HuntFinding` for the function, with the frontend's
-  `reason`, `detail` and `lineno`; `None` when already bitten.
+  `reason`, `detail` and `lineno` (`reason` is `"opted_out"` for a
+  function marked with `@nosnek`); `None` when already bitten.
 
 ## Afterwards
 
