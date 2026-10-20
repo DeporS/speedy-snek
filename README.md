@@ -8,8 +8,8 @@ Need more speed? Just `@snekit`.
 
 SpeedySnek is a small educational JIT compiler experiment for CPython 3.14.
 **`@snekit` performs experimental native compilation**: a decorated
-function in the supported integer subset (arithmetic, local variables and
-simple `if`/`else`) is compiled once,
+function in the supported integer subset (arithmetic, local variables,
+simple `if`/`else` and one `while` loop) is compiled once,
 after a short warmup, to signed 64-bit machine code with Cranelift.
 Everything else, including every unsupported function, argument or call,
 safely falls back to normal Python.
@@ -159,6 +159,27 @@ def calculate_score(wins, penalties):
     return score
 ```
 
+A `while` loop whose condition is one integer comparison runs entirely
+inside one native call:
+
+```python
+@snekit
+def sum_squares(n):
+    total = 0
+    i = 0
+    while i < n:
+        total += i * i
+        i += 1
+    return total
+
+sum_squares(10_000)   # 333283335000, native after warmup
+```
+
+Native code holds the GIL, so one call may run at most 1,000,000 loop
+iterations natively. A call that needs more is restarted from the
+beginning in plain Python, so it does that work twice; nothing about the
+result changes. See [`docs/loops.md`](docs/loops.md).
+
 What compiles today:
 
 - positional `int` arguments and `int` constants;
@@ -168,13 +189,16 @@ What compiles today:
 - `if`, `if`/`else` and `elif`, nested or one after another, whose
   condition is a single `<`, `<=`, `>`, `>=`, `==` or `!=` between integer
   expressions;
+- one `while` loop per function, not nested in another loop, with such a
+  condition, and any of the above in its body, before it and after it;
 - `return` of an integer expression at the end of every path.
 
 A variable assigned in only some branches can be read after them only if
 it was assigned before the `if`; otherwise the function runs as plain
 Python, which raises `UnboundLocalError` where Python would.
 
-Still running as plain Python: loops (`while`, `for`), `and`, `or` and
+Still running as plain Python: `for` loops, nested or several `while`
+loops, `break`, `return` inside a loop, `while True:`, `and`, `or` and
 `not` in conditions (except `and` between comparisons, which CPython
 compiles exactly like nested `if` statements), chained comparisons
 (`a < b < c`), conditions that are not a comparison (`if a:`, `is`, `in`),
@@ -185,7 +209,9 @@ item updates (`obj.x += 1`, `items[0] += 1`), tuple assignment, `try` and
 `with`, and everything else. Because SpeedySnek reads CPython's bytecode,
 not source, a `return` inside a branch and a conditional expression such
 as `return a if a < b else b` are compiled when CPython emits them the
-same way as an `if` statement with a `return` in each branch.
+same way as an `if` statement with a `return` in each branch. Likewise, a
+`continue` and a `while`/`else` without `break` compile, because their
+bytecode is identical to supported `if`/`else` forms.
 
 `@jit` is the descriptive, backwards-compatible name for the same
 decorator: `speedysnek.jit is speedysnek.snekit`, so existing
@@ -247,23 +273,23 @@ Each decorated function has its own small state machine:
   CPython produces its usual results and error messages.
 - If the native guards reject a call (`bool`, `int` subclasses, `float`,
   `str` or any non-`int` argument, an `int` outside the signed 64-bit
-  range, or a `+`, `-` or `*` that would overflow, even in an intermediate
-  value), **that call** runs the original function, which computes Python's
-  exact arbitrary-precision result. The native code stays cached for later
-  calls. Such a guard miss is expected, so it is reported with a cheap
+  range, a `+`, `-` or `*` that would overflow, even in an intermediate
+  value, or a loop needing more than 1,000,000 iterations), **that call**
+  runs the original function with the original arguments, which computes
+  Python's exact arbitrary-precision result. The native code stays cached
+  for later calls. Such a guard miss is expected, so it is reported with a cheap
   `None` sentinel, not an exception, and the guards never run any of the
   argument's Python code (no `__index__`, `__int__`, `__repr__` or
   metaclass hooks). Only an unexpected error from the native code
   disables the specialization.
-- **Disabled.** If the function is outside the supported subset (loops,
-  conditions other than one integer comparison, calls, globals, closures,
-  generators, async functions, keyword arguments, a variable that may be
-  read before it is assigned, …), the
-  backend cannot compile it, or the compiler fails
-  unexpectedly, it is never compiled again and every call runs the original
-  function. Replacing the function's `__code__` after compilation also
-  disables the cached code; stale machine code is never run, and there is
-  no recompilation yet.
+- **Disabled.** If the function is outside the supported subset (`for` and
+  nested loops, conditions other than one integer comparison, calls,
+  globals, closures, generators, async functions, keyword arguments, a
+  variable that may be read before it is assigned, …), the backend cannot
+  compile it, or the compiler fails unexpectedly, it is never compiled again
+  and every call runs the original function. Replacing the function's
+  `__code__` after compilation also disables the cached code; stale machine
+  code is never run, and there is no recompilation yet.
 
 Whenever native execution does not apply, the original function is called
 exactly once, and its result or exception is passed through unchanged.
@@ -308,20 +334,24 @@ conditionals in [`docs/conditionals.md`](docs/conditionals.md).
 
 Current status:
 
-- Only **integer arithmetic with acyclic `if`/`else`** is supported:
-  positional arguments, `int` constants, `+`, `-`, `*`, plain assignments
-  to local variables (`x = a + b`, including reassigning an argument),
-  `+=`, `-=` and `*=` on local variables and arguments, `if` statements on
-  one integer comparison, and `return`. An augmented
-  assignment becomes the same `ADD`, `SUBTRACT` or `MULTIPLY` followed by
-  `STORE_LOCAL` as the equivalent `x = x + …`: native code only ever sees
-  exact `int`s, which have no in-place operators, and any other value
-  falls back to Python, which calls its `__iadd__`, `__isub__` or
+- Only **integer arithmetic with `if`/`else` and one `while` loop** is
+  supported: positional arguments, `int` constants, `+`, `-`, `*`, plain
+  assignments to local variables (`x = a + b`, including reassigning an
+  argument), `+=`, `-=` and `*=` on local variables and arguments, `if`
+  statements and one `while` loop on one integer comparison, and `return`.
+  An augmented assignment becomes the same `ADD`, `SUBTRACT` or `MULTIPLY`
+  followed by `STORE_LOCAL` as the equivalent `x = x + …`: native code only
+  ever sees exact `int`s, which have no in-place operators, and any other
+  value falls back to Python, which calls its `__iadd__`, `__isub__` or
   `__imul__` as usual.
-- **Loops remain unsupported**: no `while` or `for`, and no jump
-  backwards. Conditions must be one `COMPARE_OP` directly consumed by
-  `POP_JUMP_IF_FALSE`; `or`, `not`, truthiness, `is`, `in`, chained
-  comparisons and comparison results used as values are rejected.
+- **One loop at most**: a `while` loop becomes a test, a body and a
+  `JUMP` back to the test, the only backward jump the IR allows; `for`,
+  nested loops and loops left other than by their condition are rejected.
+  Conditions must be one `COMPARE_OP` directly consumed by
+  `POP_JUMP_IF_FALSE` (or, at the end of a loop body, `POP_JUMP_IF_TRUE`
+  over the backward jump); `or`, `not`, truthiness, `is`, `in`, chained
+  comparisons and comparison results used as values are rejected. The
+  design is in [`docs/loops.md`](docs/loops.md).
 - Anything else (division, calls, globals, attributes, other augmented
   operators, augmented assignment to attributes, items or globals, tuple
   or chained assignment, `del`, closures, generators, async functions,
@@ -361,9 +391,10 @@ execute(program, args=(5,))  # 10
   `GuardFailure`.
 - The whole program is validated before it runs. Malformed instructions
   (empty program, stack underflow, a local slot read before it is stored
-  on every path, a backward or out-of-range jump, unreachable code, a
-  path without `RETURN`, leftover stack values, …) raise
-  `InvalidProgramError`, which means a compiler bug.
+  on every path, a backward jump that is not one loop's backedge, an
+  out-of-range jump, unreachable code, a path without `RETURN`, leftover
+  stack values, …) raise `InvalidProgramError`, which means a compiler
+  bug.
 - Arithmetic uses Python `int`, so **arbitrary precision is intentional**:
   `2**63 + 1` is not wrapped to a 64-bit value.
 - `@snekit` never uses it; it is used by the tests and is not public API.
@@ -389,10 +420,11 @@ compiled(10, 20)  # 60, computed by generated machine code
   functions.
 - It supports only the current subset (`+`, `-`, `*` on arguments,
   constants and local variables, and signed comparisons that steer
-  forward jumps). Local slots are Cranelift variables: a slot names a
-  value that was already computed, so an assignment copies nothing at run
-  time and reading a local twice reuses one computation; where branches
-  join, SSA block parameters carry each path's value.
+  branches and one loop). Local slots are Cranelift variables: a slot
+  names a value that was already computed, so an assignment copies
+  nothing at run time and reading a local twice reuses one computation;
+  where branches join, or a loop's backward jumps meet its entry, SSA
+  block parameters carry each path's value.
 - It never returns a wrapped 64-bit value. Constants outside the signed
   64-bit range are rejected at compile time (`UnsupportedProgramError`).
   At call time, arguments that are not exact `int`s in that range, a wrong
@@ -479,6 +511,11 @@ A short [measurement of functions with `if`/`else`](benchmarks/experiments/condi
 found them running natively at the same fixed cost per call as
 straight-line functions of similar size, so small ones are still about 2×
 slower than plain Python.
+A short [measurement of `while` loops](benchmarks/experiments/loops.md)
+found `sum_squares` and `conditional_sum` 2.2–2.8× faster than plain
+Python at 10 iterations and 20–30× faster from 1,000 iterations up, while
+a call needing more than the 1,000,000-iteration budget was about 3%
+slower, because its first million iterations run twice.
 
 [`benchmarks/README.md`](benchmarks/README.md) explains the methodology,
 how to get more stable numbers, and how to update the baseline.

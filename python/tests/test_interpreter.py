@@ -764,9 +764,13 @@ def test_values_join_through_locals():
     ("program", "message", "index"),
     [
         # Targets.
-        ((jump(0), const(1), RETURN), "JUMP at index 0 jumps back to index 0", 0),
-        ((const(1), jump(0), RETURN), "jumps back to index 0", 1),
-        ((const(1), store(0), jump(1), RETURN), "jumps back to index 1", 2),
+        (
+            (jump(0), const(1), RETURN),
+            "loop at index 0 must start with its condition",
+            0,
+        ),
+        ((const(1), jump(0), RETURN), "must start with its condition", 1),
+        ((const(1), store(0), jump(1), RETURN), "loop at index 1 must start", 2),
         ((jump(3), const(1), RETURN), "jumps to index 3, past the end", 0),
         ((arg(0), arg(0), LT, jump_if_false(9), const(1), RETURN), "past the end", 3),
         # Reachability and termination.

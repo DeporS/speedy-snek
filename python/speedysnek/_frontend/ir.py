@@ -51,11 +51,13 @@ Conditions and forward jumps express ``if`` statements:
 - ``RETURN`` ends the path it is on. A program may contain several: CPython
   copies a short final ``return`` into each branch.
 
-Jump targets are instruction indexes in the same program and always lie
-ahead of the jump, so there are no loops. The operand stack is empty at
-every jump and at every jump target: values flow between branches only
-through local slots. So ``def f(a, b): r = a; if a < b: r += b; return r``
-becomes::
+Jump targets are instruction indexes in the same program. They lie ahead
+of the jump, except for the backedges of at most one ``while`` loop: a
+``JUMP`` back to the loop's header, the comparison that decides whether
+the loop runs again (see ``docs/loops.md``). The operand stack is empty at
+every jump and at every jump target: values flow between branches, and
+from one iteration to the next, only through local slots. So
+``def f(a, b): r = a; if a < b: r += b; return r`` becomes::
 
     0  LOAD_ARG 0
     1  STORE_LOCAL 0
@@ -71,6 +73,23 @@ becomes::
     11 RETURN
 
 A slot can be read only where every path that leads there has stored it.
+A ``while`` loop is a test, a body and a backward ``JUMP``. So
+``def f(n): i = 0; while i < n: i += 1; return i`` becomes::
+
+    0  LOAD_CONST 0
+    1  STORE_LOCAL 0
+    2  LOAD_LOCAL 0     <- loop header
+    3  LOAD_ARG 0
+    4  LESS_THAN
+    5  JUMP_IF_FALSE 11  <- the only exit
+    6  LOAD_LOCAL 0
+    7  LOAD_CONST 1
+    8  ADD
+    9  STORE_LOCAL 0
+    10 JUMP 2           <- backedge
+    11 LOAD_LOCAL 0
+    12 RETURN
+
 The full rules are in ``speedysnek._interpreter.validate``.
 
 All types here are immutable.

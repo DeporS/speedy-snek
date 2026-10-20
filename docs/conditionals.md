@@ -18,8 +18,11 @@ def calculate_score(wins, penalties):
     return score
 ```
 
-Loops, early exits other than `return`, and everything listed under
+Early exits other than `return`, and everything listed under
 [Out of scope](#out-of-scope) are rejected, and the original function runs.
+This note describes acyclic programs; one `while` loop per function is
+now supported too, as described in [`loops.md`](loops.md), which relaxes
+the forward-only rules below for the loop's backedges.
 
 ## What CPython 3.14 emits
 
@@ -103,9 +106,9 @@ before the next block start. Nothing else is stored. Because every edge
 points forward, index order is a topological order of the control-flow
 graph: when an instruction is reached, all of its predecessors have already
 been visited. Both validators and the code generator rely on this to do a
-single pass. Supporting loops later means allowing backward targets and
-replacing that single pass with a worklist; the representation itself does
-not need to change.
+single pass. [`loops.md`](loops.md) explains why the same single pass
+still suffices with the one supported loop; the representation did not
+need to change.
 
 ### Conditions
 
@@ -243,7 +246,7 @@ because that code is unreachable.
 
 | Bytecode | Source | Reason |
 | --- | --- | --- |
-| `JUMP_BACKWARD`, `FOR_ITER` | loops | `CONTROL_FLOW` |
+| `FOR_ITER`, and loops other than [`loops.md`](loops.md) allows | loops | `CONTROL_FLOW` |
 | `POP_JUMP_IF_TRUE` | `or`, `not` | `CONTROL_FLOW` |
 | `POP_JUMP_IF_NONE`, `POP_JUMP_IF_NOT_NONE` | `is None` tests | `CONTROL_FLOW` |
 | a jump or join with a value on the stack | conditional expression inside an expression | `CONTROL_FLOW` |
@@ -255,7 +258,7 @@ because that code is unreachable.
 
 ## Out of scope
 
-Loops and backward jumps; `and`/`or`/`not` beyond the bytecode-identical
-forms above; general truthiness; chained comparisons; comparison results as
+Loops other than those in [`loops.md`](loops.md); `and`/`or`/`not` beyond
+the bytecode-identical forms above; general truthiness; chained comparisons; comparison results as
 values; calls; exceptions; globals; closures; object mutation; adaptive
 optimization. There is no new public API.

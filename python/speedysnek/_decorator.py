@@ -23,8 +23,9 @@ machine with three states (:class:`_Status`):
   arguments are passed and the number of positional arguments is exactly
   the compiled arity. If the native guards reject the arguments (``bool``,
   ``int`` subclasses, any non-``int``, values outside the signed 64-bit
-  range, or overflow), that one call runs the original function instead.
-  The specialization stays cached for later calls.
+  range, or overflow), or a loop uses up the call's backedge budget, that
+  one call runs the original function instead, from the start and with
+  the original arguments. The specialization stays cached for later calls.
 - ``DISABLED``: the frontend rejected the function, the backend could not
   compile it, the compilation machinery failed, a native call failed
   unexpectedly, or ``__code__`` was replaced after compilation. Every later
@@ -44,6 +45,7 @@ Python code at all::
         -> spec.function's fast path    (the same Rust code as try_call)
             -> validate every argument once: exact int, in i64
             -> run the machine code, which checks every operation for overflow
+               and every loop iteration against the backedge budget
             -> the result int, or a guard miss
         -> original function, only for a guard miss
 
@@ -55,7 +57,11 @@ guard miss with a ``NativeGuardFailure``, is not on this path.
 The only correctness rule is that ``@snekit`` never changes what a call
 returns or raises. Whenever native execution does not apply, the original
 function is called exactly once with the original arguments, and whatever
-it returns or raises is passed through unchanged.
+it returns or raises is passed through unchanged. Running it after a native
+attempt that stopped part-way (overflow, or an exhausted loop budget) is
+sound because native code only computes with exact integers in registers:
+it calls nothing and changes no Python object, so the attempt has no
+effect that the restart could repeat. It can only repeat the computation.
 
 The extension module is loaded on the first decoration, which needs its
 ``NativeWrapper`` type, and the compilation modules on the first

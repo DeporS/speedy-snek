@@ -11,12 +11,13 @@
 //! `LOAD_LOCAL` reads a slot that a `STORE_LOCAL` wrote on every path to
 //! it, and counts the slots from the indexes it sees.
 //!
-//! A jump's operand is the index of the instruction it continues at, which
-//! must lie ahead of the jump: control flow is a directed acyclic graph
-//! whose edges all point forward. Comparisons push a *condition*, which
-//! only the `JUMP_IF_FALSE` right after them may pop. The operand stack is
-//! empty at every jump and jump target, so paths join only through local
-//! slots, and every path ends with its own `RETURN`.
+//! A jump's operand is the index of the instruction it continues at. Every
+//! edge points forward except the backedges of at most one `while` loop:
+//! unconditional `JUMP`s back to the loop's header, under the shape rules
+//! of [`validate`] (see `docs/loops.md`). Comparisons push a *condition*,
+//! which only the `JUMP_IF_FALSE` right after them may pop. The operand
+//! stack is empty at every jump and jump target, so paths join only
+//! through local slots, and every path ends with its own `RETURN`.
 //!
 //! Python validates programs before sending them, but this module checks
 //! everything again: a malformed program must become a Python exception,
@@ -196,6 +197,130 @@ impl SlotSet {
             *word &= other;
         }
     }
+
+    fn is_subset(&self, other: &SlotSet) -> bool {
+        self.0
+            .iter()
+            .zip(&other.0)
+            .all(|(word, other)| word & !other == 0)
+    }
+}
+
+/// The one loop a program may contain (see [`validate`]).
+///
+/// The loop occupies the indexes `header..exit`. Its test runs from
+/// `header` to the `JUMP_IF_FALSE` at `test`, which jumps to `exit`; the
+/// body runs from `test + 1` to `exit - 1` and jumps back to `header`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Loop {
+    pub header: usize,
+    pub test: usize,
+    pub exit: usize,
+}
+
+/// Find the program's loop and check its shape.
+///
+/// Every jump target must already be known to be inside the program.
+/// Returns `None` for a program without backward jumps.
+fn find_loop(ops: &[Op]) -> Result<Option<Loop>, String> {
+    // Every backward jump is an unconditional JUMP, and all of them go to
+    // the same header.
+    let mut header: Option<(usize, usize)> = None; // (header, first backedge)
+    let mut last_backedge = 0;
+    for (index, op) in ops.iter().enumerate() {
+        match *op {
+            Op::JumpIfFalse(target) if target as usize <= index => {
+                return Err(format!(
+                    "JUMP_IF_FALSE at index {index} goes back to index {target}; \
+                     only an unconditional JUMP can be a loop's backward jump"
+                ));
+            }
+            Op::Jump(target) if target as usize <= index => {
+                let target = target as usize;
+                match header {
+                    None => header = Some((target, index)),
+                    Some((first_target, first)) if first_target != target => {
+                        return Err(format!(
+                            "the backward jumps at index {first} and {index} go to \
+                             different targets ({first_target} and {target}); at most \
+                             one loop is supported"
+                        ));
+                    }
+                    Some(_) => {}
+                }
+                last_backedge = index;
+            }
+            _ => {}
+        }
+    }
+    let Some((header, _)) = header else {
+        return Ok(None);
+    };
+
+    // The header is a straight-line test that ends with the loop's exit.
+    let (test, exit) = match ops[header..]
+        .iter()
+        .enumerate()
+        .find(|(_, op)| matches!(op, Op::Jump(_) | Op::JumpIfFalse(_) | Op::Return))
+    {
+        Some((offset, Op::JumpIfFalse(target))) => (header + offset, *target as usize),
+        found => {
+            let at = found.map_or(header, |(offset, _)| header + offset);
+            return Err(format!(
+                "the loop at index {header} must start with its condition: the \
+                 first jump or RETURN from there, at index {at}, must be a \
+                 JUMP_IF_FALSE that leaves the loop"
+            ));
+        }
+    };
+    if exit <= last_backedge {
+        return Err(format!(
+            "the loop condition's JUMP_IF_FALSE at index {test} goes to index {exit}, \
+             which is not after the loop's last backward jump at index {last_backedge}"
+        ));
+    }
+
+    // Entered only at the header, left only by the test.
+    let inside = |index: usize| header <= index && index < exit;
+    for (index, op) in ops.iter().enumerate() {
+        match *op {
+            Op::Return if inside(index) => {
+                return Err(format!(
+                    "RETURN at index {index} is inside the loop at indexes \
+                     {header}..{exit}; a loop can only be left by its condition"
+                ));
+            }
+            Op::Jump(target) | Op::JumpIfFalse(target) => {
+                let target = target as usize;
+                if index == test || (target == header && index > test && index < exit) {
+                    continue;
+                }
+                if inside(index) && !(test < target && target < exit) {
+                    return Err(format!(
+                        "the jump at index {index} leaves the loop body at indexes \
+                         {}..{exit} for index {target}; a loop can only be left by \
+                         its condition",
+                        test + 1
+                    ));
+                }
+                if !inside(index) && header < target && target < exit {
+                    return Err(format!(
+                        "the jump at index {index} enters the loop at index {target}; \
+                         a loop can only be entered at its header, index {header}"
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    if !matches!(ops[exit - 1], Op::Jump(target) if target as usize == header) {
+        return Err(format!(
+            "the loop body falls through from index {} into the loop's exit at \
+             index {exit}; it must end with a backward JUMP",
+            exit - 1
+        ));
+    }
+    Ok(Some(Loop { header, test, exit }))
 }
 
 /// Check that `ops` is a well-formed program for `arg_count` arguments.
@@ -204,24 +329,33 @@ impl SlotSet {
 /// independently:
 ///
 /// - the program is not empty and contains a `RETURN`;
-/// - every jump targets an instruction index ahead of itself, inside the
-///   program, so there are no cycles;
+/// - every jump targets an index inside the program, and every jump goes
+///   forward, except the backward `JUMP`s of at most one loop (below);
 /// - every instruction is reachable from the first;
 /// - nothing pops from an empty stack, and every operation finds the kind
 ///   of value it needs: only `JUMP_IF_FALSE` pops a condition;
 /// - every comparison is immediately followed by `JUMP_IF_FALSE`;
 /// - the stack is empty after every jump and on every path into a jump
-///   target;
+///   target, the loop header included;
 /// - every `LOAD_LOCAL` reads a slot stored on every path to it;
 /// - every path ends with a `RETURN` that finds exactly one value.
+///
+/// A loop has a header at index `H` and an exit at index `X`:
+///
+/// - every backward jump is an unconditional `JUMP` to `H`;
+/// - the first jump or `RETURN` at or after `H` is a `JUMP_IF_FALSE` to
+///   `X`, which lies after every backward jump;
+/// - no jump from outside `H..X` lands strictly inside it, and nothing
+///   inside it leaves for `X` or beyond: no jump, no `RETURN`, and the
+///   instruction at `X - 1` is a backward jump.
 ///
 /// In addition every `LOAD_ARG` index must be below `arg_count`, so
 /// generated code never reads past the arguments, every local index below
 /// `MAX_LOCALS`, and there are at most `MAX_JUMPS` jumps.
 ///
-/// Returns the number of local slots: one more than the largest index
-/// used, or 0.
-pub fn validate(ops: &[Op], arg_count: usize) -> Result<usize, String> {
+/// Returns the number of local slots (one more than the largest index
+/// used, or 0) and the loop, if there is one.
+pub fn validate(ops: &[Op], arg_count: usize) -> Result<(usize, Option<Loop>), String> {
     if arg_count > MAX_ARGS {
         return Err(format!(
             "arg_count {arg_count} exceeds the maximum of {MAX_ARGS}"
@@ -262,12 +396,6 @@ pub fn validate(ops: &[Op], arg_count: usize) -> Result<usize, String> {
                     ));
                 }
                 let target = target as usize;
-                if target <= index {
-                    return Err(format!(
-                        "jump at index {index} goes back to index {target}; \
-                         only forward jumps are allowed"
-                    ));
-                }
                 if target >= ops.len() {
                     return Err(format!(
                         "jump at index {index} goes to index {target}, \
@@ -278,15 +406,24 @@ pub fn validate(ops: &[Op], arg_count: usize) -> Result<usize, String> {
             _ => {}
         }
     }
+    let found = find_loop(ops)?;
+    let header = found.map(|found| found.header);
 
-    // One pass in index order sees every predecessor of an instruction
-    // before the instruction itself, because every edge points forward.
+    // One pass in index order sees every forward predecessor of an
+    // instruction before the instruction itself. The only other edges are
+    // the loop's backedges into its header: the header's state comes from
+    // its forward predecessors alone (the first iteration), and every
+    // backedge is checked to bring back a compatible state (an empty stack
+    // and at least the same assigned slots), so joining it in would change
+    // nothing and the pass has reached a fixed point.
+    //
     // `assigned` is `None` where the previous instruction does not fall
-    // through. `joins[target]` holds the slots stored on every jump into a
-    // target not reached yet; the stack is always empty there.
+    // through. `joins[target]` holds the slots stored on every forward jump
+    // into a target not reached yet; the stack is always empty there.
     let mut stack: Vec<Kind> = Vec::new();
     let mut assigned: Option<SlotSet> = Some(SlotSet::empty(local_count));
     let mut joins: Vec<Option<SlotSet>> = vec![None; ops.len()];
+    let mut at_header: Option<SlotSet> = None;
     for (index, op) in ops.iter().enumerate() {
         if let Some(jumped) = joins[index].take() {
             match &mut assigned {
@@ -308,6 +445,18 @@ pub fn validate(ops: &[Op], arg_count: usize) -> Result<usize, String> {
         let Some(current) = &mut assigned else {
             return Err(format!("instruction at index {index} is unreachable"));
         };
+        if header == Some(index) {
+            if !stack.is_empty() {
+                return Err(format!(
+                    "the loop header at index {index} is reached from index {} \
+                     with {} value(s) on the stack; the stack must be empty \
+                     where paths join",
+                    index - 1,
+                    stack.len()
+                ));
+            }
+            at_header = Some(current.clone());
+        }
 
         let (pops, push): (&[Kind], Option<Kind>) = match op {
             Op::LoadArg(_) | Op::LoadConst(_) | Op::LoadLocal(_) => (&[], Some(Kind::Int)),
@@ -364,10 +513,25 @@ pub fn validate(ops: &[Op], arg_count: usize) -> Result<usize, String> {
                     ));
                 }
                 if let Op::Jump(target) | Op::JumpIfFalse(target) = *op {
-                    let join = &mut joins[target as usize];
-                    match join {
-                        None => *join = Some(current.clone()),
-                        Some(join) => join.intersect(current),
+                    let target = target as usize;
+                    if target <= index {
+                        // A backedge: `find_loop` proved it goes to the
+                        // header, which this pass has already visited.
+                        let entry = at_header.as_ref().ok_or_else(|| {
+                            format!("backward jump at index {index} has no header")
+                        })?;
+                        if !entry.is_subset(current) {
+                            return Err(format!(
+                                "the backward jump at index {index} returns to the loop \
+                                 header with fewer assigned locals than it started with"
+                            ));
+                        }
+                    } else {
+                        let join = &mut joins[target];
+                        match join {
+                            None => *join = Some(current.clone()),
+                            Some(join) => join.intersect(current),
+                        }
                     }
                 }
                 if !matches!(op, Op::JumpIfFalse(_)) {
@@ -385,7 +549,7 @@ pub fn validate(ops: &[Op], arg_count: usize) -> Result<usize, String> {
             ops.len() - 1
         ));
     }
-    Ok(local_count)
+    Ok((local_count, found))
 }
 
 fn check_local(index: usize, name: &str, slot: u32) -> Result<usize, String> {
