@@ -37,7 +37,8 @@ mod _native {
 
     use crate::codegen::{NativeCode, STATUS_BAD_ARITY, STATUS_OK, STATUS_OVERFLOW};
     use crate::program::{
-        MAX_ARGS, OP_ADD, OP_LOAD_ARG, OP_LOAD_CONST, OP_MULTIPLY, OP_RETURN, OP_SUBTRACT, Op,
+        MAX_ARGS, MAX_LOCALS, OP_ADD, OP_LOAD_ARG, OP_LOAD_CONST, OP_LOAD_LOCAL, OP_MULTIPLY,
+        OP_RETURN, OP_STORE_LOCAL, OP_SUBTRACT, Op,
     };
 
     create_exception!(
@@ -55,10 +56,13 @@ mod _native {
         m.add("OP_SUBTRACT", OP_SUBTRACT)?;
         m.add("OP_MULTIPLY", OP_MULTIPLY)?;
         m.add("OP_RETURN", OP_RETURN)?;
+        m.add("OP_LOAD_LOCAL", OP_LOAD_LOCAL)?;
+        m.add("OP_STORE_LOCAL", OP_STORE_LOCAL)?;
         m.add("STATUS_OK", STATUS_OK)?;
         m.add("STATUS_OVERFLOW", STATUS_OVERFLOW)?;
         m.add("STATUS_BAD_ARITY", STATUS_BAD_ARITY)?;
         m.add("MAX_ARGS", MAX_ARGS)?;
+        m.add("MAX_LOCALS", MAX_LOCALS)?;
         // Lets benchmarks record, and warn about, unrepresentative builds.
         m.add("DEBUG_BUILD", cfg!(debug_assertions))?;
         m.add("CodegenError", m.py().get_type::<CodegenError>())?;

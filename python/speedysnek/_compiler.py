@@ -22,15 +22,24 @@ The native tier is narrower than Python, and never silently differs from
 it. Anything outside the tier raises instead of returning a wrong value:
 
 - :class:`UnsupportedProgramError` at compile time: valid IR that cannot be
-  represented, such as a constant outside the signed 64-bit range.
+  represented, such as a constant outside the signed 64-bit range or a
+  local slot index of ``MAX_LOCALS`` or more.
 - :class:`NativeGuardFailure` at call time: the call does not fit the tier.
   Its :attr:`~NativeGuardFailure.reason` says why: the wrong number of
   arguments, an argument that is not an exact ``int`` (``bool`` and ``int``
   subclasses included), an argument outside the signed 64-bit range, or an
   ``ADD``, ``SUBTRACT`` or ``MULTIPLY`` whose exact result does not fit.
 
-Malformed IR raises :class:`~speedysnek._interpreter.InvalidProgramError`,
-exactly as in the reference interpreter.
+Malformed IR, including a ``LOAD_LOCAL`` of a slot that no earlier
+``STORE_LOCAL`` wrote, raises
+:class:`~speedysnek._interpreter.InvalidProgramError`, exactly as in the
+reference interpreter. The Rust extension validates the serialized program
+again on its own.
+
+Local slots exist only at compile time: a slot names a value that was
+already computed, so assignments copy nothing at run time. Every ``ADD``,
+``SUBTRACT`` and ``MULTIPLY`` checks for overflow when it runs, whether or
+not its result is used later.
 
 **Argument rule:** a compiled program takes exactly ``arg_count``
 positional arguments, and every one of them, read or not, must be an exact
@@ -89,6 +98,8 @@ I64_MAX = 2**63 - 1
 _OPCODES = {
     Op.LOAD_ARG: _native.OP_LOAD_ARG,
     Op.LOAD_CONST: _native.OP_LOAD_CONST,
+    Op.LOAD_LOCAL: _native.OP_LOAD_LOCAL,
+    Op.STORE_LOCAL: _native.OP_STORE_LOCAL,
     Op.ADD: _native.OP_ADD,
     Op.SUBTRACT: _native.OP_SUBTRACT,
     Op.MULTIPLY: _native.OP_MULTIPLY,
@@ -164,7 +175,8 @@ def _as_tuple(instructions: Iterable[Instruction]) -> tuple[Instruction, ...]:
 
 
 def _check(program: tuple[Instruction, ...]) -> tuple[int, ...]:
-    """Apply the interpreter's validation plus the i64 constant rule.
+    """Apply the interpreter's validation plus the native tier's limits:
+    i64 constants and local indexes below ``MAX_LOCALS``.
 
     Returns the indexes of the arguments the program reads.
     """
@@ -175,6 +187,15 @@ def _check(program: tuple[Instruction, ...]) -> tuple[int, ...]:
         ):
             raise UnsupportedProgramError(
                 f"LOAD_CONST at index {index} does not fit in a signed 64-bit integer",
+                index=index,
+            )
+        if (
+            instruction.op is Op.LOAD_LOCAL or instruction.op is Op.STORE_LOCAL
+        ) and instruction.arg >= _native.MAX_LOCALS:
+            raise UnsupportedProgramError(
+                f"{instruction.op.name} at index {index} uses local "
+                f"{instruction.arg}, beyond the native limit of "
+                f"{_native.MAX_LOCALS} locals",
                 index=index,
             )
     return read_args

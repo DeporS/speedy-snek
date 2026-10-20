@@ -40,6 +40,11 @@ Arithmetic uses ordinary Python ``int`` operations, so results have
 arbitrary precision exactly like CPython. There is deliberately no 64-bit
 wrap-around or overflow check.
 
+Local slots hold plain ``int`` values: ``STORE_LOCAL`` copies a value into
+a slot, so storing into one slot never changes another. Validation proves
+that every ``LOAD_LOCAL`` reads a slot an earlier ``STORE_LOCAL`` wrote; an
+unassigned slot is never read, and never has a default value.
+
 :func:`speedysnek.snekit` never uses the interpreter: it runs either native code
 or the original function. The interpreter remains the tests' oracle, and is
 not part of the public API.
@@ -82,6 +87,8 @@ class GuardFailure(Exception):
 _STACK_EFFECT = {
     Op.LOAD_ARG: (0, 1),
     Op.LOAD_CONST: (0, 1),
+    Op.LOAD_LOCAL: (0, 1),
+    Op.STORE_LOCAL: (1, 0),
     Op.ADD: (2, 1),
     Op.SUBTRACT: (2, 1),
     Op.MULTIPLY: (2, 1),
@@ -93,8 +100,9 @@ def validate(instructions: Iterable[Instruction]) -> tuple[int, ...]:
     """Check that ``instructions`` form a well-formed program.
 
     A well-formed program is a non-empty sequence of :class:`Instruction`
-    objects that never pops from an empty stack and ends with its only
-    ``RETURN``, which finds exactly one value on the stack.
+    objects that never pops from an empty stack, never reads a local slot
+    before storing into it, and ends with its only ``RETURN``, which finds
+    exactly one value on the stack.
 
     Returns the sorted indexes of the arguments the program reads, which
     are the arguments the runtime guards must check. Raises
@@ -118,12 +126,18 @@ def execute(instructions: Iterable[Instruction], args: Iterable[object]) -> int:
     _check_guards(args, read_args)
 
     stack: list[int] = []
+    # A dict, not a list: slot numbers in hand-written IR may be sparse.
+    local_slots: dict[int, int] = {}
     for instruction in program:
         match instruction.op:
             case Op.LOAD_ARG:
                 stack.append(args[instruction.arg])
             case Op.LOAD_CONST:
                 stack.append(instruction.arg)
+            case Op.LOAD_LOCAL:
+                stack.append(local_slots[instruction.arg])
+            case Op.STORE_LOCAL:
+                local_slots[instruction.arg] = stack.pop()
             case Op.ADD:
                 right = stack.pop()
                 left = stack.pop()
@@ -179,10 +193,12 @@ def _validate(program: tuple[object, ...]) -> tuple[int, ...]:
             index=returns[0],
         )
 
-    # Simulate the stack depth. Straight-line code has exactly one possible
-    # depth at every instruction, so one pass covers every execution.
+    # Simulate the stack depth and the assigned local slots. Straight-line
+    # code has exactly one possible state at every instruction, so one pass
+    # covers every execution.
     depth = 0
     read_args: set[int] = set()
+    assigned: set[int] = set()
     for index, instruction in enumerate(program):
         pops, pushes = _STACK_EFFECT[instruction.op]
         if depth < pops:
@@ -197,11 +213,24 @@ def _validate(program: tuple[object, ...]) -> tuple[int, ...]:
                 f"on the stack; it must find exactly one",
                 index=index,
             )
+        if instruction.op is Op.LOAD_LOCAL and instruction.arg not in assigned:
+            raise InvalidProgramError(
+                f"LOAD_LOCAL at index {index} reads local {instruction.arg} "
+                f"before it is assigned",
+                index=index,
+            )
         if instruction.op is Op.LOAD_ARG:
             read_args.add(instruction.arg)
+        elif instruction.op is Op.STORE_LOCAL:
+            assigned.add(instruction.arg)
         depth += pushes - pops
 
     return tuple(sorted(read_args))
+
+
+# Operations whose argument is an int: a constant, or an argument or local
+# index (which cannot be negative).
+_OPS_WITH_INT = frozenset({Op.LOAD_ARG, Op.LOAD_CONST, Op.LOAD_LOCAL, Op.STORE_LOCAL})
 
 
 def _check_instruction(index: int, instruction: object) -> None:
@@ -220,16 +249,17 @@ def _check_instruction(index: int, instruction: object) -> None:
             f"instruction at index {index} has unknown operation {op!r}",
             index=index,
         )
-    if op is Op.LOAD_ARG or op is Op.LOAD_CONST:
+    if op in _OPS_WITH_INT:
         if type(arg) is not int:
             raise InvalidProgramError(
                 f"{op.name} at index {index} needs an int argument, "
                 f"got {type(arg).__name__}",
                 index=index,
             )
-        if op is Op.LOAD_ARG and arg < 0:
+        if op is not Op.LOAD_CONST and arg < 0:
+            kind = "argument" if op is Op.LOAD_ARG else "local"
             raise InvalidProgramError(
-                f"LOAD_ARG at index {index} has negative argument index {arg}",
+                f"{op.name} at index {index} has negative {kind} index {arg}",
                 index=index,
             )
     elif arg is not None:

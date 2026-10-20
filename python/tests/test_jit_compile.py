@@ -347,6 +347,188 @@ def test_native_results_are_plain_ints():
     assert type(result) is int
 
 
+# --- Local variables -----------------------------------------------------
+
+
+def calculate_score(wins, draws, penalties):
+    points = wins * 3 + draws
+    deduction = penalties * 2
+    result = points - deduction
+    return result
+
+
+def reuse(a, b):
+    total = a + b
+    return total * total
+
+
+def reassign(a, b):
+    value = a + b
+    value = value * 3
+    return value - a
+
+
+def overwrite_argument(a, b):
+    a = a + 1
+    return a * b
+
+
+def copy_value(a, b):
+    x = a
+    y = x
+    x = b
+    return y - x
+
+
+def intermediate_overflow(a):
+    value = a + 1
+    value = 0
+    return value
+
+
+def unused_product(a, b):
+    product = a * b  # noqa: F841 -- computed, never read.
+    return a - b
+
+
+def helper_names(stack, args):
+    # Names that resemble the compiler's own internals.
+    locals = stack * 2
+    LOAD_LOCAL = locals + args
+    result = LOAD_LOCAL - stack
+    stack = result * result
+    return stack - LOAD_LOCAL
+
+
+LOCAL_EXAMPLES = [
+    (calculate_score, (5, 2, 3)),
+    (calculate_score, (-4, 10**6, -(2**40))),
+    (reuse, (3, 4)),
+    (reuse, (-(2**31), 2**31 - 1)),
+    (reassign, (3, 4)),
+    (reassign, (-7, I64_MAX // 3 - 10)),
+    (overwrite_argument, (3, 4)),
+    (overwrite_argument, (I64_MAX - 1, 1)),
+    (overwrite_argument, (-1, I64_MIN)),
+    (copy_value, (10, 3)),
+    (copy_value, (I64_MIN, 0)),
+    (intermediate_overflow, (I64_MAX - 1,)),
+    (unused_product, (2**31, -(2**31))),
+    (helper_names, (6, 7)),
+]
+
+
+@pytest.mark.parametrize(
+    ("func", "args"), LOCAL_EXAMPLES, ids=lambda v: getattr(v, "__name__", "")
+)
+def test_locals_run_natively(func, args):
+    f = compiled(snekit(func), *args)
+    expected = func(*args)
+    assert assert_native(f, *args) == expected
+    assert execute(analyze(func).instructions, args) == expected
+    assert state_of(f).compiled.instructions == analyze(func).instructions
+
+
+def test_copy_value_returns_the_original_a_minus_b():
+    f = compiled(snekit(copy_value), 1, 2)
+    for a, b in [(10, 3), (-5, 8), (0, 0), (I64_MAX, 0)]:
+        assert assert_native(f, a, b) == a - b
+
+
+@pytest.mark.parametrize(
+    ("func", "args"),
+    [
+        # The overwritten ``a + 1`` overflows; Python returns 0.
+        (intermediate_overflow, (I64_MAX,)),
+        # The never-read ``a * b`` overflows; Python returns a - b.
+        (unused_product, (2**32, 2**32)),
+        (unused_product, (I64_MIN, -1)),
+        # ``points`` overflows although the final result fits.
+        (calculate_score, (I64_MAX // 3 + 1, 0, I64_MAX // 2)),
+        # The reassigned argument overflows.
+        (overwrite_argument, (I64_MAX, 0)),
+        # The final multiply overflows.
+        (reuse, (2**32, 0)),
+    ],
+    ids=lambda v: getattr(v, "__name__", ""),
+)
+def test_overflow_in_locals_falls_back_to_python(func, args):
+    f = compiled(snekit(func), *(1,) * len(args))
+    specialization = state_of(f).specialization
+    result, fast_calls = assert_python(f, *args)
+    assert result == func(*args)
+    # The native code ran, and its overflow guard sent the call to Python.
+    assert fast_calls == 1
+    assert state_of(f).specialization is specialization
+    assert state_of(f).status is _Status.COMPILED
+    assert assert_native(f, *(2,) * len(args)) == func(*(2,) * len(args))
+
+
+def test_unread_reassigned_argument_is_still_guarded():
+    @snekit
+    def f(a, b):
+        a = 1
+        return a + b
+
+    compiled(f, 1, 2)
+    assert assert_native(f, 100, 2) == 3
+    # CPython never reads the old ``a``, so a non-int works; natively every
+    # argument must be an exact i64, so this falls back.
+    assert assert_python(f, "x", 2) == (3, 1)
+    assert assert_python(f, 2**64, 2) == (3, 1)
+
+
+def test_read_before_assignment_falls_back_to_python():
+    @snekit
+    def f(a):
+        y = x + a  # noqa: F821 -- ``x`` is the local assigned below.
+        x = 1  # noqa: F841
+        return y
+
+    for _ in range(_WARMUP_CALLS + 5):
+        with pytest.raises(UnboundLocalError):
+            f(1)
+    state = state_of(f)
+    assert state.status is _Status.DISABLED
+    assert state.disabled_reason is _DisabledReason.REJECTED
+    assert state.rejection.reason is RejectionReason.UNSUPPORTED_VARIABLE
+    assert state.compiled is None
+    assert f.call_count == _WARMUP_CALLS + 5
+    with recording() as calls:
+        with pytest.raises(UnboundLocalError):
+            f(1)
+    assert calls[f.__wrapped__.__code__] == 1
+
+
+def test_readme_locals_example():
+    @snekit
+    def score(wins, draws, penalties):
+        points = wins * 3 + draws
+        deduction = penalties * 2
+        result = points - deduction
+        return result
+
+    for _ in range(100):
+        assert score(10, 4, 3) == 28
+    assert state_of(score).status is _Status.COMPILED
+    assert assert_native(score, 10, 4, 3) == 28
+    assert score.call_count == 101
+
+
+def test_replacing_code_of_a_function_with_locals():
+    @snekit
+    def f(a, b):
+        value = a + b
+        value = value * 3
+        return value - a
+
+    compiled(f, 1, 2)
+    assert assert_native(f, 3, 4) == 18
+    f.__wrapped__.__code__ = overwrite_argument.__code__
+    assert assert_python(f, 3, 4) == (16, 0)
+    assert state_of(f).disabled_reason is _DisabledReason.CODE_CHANGED
+
+
 # --- Fallback ------------------------------------------------------------
 
 
@@ -664,9 +846,21 @@ def _global(a):
     return a + GLOBAL_OFFSET
 
 
-def _local(a):
-    b = a * 2
-    return b + 1
+def _augmented(a):
+    a += 1
+    return a
+
+
+def _tuple_assignment(a, b):
+    a, b = b, a
+    return a - b
+
+
+def _loop_with_locals(a):
+    total = 0
+    for i in range(a):
+        total = total + i
+    return total
 
 
 def _divide(a, b):
@@ -695,7 +889,9 @@ UNSUPPORTED = [
     (_branch, (-4,), RejectionReason.CONTROL_FLOW),
     (_call, (-4,), RejectionReason.UNSUPPORTED_OPCODE),
     (_global, (4,), RejectionReason.UNSUPPORTED_OPCODE),
-    (_local, (4,), RejectionReason.UNSUPPORTED_OPCODE),
+    (_augmented, (4,), RejectionReason.UNSUPPORTED_OPERATOR),
+    (_tuple_assignment, (4, 5), RejectionReason.UNSUPPORTED_OPCODE),
+    (_loop_with_locals, (4,), RejectionReason.CONTROL_FLOW),
     (_divide, (9, 2), RejectionReason.UNSUPPORTED_OPERATOR),
     (_varargs, (1, 2), RejectionReason.UNSUPPORTED_SIGNATURE),
     (abs, (-3,), RejectionReason.NOT_A_FUNCTION),

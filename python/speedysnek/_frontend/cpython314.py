@@ -26,17 +26,27 @@ Details of CPython 3.14 that matter here:
 - ``EXTENDED_ARG`` prefixes instructions whose argument is >= 256. ``dis``
   already folds it into the next instruction's ``arg``/``argval``, so it is
   skipped too.
-- Arguments are read with ``LOAD_FAST_BORROW`` (new in 3.14: it pushes a
-  borrowed reference). Two consecutive reads of arguments with index < 16
+- Variables are read with ``LOAD_FAST_BORROW`` (new in 3.14: it pushes a
+  borrowed reference). Two consecutive reads of variables with index < 16
   are fused into the superinstruction ``LOAD_FAST_BORROW_LOAD_FAST_BORROW``,
   whose ``argval`` is a tuple of both names.
-- Arguments with index >= 64 are read with ``LOAD_FAST_CHECK``, because
-  the compiler only proves 64 locals definitely bound. Positional
-  arguments are always bound, and stores and deletes are rejected, so the
-  check can never fail here.
+- Variables with index >= 64 are read with ``LOAD_FAST_CHECK``, because
+  the compiler only proves 64 locals definitely bound. A read of a local
+  that may be unbound uses ``LOAD_FAST_CHECK`` too. The frontend does not
+  rely on which form CPython picked: it tracks assignments itself (see
+  below).
 - The owned-reference forms ``LOAD_FAST`` and ``LOAD_FAST_LOAD_FAST`` read
-  locals the same way. They were not observed for this subset but are
-  accepted because they mean the same thing.
+  variables the same way. ``LOAD_FAST`` is emitted, for example, when a
+  variable is copied into another (``x = a``).
+- An assignment statement ``x = <expression>`` is the expression followed
+  by ``STORE_FAST`` (``argval`` is the name). The fused forms
+  ``STORE_FAST_LOAD_FAST`` and ``STORE_FAST_STORE_FAST`` were not observed
+  for plain assignments; CPython 3.14 emits them for tuple assignment
+  (``x, y = a, b``), chained assignment (``x = y = a``, after a ``COPY``)
+  and the walrus operator, all outside the subset, so they are rejected
+  like any other unsupported opcode. Augmented assignment (``a += 1``) is
+  a ``BINARY_OP`` with operator ``+=``, rejected as an unsupported
+  operator, and ``del x`` is a rejected ``DELETE_FAST``.
 - Integers 0..255 are loaded with ``LOAD_SMALL_INT`` (new in 3.14); other
   constants, including negative literals such as ``-1``, use
   ``LOAD_CONST``. Constant expressions such as ``2 * 3`` are folded by the
@@ -44,6 +54,25 @@ Details of CPython 3.14 that matter here:
 - All arithmetic is ``BINARY_OP``; ``argrepr`` names the operator.
 - ``RETURN_CONST`` (3.12, 3.13) no longer exists: ``return 1`` is
   ``LOAD_SMALL_INT 1`` followed by ``RETURN_VALUE``.
+
+Local variables. Straight-line code runs every instruction once, in
+bytecode order, so a variable is bound at a read exactly when a store to it
+(or, for an argument, the call itself) comes earlier in that order. The
+frontend maps variables like this:
+
+- an argument that has not been assigned yet is ``LOAD_ARG`` with its
+  position;
+- the first ``STORE_FAST`` to a name gives it the next free local slot,
+  counting from 0, and stores go to ``STORE_LOCAL`` with that slot. An
+  argument that is assigned gets a slot like any other variable;
+- a read of a name with a slot is ``LOAD_LOCAL``;
+- a read of any other name is rejected (``UNSUPPORTED_VARIABLE``): it may
+  be unbound, and running the original function raises CPython's usual
+  ``UnboundLocalError``.
+
+Each load becomes one instruction: an assigned expression is computed once,
+by the instructions before its ``STORE_LOCAL``, and never copied into the
+places that read it.
 
 ``dis.get_instructions`` is called with ``adaptive=False`` (the default),
 so specialized instructions such as ``BINARY_OP_ADD_INT``, which appear
@@ -60,11 +89,11 @@ from .ir import Analysis, Instruction, Op, Rejection, RejectionReason
 # Interpreter bookkeeping that has no meaning in the normalized form.
 _BOOKKEEPING = frozenset({"RESUME", "NOP", "NOT_TAKEN", "EXTENDED_ARG"})
 
-# Instructions that push one local variable; ``argval`` is its name.
+# Instructions that push one variable; ``argval`` is its name.
 _LOAD_LOCAL = frozenset({"LOAD_FAST", "LOAD_FAST_BORROW", "LOAD_FAST_CHECK"})
 
-# Superinstructions that push two local variables; ``argval`` is a tuple
-# of both names.
+# Superinstructions that push two variables; ``argval`` is a tuple of both
+# names.
 _LOAD_LOCAL_PAIR = frozenset(
     {"LOAD_FAST_LOAD_FAST", "LOAD_FAST_BORROW_LOAD_FAST_BORROW"}
 )
@@ -99,6 +128,8 @@ def translate(code: CodeType) -> Analysis:
             )
 
     instructions: list[Instruction] = []
+    # Local slots by variable name, in order of first assignment.
+    slots: dict[str, int] = {}
     for instr in bytecode:
         name = instr.opname
         if name in _BOOKKEEPING:
@@ -106,14 +137,20 @@ def translate(code: CodeType) -> Analysis:
         if name in _LOAD_LOCAL or name in _LOAD_LOCAL_PAIR:
             names = instr.argval if name in _LOAD_LOCAL_PAIR else (instr.argval,)
             for var in names:
+                if var in slots:
+                    instructions.append(Instruction(Op.LOAD_LOCAL, slots[var]))
+                    continue
                 index = code.co_varnames.index(var)
                 if index >= code.co_argcount:
                     return _reject(
                         RejectionReason.UNSUPPORTED_VARIABLE,
                         instr,
-                        f"{var!r} is a local variable, not a positional argument",
+                        f"local variable {var!r} may be read before it is assigned",
                     )
                 instructions.append(Instruction(Op.LOAD_ARG, index))
+        elif name == "STORE_FAST":
+            slot = slots.setdefault(instr.argval, len(slots))
+            instructions.append(Instruction(Op.STORE_LOCAL, slot))
         elif name in _LOAD_CONSTANT:
             value = instr.argval
             # ``bool`` is a subclass of ``int``; reject it explicitly.

@@ -10,6 +10,8 @@ OP_ADD: int
 OP_SUBTRACT: int
 OP_MULTIPLY: int
 OP_RETURN: int
+OP_LOAD_LOCAL: int
+OP_STORE_LOCAL: int
 
 # Status codes returned by ``I64Function.call``.
 STATUS_OK: int
@@ -17,6 +19,7 @@ STATUS_OVERFLOW: int
 STATUS_BAD_ARITY: int
 
 MAX_ARGS: int
+MAX_LOCALS: int
 
 # ``True`` when the extension was built with debug assertions, as by a plain
 # ``maturin develop``. Benchmarks record it; debug builds are not

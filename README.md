@@ -116,6 +116,30 @@ expression(2**62, 2**62)          # 18446744073709551616, computed by Python
 expression.call_count             # 101
 ```
 
+Functions can use local variables, too. Each assigned value is computed
+once, and reading a variable again reuses it:
+
+```python
+from speedysnek import snekit
+
+@snekit
+def calculate_score(wins, draws, penalties):
+    points = wins * 3 + draws
+    deduction = penalties * 2
+    result = points - deduction
+    return result
+
+for _ in range(100):
+    score = calculate_score(10, 4, 3)   # 28, native after warmup
+```
+
+What compiles today: positional `int` arguments, `int` constants, `+`,
+`-`, `*`, assignments to local variables (including reassigning an
+argument) and one final `return`. Branches (`if`, conditional
+expressions), loops, function calls, globals, augmented assignment
+(`x += 1`), tuple assignment and everything else still run as plain
+Python.
+
 `@jit` is the descriptive, backwards-compatible name for the same
 decorator: `speedysnek.jit is speedysnek.snekit`, so existing
 `from speedysnek import jit` code keeps working unchanged. New code should
@@ -186,7 +210,8 @@ Each decorated function has its own small state machine:
   disables the specialization.
 - **Disabled.** If the function is outside the supported subset (branches,
   loops, calls, globals, closures, generators, async functions, keyword
-  arguments, …), the backend cannot compile it, or the compiler fails
+  arguments, a variable that may be read before it is assigned, …), the
+  backend cannot compile it, or the compiler fails
   unexpectedly, it is never compiled again and every call runs the original
   function. Replacing the function's `__code__` after compilation also
   disables the cached code; stale machine code is never run, and there is
@@ -225,14 +250,25 @@ for instruction in analyze(add).instructions:
 # RETURN
 ```
 
+Local variables become numbered local slots: `STORE_LOCAL n` and
+`LOAD_LOCAL n`. `LOAD_ARG n` always means the argument as passed, and an
+argument that the function reassigns gets a local slot of its own. The
+details are in `python/speedysnek/_frontend/ir.py` and `cpython314.py`.
+
 Current status:
 
 - Only **straight-line integer arithmetic** is supported: positional
-  arguments, `int` constants, `+`, `-`, `*` and `return`.
-- Anything else (division, calls, globals, attributes, branches, loops,
-  closures, generators, async functions, non-`int` constants, …) is
-  rejected with a machine-readable reason and, where applicable, the
-  offending CPython opcode and bytecode offset.
+  arguments, `int` constants, `+`, `-`, `*`, plain assignments to local
+  variables (`x = a + b`, including reassigning an argument) and `return`.
+- **Control flow and loops remain unsupported**: no `if`, conditional
+  expressions, `while` or `for`.
+- Anything else (division, calls, globals, attributes, augmented
+  assignment, tuple or chained assignment, `del`, closures, generators,
+  async functions, non-`int` constants, …) is rejected with a
+  machine-readable reason and, where applicable, the offending CPython
+  opcode and bytecode offset. So is reading a local variable that may not
+  be assigned yet; the original function then raises its usual
+  `UnboundLocalError`.
 - `@snekit` runs the frontend once per hot function. It is not public API.
 - All CPython 3.14-specific handling lives in
   `python/speedysnek/_frontend/cpython314.py`.
@@ -261,8 +297,9 @@ execute(program, args=(5,))  # 10
   reads must satisfy `type(value) is int` (so `bool`, `float`, `str` and
   `int` subclasses are rejected); otherwise it raises `GuardFailure`.
 - The whole program is validated before it runs. Malformed instructions
-  (empty program, stack underflow, missing or misplaced `RETURN`, leftover
-  stack values, …) raise `InvalidProgramError`, which means a compiler bug.
+  (empty program, stack underflow, a local slot read before it is stored,
+  missing or misplaced `RETURN`, leftover stack values, …) raise
+  `InvalidProgramError`, which means a compiler bug.
 - Arithmetic uses Python `int`, so **arbitrary precision is intentional**:
   `2**63 + 1` is not wrapped to a 64-bit value.
 - `@snekit` never uses it; it is used by the tests and is not public API.
@@ -287,12 +324,15 @@ compiled(10, 20)  # 60, computed by generated machine code
 - It is **private and experimental**. `@snekit` uses it to compile hot
   functions.
 - It supports only the current arithmetic subset (`+`, `-`, `*` on
-  arguments and constants).
+  arguments, constants and local variables). Local slots exist only at
+  compile time: a slot names a value that was already computed, so an
+  assignment copies nothing at run time and reading a local twice reuses
+  one computation.
 - It never returns a wrapped 64-bit value. Constants outside the signed
   64-bit range are rejected at compile time (`UnsupportedProgramError`).
   At call time, arguments that are not exact `int`s in that range, a wrong
   number of arguments, or any `+`, `-` or `*` that overflows are a guard
-  miss.
+  miss, including one whose result is later overwritten or never read.
 - A compiled program has two entry points:
   - `compiled(*args)`, the **diagnostic** path, raises
     `NativeGuardFailure` with the exact reason for a miss (wrong arity, not

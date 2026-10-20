@@ -357,18 +357,346 @@ def test_rejects_loops():
     assert_rejected(for_loop, RejectionReason.CONTROL_FLOW, "FOR_ITER", 6)
 
 
-def test_rejects_local_variables():
-    def store(a):
-        b = a + 1
-        return b
-
-    assert_rejected(store, RejectionReason.UNSUPPORTED_OPCODE, "STORE_FAST", 18)
-
-
 def test_rejects_reading_a_non_argument_local():
     # Nothing ever stores ``y``, so CPython emits a lone LOAD_FAST_CHECK.
     f = define("def f():\n    return y\n    y = 1\n")
+    rejection = assert_rejected(
+        f, RejectionReason.UNSUPPORTED_VARIABLE, "LOAD_FAST_CHECK", 2
+    )
+    assert "'y' may be read before it is assigned" in rejection.message
+
+
+def test_rejects_read_before_assignment():
+    def f(a):
+        y = x + a  # noqa: F821 -- ``x`` is the local assigned below.
+        x = 1  # noqa: F841
+        return y
+
     assert_rejected(f, RejectionReason.UNSUPPORTED_VARIABLE, "LOAD_FAST_CHECK", 2)
+    with pytest.raises(UnboundLocalError):
+        f(1)
+
+
+def test_rejects_self_referencing_first_assignment():
+    def f(a):
+        x = x + a  # noqa: F821
+        return x
+
+    assert_rejected(f, RejectionReason.UNSUPPORTED_VARIABLE, "LOAD_FAST_CHECK", 2)
+
+
+def test_rejects_assignment_forms_outside_the_subset():
+    # Each is rejected at its first unsupported instruction.
+    cases = [
+        # Tuple assignment and swaps use STORE_FAST_STORE_FAST directly.
+        ("x, y = a, b\n    return x - y", "STORE_FAST_STORE_FAST", 4),
+        ("a, b = b, a\n    return a - b", "STORE_FAST_STORE_FAST", 4),
+        # Chained assignment and the walrus operator duplicate a value first.
+        ("x = y = a + 1\n    return x * y", "COPY", 18),
+        ("return (x := a + 1) * x", "COPY", 18),
+        ("del a\n    return b", "DELETE_FAST", 2),
+    ]
+    for body, opname, offset in cases:
+        f = define(f"def f(a, b):\n    {body}\n")
+        assert_rejected(f, RejectionReason.UNSUPPORTED_OPCODE, opname, offset)
+
+    # Augmented assignment is BINARY_OP with an in-place operator.
+    for operator in ("+=", "-=", "*="):
+        f = define(f"def f(a):\n    a {operator} 1\n    return a\n")
+        rejection = assert_rejected(
+            f, RejectionReason.UNSUPPORTED_OPERATOR, "BINARY_OP", 6
+        )
+        assert repr(operator) in rejection.message
+
+
+def test_rejects_non_local_stores():
+    sources = {
+        "global G\n    G = a\n    return a": "STORE_GLOBAL",
+        "a.x = 1\n    return 1": "STORE_ATTR",
+        "a[0] = 1\n    return 1": "STORE_SUBSCR",
+    }
+    for body, opname in sources.items():
+        rejection = analyze(define(f"def f(a):\n    {body}\n")).rejection
+        assert rejection.reason is RejectionReason.UNSUPPORTED_OPCODE
+        assert rejection.opname == opname
+
+
+# --- Local variables -----------------------------------------------------
+
+
+def load(slot):
+    return Instruction(Op.LOAD_LOCAL, slot)
+
+
+def store(slot):
+    return Instruction(Op.STORE_LOCAL, slot)
+
+
+def test_local_variables():
+    def calculate_score(wins, draws, penalties):
+        points = wins * 3 + draws
+        deduction = penalties * 2
+        result = points - deduction
+        return result
+
+    assert_supported(
+        calculate_score,
+        [
+            LOAD_ARG_0,
+            const(3),
+            MULTIPLY,
+            LOAD_ARG_1,
+            ADD,
+            store(0),  # points
+            Instruction(Op.LOAD_ARG, 2),
+            const(2),
+            MULTIPLY,
+            store(1),  # deduction
+            load(0),
+            load(1),
+            SUBTRACT,
+            store(2),  # result
+            load(2),
+            RETURN,
+        ],
+    )
+
+
+def test_reused_local_is_computed_once():
+    # ``total`` is read twice through the fused LOAD_FAST_BORROW pair, but
+    # ``a + b`` appears once.
+    def reuse(a, b):
+        total = a + b
+        return total * total
+
+    assert_supported(
+        reuse,
+        [LOAD_ARG_0, LOAD_ARG_1, ADD, store(0), load(0), load(0), MULTIPLY, RETURN],
+    )
+
+
+def test_reassigned_local_keeps_its_slot():
+    def reassign(a, b):
+        value = a + b
+        value = value * 3
+        return value - a
+
+    assert_supported(
+        reassign,
+        [
+            LOAD_ARG_0,
+            LOAD_ARG_1,
+            ADD,
+            store(0),
+            load(0),
+            const(3),
+            MULTIPLY,
+            store(0),
+            load(0),
+            LOAD_ARG_0,
+            SUBTRACT,
+            RETURN,
+        ],
+    )
+
+
+def test_reassigned_argument_gets_a_local_slot():
+    def overwrite_argument(a, b):
+        a = a + 1
+        return a * b
+
+    assert_supported(
+        overwrite_argument,
+        [LOAD_ARG_0, const(1), ADD, store(0), load(0), LOAD_ARG_1, MULTIPLY, RETURN],
+    )
+
+
+def test_argument_reads_before_and_after_reassignment():
+    # The original ``a`` is LOAD_ARG until the store, LOAD_LOCAL after it;
+    # ``b`` is never assigned and stays LOAD_ARG.
+    def f(a, b):
+        c = a * 2
+        a = b
+        return a + c - b
+
+    assert_supported(
+        f,
+        [
+            LOAD_ARG_0,
+            const(2),
+            MULTIPLY,
+            store(0),  # c
+            LOAD_ARG_1,
+            store(1),  # a
+            load(1),
+            load(0),
+            ADD,
+            LOAD_ARG_1,
+            SUBTRACT,
+            RETURN,
+        ],
+    )
+
+
+def test_copying_between_locals():
+    # CPython uses the owned LOAD_FAST for a copy.
+    def copy_value(a, b):
+        x = a
+        y = x
+        x = b
+        return y - x
+
+    opnames = [i.opname for i in dis.get_instructions(copy_value)]
+    assert opnames[1:4] == ["LOAD_FAST", "STORE_FAST", "LOAD_FAST"]
+    assert_supported(
+        copy_value,
+        [
+            LOAD_ARG_0,
+            store(0),  # x
+            load(0),
+            store(1),  # y
+            LOAD_ARG_1,
+            store(0),  # x again
+            load(1),
+            load(0),
+            SUBTRACT,
+            RETURN,
+        ],
+    )
+
+
+def test_unused_and_overwritten_computations_are_kept():
+    def overwritten(a):
+        value = a + 1
+        value = 0
+        return value
+
+    def unused(a):
+        t = a * a  # noqa: F841
+        return a
+
+    assert_supported(
+        overwritten,
+        [LOAD_ARG_0, const(1), ADD, store(0), const(0), store(0), load(0), RETURN],
+    )
+    assert_supported(
+        unused, [LOAD_ARG_0, LOAD_ARG_0, MULTIPLY, store(0), LOAD_ARG_0, RETURN]
+    )
+
+
+def test_self_assignment_and_constant_locals():
+    def self_assign(a):
+        a = a
+        return a
+
+    def constants():
+        x = 1
+        y = 1000
+        return x + y
+
+    assert_supported(self_assign, [LOAD_ARG_0, store(0), load(0), RETURN])
+    assert_supported(
+        constants,
+        [const(1), store(0), const(1000), store(1), load(0), load(1), ADD, RETURN],
+    )
+
+
+def test_annotated_assignment_is_a_plain_assignment():
+    def f(a):
+        x: int = a + 1
+        return x
+
+    assert_supported(f, [LOAD_ARG_0, const(1), ADD, store(0), load(0), RETURN])
+
+
+@pytest.mark.parametrize(
+    "names",
+    [
+        ("stack", "slot", "locals"),
+        ("LOAD_LOCAL", "STORE_LOCAL", "LOAD_ARG"),
+        ("_", "__", "__return__"),
+        ("result", "value", "index"),
+        ("arg0", "local0", "tmp"),
+    ],
+)
+def test_local_names_do_not_affect_output(names):
+    x, y, z = names
+    f = define(
+        f"def f(a, b):\n    {x} = a + b\n    {y} = {x} * a\n"
+        f"    {z} = {y} - {x}\n    {x} = {z}\n    return {x} * {y}\n"
+    )
+
+    def reference(a, b):
+        p = a + b
+        q = p * a
+        r = q - p
+        p = r
+        return p * q
+
+    assert analyze(f) == analyze(reference)
+
+
+def test_slots_follow_first_assignment():
+    # Slots are numbered by first store, not by ``co_varnames`` position:
+    # the argument ``a`` is assigned second, so it gets slot 1.
+    def f(a, b):
+        x = b
+        a = x
+        y = a
+        return y
+
+    assert f.__code__.co_varnames == ("a", "b", "x", "y")
+    assert_supported(
+        f, [LOAD_ARG_1, store(0), load(0), store(1), load(1), store(2), load(2), RETURN]
+    )
+
+
+def test_many_locals_use_extended_arg():
+    # Local indexes >= 256 need an EXTENDED_ARG prefix.
+    body = "".join(f"    v{i} = a + {i}\n" for i in range(300))
+    f = define(f"def f(a):\n{body}    return v299 - v70 + v0\n")
+    opnames = [i.opname for i in dis.get_instructions(f)]
+    assert "EXTENDED_ARG" in opnames
+
+    expected = []
+    for i in range(300):
+        expected += [LOAD_ARG_0, const(i), ADD, store(i)]
+    expected += [load(299), load(70), SUBTRACT, load(0), ADD, RETURN]
+    assert_supported(f, expected)
+
+
+def test_reassigning_an_argument_read_with_load_fast_check():
+    # Arguments at index >= 64 are read with LOAD_FAST_CHECK; after the
+    # store, CPython reads ``a65`` with LOAD_FAST_BORROW. Either way the
+    # frontend's own tracking decides between LOAD_ARG and LOAD_LOCAL.
+    params = ", ".join(f"a{i}" for i in range(66))
+    f = define(f"def f({params}):\n    a65 = a65 + 1\n    return a65 * a64\n")
+    opnames = [i.opname for i in dis.get_instructions(f)]
+    assert opnames[1] == "LOAD_FAST_CHECK"
+    assert opnames[5:7] == ["LOAD_FAST_BORROW", "LOAD_FAST_CHECK"]
+    assert_supported(
+        f,
+        [
+            Instruction(Op.LOAD_ARG, 65),
+            const(1),
+            ADD,
+            store(0),
+            load(0),
+            Instruction(Op.LOAD_ARG, 64),
+            MULTIPLY,
+            RETURN,
+        ],
+    )
+
+
+def test_ir_size_is_linear_in_the_source():
+    # Each line squares the previous value. Inlining assignments would
+    # double the IR per line; slots keep it at a constant per line.
+    lines = "".join("    x = x * x\n" for _ in range(200))
+    f = define(f"def f(a):\n    x = a\n{lines}    return x\n")
+    instructions = analyze(f).instructions
+    assert len(instructions) == 2 + 200 * 4 + 2
+    assert instructions.count(Instruction(Op.MULTIPLY)) == 200
 
 
 @pytest.mark.parametrize(
@@ -515,6 +843,14 @@ def test_instruction_validates_its_argument():
         Instruction(Op.LOAD_ARG, -1)
     with pytest.raises(TypeError):
         Instruction(Op.ADD, 1)
+    for op in (Op.LOAD_LOCAL, Op.STORE_LOCAL):
+        with pytest.raises(TypeError):
+            Instruction(op)
+        with pytest.raises(TypeError):
+            Instruction(op, False)
+        with pytest.raises(ValueError, match=f"{op.name} index must be non-negative"):
+            Instruction(op, -1)
+        assert str(Instruction(op, 3)) == f"{op.name} 3"
 
 
 def test_analysis_has_instructions_xor_rejection():
