@@ -1710,7 +1710,16 @@ def test_guard_reasons_are_stable_strings():
 
 
 def test_backend_is_private():
-    assert speedysnek.__all__ == ["snekit", "jit", "hunt", "HuntReport", "HuntFinding"]
+    assert speedysnek.__all__ == [
+        "snekit",
+        "jit",
+        "hunt",
+        "HuntReport",
+        "HuntFinding",
+        "bite",
+        "BiteReport",
+        "BiteFinding",
+    ]
     for name in ("compile_i64", "CompiledI64", "NativeGuardFailure", "I64Function"):
         assert not hasattr(speedysnek, name)
 
