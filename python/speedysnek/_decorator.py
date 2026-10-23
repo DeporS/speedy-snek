@@ -14,10 +14,12 @@ The decorator connects the compiler pipeline::
         -> original CPython function otherwise
 
 Every decorated function gets its own :class:`_JitState`, a small state
-machine with three states (:class:`_Status`):
+machine with four states (:class:`_Status`):
 
-- ``COLD``: the first ``_WARMUP_CALLS`` calls run the original function.
-  The next call tries to compile it, exactly once, and then picks a path.
+- ``COLD``: the first ``_WARMUP_CALLS`` calls run the original function,
+  and the wrapper notes, for each, whether it could have run natively (see
+  *the miss policy* below). The next call decides: it tries to compile the
+  function, exactly once, or parks it.
 - ``COMPILED``: a native specialization is cached. A call uses it when the
   function's ``__code__`` is still the compiled code object, no keyword
   arguments are passed and the number of positional arguments is exactly
@@ -26,6 +28,11 @@ machine with three states (:class:`_Status`):
   range, or overflow), or a loop uses up the call's backedge budget, that
   one call runs the original function instead, from the start and with
   the original arguments. The specialization stays cached for later calls.
+- ``PARKED``: the observed calls do not fit the i64 specialization, so
+  calls run the original function without a native attempt. Either warmup
+  showed it (nothing is compiled then) or a compiled function's calls kept
+  missing. It is not an error and not final: now and then a call that fits
+  re-probes, which compiles the function or makes it ``COMPILED`` again.
 - ``DISABLED``: the frontend rejected the function, the backend could not
   compile it, the compilation machinery failed, a native call failed
   unexpectedly, ``__code__`` was replaced after compilation, or the
@@ -56,8 +63,9 @@ state transition stay in Python: the wrapper only reads
 ``state._specialization`` (the slot behind ``state.specialization``) and
 ``state.status`` and calls the state's
 ``cold_call``, ``invalidate`` and ``native_failed`` methods, in the same
-places the earlier Python closure did. A warmed, eligible call runs no
-Python code at all.
+places the earlier Python closure did, plus the miss policy's
+``repeated_misses``, ``reprobe_succeeded`` and ``reprobe`` (see below). A
+warmed, eligible call runs no Python code at all.
 
 **The hot slot.** Reading those attributes on every call is most of a
 warmed call's cost, so ``snekit`` also gives the wrapper and its state one
@@ -83,6 +91,45 @@ replaced, always takes the generic path::
                and every loop iteration against the backedge budget
             -> the result int, or a guard miss
         -> original function, only for a guard miss
+
+    parked hot slot                     (the miss policy, below)
+        -> __code__ and the range guard still match? (compiled only)
+        -> original function, without a native attempt,
+           except for a re-probe
+
+**The miss policy.** Native execution only pays off for calls that fit
+the specialization; a call that does not fit pays for the attempt and then
+runs the original function anyway. So the wrapper stops attempting when the
+calls it sees clearly do not fit, using only facts it already has: whether
+there are keywords, the number of positional arguments, and whether every
+argument is an exact ``int`` in the signed 64-bit range (read without
+running Python code). It never measures time.
+
+- *Warmup.* A warmup call *fits* if it has no keywords, exactly
+  ``co_argcount`` positional arguments, and only exact ints in i64. So a
+  method called on an instance (``self``), a call relying on a default, a
+  keyword call, ``bool``, ``float`` and ``int`` subclasses do not fit.
+  With fewer than ``_MIN_FITTING_WARMUP_CALLS`` fitting warmup calls, the
+  function is parked (``_ParkedReason.WARMUP``) instead of compiled, and
+  neither the frontend nor the compiler is loaded. Only a Python function
+  with a hot slot is parked; anything else compiles (or is rejected) as
+  before.
+- *Compiled.* The hot slot counts the calls in a row that could not run
+  natively: keywords, another arity, a guard miss. A native result resets
+  the count, so occasional misses and an alternating mix never park. The
+  ``MISS_LIMIT``th miss in a row parks the specialization
+  (``_ParkedReason.MISSES``).
+- *Parked.* Calls run the original function directly. After
+  ``REPROBE_INTERVAL`` parked calls, the next call that fits is a
+  re-probe: a parked specialization runs it natively and is ``COMPILED``
+  again if that gives a result; a function parked during warmup is
+  compiled then, at most once in its life. A failed re-probe stays parked
+  and starts the interval again. ``__code__`` replacement and a changed
+  range binding are still checked on every parked call of a compiled
+  function and disable it for good, as before.
+
+``MISS_LIMIT`` and ``REPROBE_INTERVAL`` are constants of the extension
+module (``_native``), with their rationale next to them in ``src/lib.rs``.
 
 Guard misses are expected, so they are reported without an exception.
 Only an unexpected native error (an ``Exception`` from the fast path)
@@ -116,13 +163,33 @@ from typing import Any
 # compile it.
 _WARMUP_CALLS = 8
 
+# How many of the warmup calls must fit the i64 specialization for the next
+# call to compile it; with fewer, it is parked instead. Half: a function
+# whose calls mostly fit is compiled at once, and one whose calls mostly do
+# not, such as a function only ever called with floats, does not load the
+# compiler for code that would only miss. A function parked with a few
+# fitting calls can still compile at its first re-probe.
+_MIN_FITTING_WARMUP_CALLS = _WARMUP_CALLS // 2
+
 
 class _Status(enum.Enum):
     """Where a decorated function is in its lifecycle."""
 
     COLD = "cold"
     COMPILED = "compiled"
+    PARKED = "parked"
     DISABLED = "disabled"
+
+
+class _ParkedReason(enum.Enum):
+    """Why a decorated function is ``PARKED``."""
+
+    # Fewer than ``_MIN_FITTING_WARMUP_CALLS`` warmup calls fit; nothing
+    # was compiled. See ``_JitState.warmup_fits``.
+    WARMUP = "warmup_mismatch"
+    # ``_native.MISS_LIMIT`` calls in a row could not use the compiled
+    # specialization.
+    MISSES = "repeated_misses"
 
 
 class _DisabledReason(enum.Enum):
@@ -203,7 +270,8 @@ class _JitState:
     It is private and exists for tests and debugging.
 
     Invariant: ``specialization`` is not ``None`` exactly when ``status``
-    is ``COMPILED``. ``compiled`` and ``compiled_code`` keep the last
+    is ``COMPILED``, or ``PARKED`` after compiling (``parked_reason`` is
+    then ``MISSES``). ``compiled`` and ``compiled_code`` keep the last
     successful compilation for inspection even after it is invalidated.
 
     ``_hot`` is the wrapper's ``_native.HotSlot``, or ``None`` for a state
@@ -213,6 +281,12 @@ class _JitState:
     ``specialization`` retires it first, for good: whether ``_disable``
     makes it, on any path to ``DISABLED``, or a test does. So the slot is
     live only while the wrapper would run exactly this specialization.
+    The slot is parked exactly while ``status`` is ``PARKED``: ``_park``
+    changes both, and every ``_unpark`` is followed by the new status,
+    with the lock held and no Python code in between.
+
+    ``warmup_fits`` counts the warmup calls that could have run natively;
+    ``parked_reason`` says why the state is ``PARKED``.
     """
 
     __slots__ = (
@@ -226,9 +300,11 @@ class _JitState:
         "compiled_code",
         "disabled_reason",
         "native_error",
+        "parked_reason",
         "rejection",
         "status",
         "warmup_calls",
+        "warmup_fits",
     )
 
     def __init__(self, func: Callable[..., Any], hot: Any = None) -> None:
@@ -240,6 +316,8 @@ class _JitState:
         # ``specialization``.
         self._specialization: _Specialization | None = None
         self.warmup_calls = 0
+        self.warmup_fits = 0
+        self.parked_reason: _ParkedReason | None = None
         self.compile_attempts = 0
         self.rejection = None
         self.compile_error: Exception | None = None
@@ -264,39 +342,111 @@ class _JitState:
             self._hot.retire()
         self._specialization = value
 
-    def cold_call(self) -> _Specialization | None:
-        """Count one call while ``COLD``; compile once warmup is over.
+    def cold_call(self, fits: int | None = None) -> _Specialization | None:
+        """Count one call while ``COLD``; decide once warmup is over.
+
+        ``fits`` is the wrapper's profile of the call: its number of
+        positional arguments if it has no keywords and every argument is an
+        exact ``int`` in the signed 64-bit range, else -1. ``None``, from a
+        caller that does not profile, counts as a call that fits.
 
         Returns the specialization to try for this call, if there is one.
         """
-        # Not atomic across threads: a lost update only delays compilation.
+        # Not atomic across threads: a lost update only delays compilation
+        # or shifts the profile by one call.
         self.warmup_calls += 1
         if self.warmup_calls <= _WARMUP_CALLS:
+            # ``FunctionType`` cannot be subclassed, so reading
+            # ``__code__.co_argcount`` runs no Python code.
+            func = self._func
+            if fits is None or (
+                fits >= 0
+                and type(func) is FunctionType
+                and fits == func.__code__.co_argcount
+            ):
+                self.warmup_fits += 1
             return None
         with self._lock:
             # Another thread may have finished compiling while we waited.
             if self.status is _Status.COLD:
+                if self._parkable() and self.warmup_fits < _MIN_FITTING_WARMUP_CALLS:
+                    self._park(_ParkedReason.WARMUP)
+                else:
+                    self._compile()
+        return self._specialization
+
+    def repeated_misses(self) -> None:
+        """``MISS_LIMIT`` calls in a row could not run natively."""
+        with self._lock:
+            if self.status is _Status.COMPILED and self._specialization is not None:
+                self._park(_ParkedReason.MISSES)
+
+    def reprobe_succeeded(self) -> None:
+        """A re-probe of the parked specialization ran natively."""
+        with self._lock:
+            if self.status is _Status.PARKED and self._specialization is not None:
+                self._unpark()
+                self.status = _Status.COMPILED
+
+    def reprobe(self, args: int) -> _Specialization | None:
+        """A call to a function parked during warmup may fit: compile it.
+
+        The wrapper has checked that the call has no keywords and only
+        exact ints in i64; ``args`` is their number. Returns the
+        specialization to try for this call, if there is one.
+        """
+        # Parked only when ``FunctionType``, so this runs no Python code.
+        if args != self._func.__code__.co_argcount:
+            return None
+        with self._lock:
+            # Compiled at most once: a parked state without a
+            # specialization has never compiled.
+            if self.status is _Status.PARKED and self.compile_attempts == 0:
+                self._unpark()
+                # ``_compile`` treats a state left ``COLD`` as interrupted.
+                self.status = _Status.COLD
                 self._compile()
         return self._specialization
 
     def invalidate(self) -> None:
         """``__code__`` no longer matches the compiled code object."""
         with self._lock:
-            if self.status is _Status.COMPILED:
+            if self._has_native():
                 self._disable(_DisabledReason.CODE_CHANGED)
 
     def binding_changed(self) -> None:
         """The range guard failed: ``range`` may no longer be the builtin."""
         with self._lock:
-            if self.status is _Status.COMPILED:
+            if self._has_native():
                 self._disable(_DisabledReason.RANGE_CHANGED)
 
     def native_failed(self, error: Exception) -> None:
         """A native call raised; guard misses return ``None`` instead."""
         with self._lock:
-            if self.status is _Status.COMPILED:
+            if self._has_native():
                 self.native_error = error
                 self._disable(_DisabledReason.NATIVE_ERROR)
+
+    def _has_native(self) -> bool:
+        # ``COMPILED``, or ``PARKED`` with compiled code.
+        return self.status is _Status.COMPILED or (
+            self.status is _Status.PARKED and self._specialization is not None
+        )
+
+    def _parkable(self) -> bool:
+        # Only the hot slot parks and re-probes, and only for a function.
+        return self._hot is not None and type(self._func) is FunctionType
+
+    def _park(self, reason: _ParkedReason) -> None:
+        # Called with the lock held.
+        self.status = _Status.PARKED
+        self.parked_reason = reason
+        self._hot.park()
+
+    def _unpark(self) -> None:
+        # Called with the lock held; the caller sets the new status.
+        self.parked_reason = None
+        self._hot.unpark()
 
     def _compile(self) -> None:
         # Called with the lock held, at most once per wrapper.
@@ -371,6 +521,7 @@ class _JitState:
         self.specialization = None
         self.status = _Status.DISABLED
         self.disabled_reason = reason
+        self.parked_reason = None
 
 
 def snekit[F: Callable[..., Any]](func: F) -> F:

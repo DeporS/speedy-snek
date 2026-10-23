@@ -30,6 +30,7 @@ from speedysnek._compiler import I64_MAX, I64_MIN, CompiledI64, NativeGuardFailu
 from speedysnek._decorator import (
     _WARMUP_CALLS,
     _DisabledReason,
+    _ParkedReason,
     _Specialization,
     _Status,
 )
@@ -223,10 +224,13 @@ def test_compilation_uses_the_full_positional_arity(compile_spy):
 
 def test_warmup_counts_every_call_including_ineligible_ones():
     add = make_add()
-    for _ in range(_WARMUP_CALLS):
-        add(a=1, b=2)
-    # The threshold is about calls, not argument types: the ninth call
-    # compiles, then falls back because of its keyword arguments.
+    for i in range(_WARMUP_CALLS):
+        assert (add(a=1, b=2) if i % 2 else add(1, 2)) == 3
+    # The threshold is about calls, not argument types: half of them fit,
+    # so the ninth call compiles, then falls back because of its keyword
+    # arguments.
+    assert state_of(add).warmup_calls == _WARMUP_CALLS
+    assert state_of(add).warmup_fits == _WARMUP_CALLS // 2
     assert assert_python(add, 1, b=2) == (3, 0)
     assert state_of(add).status is _Status.COMPILED
     assert assert_native(add, 1, 2) == 3
@@ -1346,7 +1350,8 @@ UNSUPPORTED = [
     (_tuple_assignment, (4, 5), RejectionReason.UNSUPPORTED_OPCODE),
     (_loop_with_locals, (4,), RejectionReason.UNSUPPORTED_ITERATION),
     (_divide, (9, 2), RejectionReason.UNSUPPORTED_OPERATOR),
-    (_varargs, (1, 2), RejectionReason.UNSUPPORTED_SIGNATURE),
+    # Called without arguments: with them, no call fits its arity of 0.
+    (_varargs, (), RejectionReason.UNSUPPORTED_SIGNATURE),
     (abs, (-3,), RejectionReason.NOT_A_FUNCTION),
     (_CallableObject(), (1, 2), RejectionReason.NOT_A_FUNCTION),
     (functools.partial(_divide, 9), (2,), RejectionReason.NOT_A_FUNCTION),
@@ -1737,29 +1742,41 @@ class Scaled:
         return self.factor * x
 
 
-def test_methods_bind_and_fall_back_on_self():
+def test_methods_bind_and_park_on_self():
     instances = [Scaled(i) for i in range(3)]
     for _ in range(_WARMUP_CALLS + 5):
         for i, instance in enumerate(instances):
             assert instance.double(i) == 2 * i
-    # The method itself compiles (``self`` is never read) ...
+    # A bound call passes ``self``, which is not an int, so no warmup call
+    # fit: the method is parked, and nothing was compiled.
     state = state_of(Scaled.double)
-    assert state.status is _Status.COMPILED
-    assert state.specialization.arg_count == 2
-    # ... but a bound call passes ``self``, which is not an int.
-    assert assert_python(instances[0].double, 21) == (42, 1)
-    # Called through the class with an int in ``self``'s place, it can run
-    # natively, exactly like the original function would compute.
+    assert state.status is _Status.PARKED
+    assert state.parked_reason is _ParkedReason.WARMUP
+    assert (state.warmup_fits, state.compile_attempts) == (0, 0)
+    assert state.compiled is None
+    assert assert_python(instances[0].double, 21) == (42, 0)
+    # Called through the class with an int in ``self``'s place, a re-probe
+    # compiles it, and it runs natively, exactly like the original function
+    # would compute.
+    while state._hot.parked_calls < _native.REPROBE_INTERVAL:
+        assert assert_python(instances[0].double, 21) == (42, 0)
+    assert assert_python(instances[0].double, 21) == (42, 0)
+    assert state.status is _Status.PARKED
     assert assert_native(Scaled.double, 0, 21) == 42
+    assert (state.status, state.compile_attempts) == (_Status.COMPILED, 1)
+    assert state.specialization.arg_count == 2
 
 
 def test_methods_reading_attributes_stay_in_python():
     instances = [Scaled(i) for i in range(3)]
-    for _ in range(_WARMUP_CALLS + 5):
+    for _ in range(_WARMUP_CALLS + 5 + 2 * _native.REPROBE_INTERVAL):
         for i, instance in enumerate(instances):
             assert instance.scale(10) == 10 * i
-    assert state_of(Scaled.scale).status is _Status.DISABLED
-    assert Scaled.scale.call_count == 3 * (_WARMUP_CALLS + 5)
+    state = state_of(Scaled.scale)
+    assert (state.status, state.compile_attempts) == (_Status.PARKED, 0)
+    assert Scaled.scale.call_count == 3 * (
+        _WARMUP_CALLS + 5 + 2 * _native.REPROBE_INTERVAL
+    )
 
 
 def test_rejects_non_callable():

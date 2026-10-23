@@ -22,6 +22,11 @@ mod program;
 /// function is compiled, a `HotSlot` holds the specialization in Rust, so
 /// a warmed call reads no Python attribute at all.
 ///
+/// The slot also carries the wrapper's miss policy: a compiled function
+/// whose calls keep missing the i64 specialization is *parked*, so that
+/// later calls run the original function without a native attempt, and
+/// it re-probes the specialization now and then (see `HotSlot`).
+///
 /// A function with a `for` loop over `range` is compiled to a program that
 /// no longer mentions `range`. `RangeGuard` proves that the function's
 /// `range` is the builtin and watches its globals and builtins for
@@ -30,7 +35,7 @@ mod program;
 #[pymodule]
 mod _native {
     use std::ffi::c_int;
-    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU32, AtomicU64, Ordering};
     use std::sync::{Mutex, OnceLock};
 
     use pyo3::create_exception;
@@ -98,6 +103,8 @@ mod _native {
         m.add("MAX_ARGS", MAX_ARGS)?;
         m.add("MAX_LOCALS", MAX_LOCALS)?;
         m.add("MAX_JUMPS", MAX_JUMPS)?;
+        m.add("MISS_LIMIT", MISS_LIMIT)?;
+        m.add("REPROBE_INTERVAL", REPROBE_INTERVAL)?;
         // Lets benchmarks record, and warn about, unrepresentative builds.
         m.add("DEBUG_BUILD", cfg!(debug_assertions))?;
         m.add("CodegenError", m.py().get_type::<CodegenError>())?;
@@ -123,6 +130,10 @@ mod _native {
         code: NativeCode,
         /// Diagnostics: how many times `try_call_tuple` ran.
         try_calls: AtomicU64,
+        /// Diagnostics: how many of those returned no native result (a
+        /// guard miss or an error). Counted on the miss path only, so a
+        /// native result costs nothing extra.
+        try_misses: AtomicU64,
     }
 
     #[pymethods]
@@ -147,6 +158,24 @@ mod _native {
         #[getter]
         fn try_calls(&self) -> u64 {
             self.try_calls.load(Ordering::Relaxed)
+        }
+
+        /// How many of the `try_calls` returned no native result: guard
+        /// misses, and any call that raised. `try_calls - try_misses` is
+        /// exactly the number of native results.
+        #[getter]
+        fn try_misses(&self) -> u64 {
+            self.try_misses.load(Ordering::Relaxed)
+        }
+
+        /// `(try_calls, try_misses)`, read together. Holding the GIL, no
+        /// call can run in between, so the pair is consistent.
+        #[getter]
+        fn try_counts(&self) -> (u64, u64) {
+            (
+                self.try_calls.load(Ordering::Relaxed),
+                self.try_misses.load(Ordering::Relaxed),
+            )
         }
 
         /// Run the code with a tuple of exact ints that fit in i64.
@@ -207,14 +236,14 @@ mod _native {
         /// The body of `try_call`, shared with `NativeWrapper`, which calls
         /// it directly instead of through the Python method.
         fn try_call_tuple(&self, args: &Bound<'_, PyTuple>) -> PyResult<Option<i64>> {
-            // Not a locked read-modify-write: callers hold the GIL, which
-            // serializes them, and this counter is only for diagnostics.
-            let try_calls = self.try_calls.load(Ordering::Relaxed);
-            self.try_calls
-                .store(try_calls.wrapping_add(1), Ordering::Relaxed);
+            // Not locked read-modify-writes: callers hold the GIL, which
+            // serializes them, and these counters are only for diagnostics.
+            // Misses are counted where they return, so that a native
+            // result pays for nothing but `try_calls`.
+            bump(&self.try_calls);
             let arg_count = self.code.arg_count();
             if args.len() != arg_count {
-                return Ok(None);
+                return self.miss();
             }
             // Typical functions have a few arguments; avoid a heap
             // allocation for them.
@@ -227,19 +256,35 @@ mod _native {
                 &mut heap[..]
             };
             for (slot, item) in values.iter_mut().zip(args.iter_borrowed()) {
-                match exact_i64_or_none(&item)? {
-                    Some(value) => *slot = value,
-                    None => return Ok(None),
+                match exact_i64_or_none(&item) {
+                    Ok(Some(value)) => *slot = value,
+                    Ok(None) => return self.miss(),
+                    Err(error) => return self.failed(error),
                 }
             }
             match self.code.call(values) {
                 (STATUS_OK, value) => Ok(Some(value)),
-                (STATUS_OVERFLOW | STATUS_BUDGET_EXHAUSTED, _) => Ok(None),
+                (STATUS_OVERFLOW | STATUS_BUDGET_EXHAUSTED, _) => self.miss(),
                 // The arity was checked above, so this is a backend bug.
-                (status, _) => Err(PyRuntimeError::new_err(format!(
+                (status, _) => self.failed(PyRuntimeError::new_err(format!(
                     "unexpected native status {status}"
                 ))),
             }
+        }
+
+        /// Count a guard miss and report it.
+        #[inline(always)]
+        fn miss(&self) -> PyResult<Option<i64>> {
+            bump(&self.try_misses);
+            Ok(None)
+        }
+
+        /// Count a call that raised, as one more call with no native
+        /// result, and raise.
+        #[cold]
+        fn failed(&self, error: PyErr) -> PyResult<Option<i64>> {
+            bump(&self.try_misses);
+            Err(error)
         }
     }
 
@@ -320,8 +365,36 @@ mod _native {
         }
     }
 
+    /// After this many calls in a row that could not run natively, a
+    /// compiled wrapper parks its specialization.
+    ///
+    /// An occasional miss (one float, one overflow) costs one fallback and
+    /// must not throw a useful specialization away: any native result
+    /// starts the count again. 32 misses with no native result in between
+    /// say the calls have changed shape, while bounding what they cost
+    /// before parking to a few microseconds, far less than compiling did.
+    /// A fixed count, never tuned from timings.
+    const MISS_LIMIT: u32 = 32;
+
+    /// A parked wrapper re-probes after this many parked calls: the next
+    /// call that could run natively then tries the specialization again
+    /// (or, if it was parked during warmup, compiles it).
+    ///
+    /// Long enough that a parked function pays about one native attempt
+    /// per 64 calls, at most a nanosecond or two per call on average;
+    /// short enough that a workload that changes back to exact ints gets
+    /// native code again within 64 calls. A fixed count, never tuned from
+    /// timings.
+    const REPROBE_INTERVAL: u32 = 64;
+
+    /// `HotSlot` modes.
+    const ACTIVE: u8 = 0;
+    const PARKED: u8 = 1;
+    const RETIRED: u8 = 2;
+
     /// One wrapper's compiled specialization, held in Rust so that a warmed
-    /// call reads no Python attribute (see `speedysnek._decorator`).
+    /// call reads no Python attribute (see `speedysnek._decorator`), and the
+    /// wrapper's miss policy.
     ///
     /// `snekit` gives one empty slot to both the `NativeWrapper` and its
     /// `_JitState`. The state publishes its specialization into it once,
@@ -332,14 +405,29 @@ mod _native {
     ///
     /// - Write-once: `publish` succeeds at most once, and what it stored is
     ///   never changed or dropped before the slot itself.
-    /// - One-way: once retired, the slot is never used again.
+    /// - One-way retirement: once retired, the slot is never used again.
     /// - Only a genuine `I64Function` or `GuardedI64Function` is published.
     ///   Anything else (only test doubles use another `function`) leaves
     ///   the slot empty, and the wrapper keeps reading the state.
     ///
+    /// Its `mode` is active, parked or retired. Only the state changes it,
+    /// with `park`, `unpark` and `retire`, in step with its `status`; the
+    /// wrapper asks the state to when a call shows it is time:
+    ///
+    /// - While active and published, calls use the slot. `misses` counts
+    ///   the calls in a row that could not run natively (keywords, another
+    ///   arity, a guard miss); a native result resets it. The call that
+    ///   makes it `MISS_LIMIT` asks the state to park.
+    /// - While parked, published or not (a function parked during warmup
+    ///   has nothing to publish yet), calls run the original function
+    ///   without a native attempt and count `parked_calls`. Once it has
+    ///   reached `REPROBE_INTERVAL`, the next call that could run natively
+    ///   is a re-probe, and starts the count again.
+    ///
     /// Reading it costs two atomic loads and takes no lock. It holds strong
     /// references to everything a native call uses, and the wrapper holds
-    /// the slot, so nothing is freed while a call runs.
+    /// the slot, so nothing is freed while a call runs. The counters are
+    /// plain loads and stores: every caller holds the GIL.
     ///
     /// It is not tracked by the garbage collector: a code object, an
     /// `I64Function` and a `RangeGuard` are not either, so no reference
@@ -347,7 +435,12 @@ mod _native {
     #[pyclass(frozen, module = "speedysnek._native")]
     struct HotSlot {
         hot: OnceLock<Hot>,
-        retired: AtomicBool,
+        mode: AtomicU8,
+        /// While active: calls in a row that could not run natively.
+        misses: AtomicU32,
+        /// While parked: calls since parking or the last re-probe, at most
+        /// `REPROBE_INTERVAL`.
+        parked_calls: AtomicU32,
     }
 
     /// What a published `HotSlot` holds.
@@ -366,7 +459,9 @@ mod _native {
         fn new() -> Self {
             HotSlot {
                 hot: OnceLock::new(),
-                retired: AtomicBool::new(false),
+                mode: AtomicU8::new(ACTIVE),
+                misses: AtomicU32::new(0),
+                parked_calls: AtomicU32::new(0),
             }
         }
 
@@ -404,25 +499,102 @@ mod _native {
 
         /// Stop every later call from using the slot. Idempotent.
         fn retire(&self) {
-            self.retired.store(true, Ordering::Release);
+            self.mode.store(RETIRED, Ordering::Release);
         }
 
-        /// Whether calls can use the slot: published and not retired. A
-        /// diagnostic for tests.
+        /// Park an active slot: later calls run the original function and
+        /// count towards the next re-probe. Returns whether it parked; a
+        /// parked or retired slot stays as it is.
+        fn park(&self) -> bool {
+            let parked = self
+                .mode
+                .compare_exchange(ACTIVE, PARKED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
+            if parked {
+                self.parked_calls.store(0, Ordering::Relaxed);
+            }
+            parked
+        }
+
+        /// Make a parked slot active again, with no misses counted. Returns
+        /// whether it changed; an active or retired slot stays as it is.
+        fn unpark(&self) -> bool {
+            self.misses.store(0, Ordering::Relaxed);
+            self.mode
+                .compare_exchange(PARKED, ACTIVE, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        }
+
+        /// Whether calls can use the slot: published, active and not
+        /// retired. A diagnostic for tests.
         #[getter]
         fn live(&self) -> bool {
             self.get().is_some()
         }
+
+        /// Whether the slot is parked. A diagnostic.
+        #[getter]
+        fn parked(&self) -> bool {
+            self.mode.load(Ordering::Acquire) == PARKED
+        }
+
+        /// While active, the calls in a row that could not run natively. A
+        /// diagnostic.
+        #[getter]
+        fn misses(&self) -> u32 {
+            self.misses.load(Ordering::Relaxed)
+        }
+
+        /// While parked, the calls since parking or the last re-probe, at
+        /// most `REPROBE_INTERVAL`. A diagnostic.
+        #[getter]
+        fn parked_calls(&self) -> u32 {
+            self.parked_calls.load(Ordering::Relaxed)
+        }
     }
 
     impl HotSlot {
-        /// The published specialization, unless the slot is retired.
+        /// The published specialization, if the slot is active.
         #[inline]
         fn get(&self) -> Option<&Hot> {
-            if self.retired.load(Ordering::Acquire) {
+            if self.mode.load(Ordering::Acquire) != ACTIVE {
                 return None;
             }
             self.hot.get()
+        }
+
+        /// A call that used the slot ran natively.
+        #[inline]
+        fn hit(&self) {
+            self.misses.store(0, Ordering::Relaxed);
+        }
+
+        /// A call that used the slot could not run natively. Returns `true`
+        /// exactly once per run of misses, on the one that reaches
+        /// `MISS_LIMIT`.
+        #[inline]
+        fn miss(&self) -> bool {
+            let misses = self.misses.load(Ordering::Relaxed).saturating_add(1);
+            self.misses.store(misses, Ordering::Relaxed);
+            misses == MISS_LIMIT
+        }
+
+        /// Count a parked call. Returns whether the interval has passed, so
+        /// that this call may re-probe if it could run natively.
+        #[inline]
+        fn reprobe_due(&self) -> bool {
+            let calls = self.parked_calls.load(Ordering::Relaxed);
+            if calls >= REPROBE_INTERVAL {
+                return true;
+            }
+            self.parked_calls.store(calls + 1, Ordering::Relaxed);
+            false
+        }
+
+        /// A re-probe is being made: start the interval again.
+        #[inline]
+        fn reprobing(&self) {
+            self.parked_calls.store(0, Ordering::Relaxed);
         }
     }
 
@@ -438,13 +610,16 @@ mod _native {
     /// Compilation and every state transition stay in the Python
     /// `_JitState`; this object only reads `state._specialization` (the
     /// slot behind its `specialization` property) and `state.status` and
-    /// calls the state's `cold_call`, `invalidate`, `binding_changed` and
-    /// `native_failed` methods. It binds as a method like a function.
+    /// calls the state's `cold_call`, `invalidate`, `binding_changed`,
+    /// `native_failed`, `repeated_misses`, `reprobe_succeeded` and `reprobe`
+    /// methods. It binds as a method like a function.
     ///
     /// While its `HotSlot` is live, a call that can use the slot reads none
     /// of the state's attributes: the slot holds the same specialization,
     /// and every call that would make the state change goes to the generic
-    /// path, which makes the change exactly as before.
+    /// path, which makes the change exactly as before. While the slot is
+    /// parked, a call reads none of them either: it runs the original
+    /// function, and only a re-probe calls into the state.
     ///
     /// Metadata copied by `functools.update_wrapper` lives in the instance
     /// `__dict__`, except `__annotate__` and `__annotations__`, which behave
@@ -566,24 +741,22 @@ mod _native {
                 self.carry(py)?;
             }
             let func = self.func.bind(py);
-            if let Some(hot) = self.hot_specialization(py) {
-                // The slot holds exactly `state.specialization`, so each
-                // outcome below is the generic path's for the same call.
-                if kwargs.is_some_and(|kwargs| !kwargs.is_empty()) {
-                    return func.call(args, kwargs);
+            if let Some(slot) = self.slot() {
+                match slot.mode.load(Ordering::Acquire) {
+                    ACTIVE => {
+                        if let Some(hot) = slot.hot.get()
+                            && self.is_current(py, hot)
+                        {
+                            return self.hot_call(py, slot, hot, args, kwargs);
+                        }
+                    }
+                    PARKED => {
+                        if let Some(result) = self.parked_call(py, slot, args, kwargs)? {
+                            return Ok(result);
+                        }
+                    }
+                    _ => {}
                 }
-                let function = hot.function.get();
-                // As in the generic path, a call with another arity (an
-                // omitted default) makes no native call at all.
-                if args.len() != function.code.arg_count() {
-                    return func.call(args, kwargs);
-                }
-                match function.try_call_tuple(args) {
-                    Ok(Some(value)) => return Ok(value.into_pyobject(py)?.into_any()),
-                    Ok(None) => {}
-                    Err(error) => self.native_failed(py, error)?,
-                }
-                return func.call(args, kwargs);
             }
             let state = self.state.bind(py);
             let mut spec = state.getattr(intern!(py, "_specialization"))?;
@@ -591,7 +764,15 @@ mod _native {
                 if !state.getattr(intern!(py, "status"))?.is(&self.cold) {
                     return func.call(args, kwargs);
                 }
-                spec = state.call_method0(intern!(py, "cold_call"))?;
+                // Warmup profile: could this call have run natively? Its
+                // positional count when it could (the state checks it
+                // against the function's arity), -1 when it could not.
+                let fits = if kwargs.is_none_or(|kwargs| kwargs.is_empty()) && exact_i64s(args) {
+                    args.len() as isize
+                } else {
+                    -1
+                };
+                spec = state.call_method1(intern!(py, "cold_call"), (fits,))?;
                 if spec.is_none() {
                     return func.call(args, kwargs);
                 }
@@ -752,18 +933,23 @@ mod _native {
     }
 
     impl NativeWrapper {
-        /// The specialization in the hot slot, if this call may use it: the
-        /// slot is live, and the function's current `__code__` and `range`
-        /// binding are still the ones compiled for. Reads no Python
-        /// attribute. `None` sends the call to the generic path, which
-        /// makes the state transition a stale `__code__` or a failed range
-        /// guard calls for.
-        #[inline]
-        fn hot_specialization(&self, _py: Python<'_>) -> Option<&Hot> {
+        /// The hot slot, if this wrapper may use one: it has a slot and
+        /// wraps a Python function.
+        #[inline(always)]
+        fn slot(&self) -> Option<&HotSlot> {
             if !self.plain_function {
                 return None;
             }
-            let hot = self.hot.as_ref()?.get().get()?;
+            Some(self.hot.as_ref()?.get())
+        }
+
+        /// Whether the function's current `__code__` and `range` binding
+        /// are still the ones `hot` was compiled for. Reads no Python
+        /// attribute. When they are not, the call takes the generic path,
+        /// which makes the state transition a stale `__code__` or a failed
+        /// range guard calls for.
+        #[inline(always)]
+        fn is_current(&self, _py: Python<'_>, hot: &Hot) -> bool {
             // SAFETY: `func` is a `FunctionType` (checked when the wrapper
             // was made; it is never replaced), it is alive because `self`
             // owns it, and `_py` proves the GIL is held. `PyFunction_GetCode`
@@ -771,14 +957,120 @@ mod _native {
             // dereferenced. It cannot fail for a function.
             let code = unsafe { ffi::PyFunction_GetCode(self.func.as_ptr()) };
             if code != hot.code.as_ptr() {
-                return None;
+                return false;
             }
-            if let Some(guard) = &hot.guard
-                && !guard.get().guard.valid()
+            hot.guard
+                .as_ref()
+                .is_none_or(|guard| guard.get().guard.valid())
+        }
+
+        /// A call through the live slot. The slot holds exactly
+        /// `state.specialization`, so each outcome is the generic path's
+        /// for the same call; it also counts native results and misses.
+        #[inline(always)]
+        fn hot_call<'py>(
+            &self,
+            py: Python<'py>,
+            slot: &HotSlot,
+            hot: &Hot,
+            args: &Bound<'py, PyTuple>,
+            kwargs: Option<&Bound<'py, PyDict>>,
+        ) -> PyResult<Bound<'py, PyAny>> {
+            let func = self.func.bind(py);
+            let function = hot.function.get();
+            // As in the generic path, a call with keywords or another
+            // arity (an omitted default) makes no native call at all.
+            if kwargs.is_some_and(|kwargs| !kwargs.is_empty())
+                || args.len() != function.code.arg_count()
             {
-                return None;
+                self.missed(py, slot)?;
+                return func.call(args, kwargs);
             }
-            Some(hot)
+            match function.try_call_tuple(args) {
+                Ok(Some(value)) => {
+                    slot.hit();
+                    return Ok(value.into_pyobject(py)?.into_any());
+                }
+                Ok(None) => self.missed(py, slot)?,
+                Err(error) => self.native_failed(py, error)?,
+            }
+            func.call(args, kwargs)
+        }
+
+        /// Count a call that could not run natively; on the `MISS_LIMIT`th
+        /// in a row, ask the state to park the specialization.
+        #[inline(always)]
+        fn missed(&self, py: Python<'_>, slot: &HotSlot) -> PyResult<()> {
+            if slot.miss() {
+                return self.repeated_misses(py);
+            }
+            Ok(())
+        }
+
+        #[cold]
+        #[inline(never)]
+        fn repeated_misses(&self, py: Python<'_>) -> PyResult<()> {
+            self.state
+                .bind(py)
+                .call_method0(intern!(py, "repeated_misses"))?;
+            Ok(())
+        }
+
+        /// A call while the slot is parked: the original function, with no
+        /// native attempt, except for a re-probe.
+        ///
+        /// Once `REPROBE_INTERVAL` parked calls have passed, the next call
+        /// that could run natively (no keywords, only exact ints in i64,
+        /// and, when compiled, the compiled arity) is the re-probe: it
+        /// tries the specialization, and unparks it if that gives a native
+        /// result, or, for a function parked during warmup, asks the state
+        /// to compile it. Other calls never pay for a native attempt.
+        ///
+        /// Returns `None` to send the call to the generic path: when
+        /// `__code__` or the range binding changed, which disables the
+        /// specialization exactly as for a live slot, or when a re-probe
+        /// just compiled the function, which then runs the call natively.
+        fn parked_call<'py>(
+            &self,
+            py: Python<'py>,
+            slot: &HotSlot,
+            args: &Bound<'py, PyTuple>,
+            kwargs: Option<&Bound<'py, PyDict>>,
+        ) -> PyResult<Option<Bound<'py, PyAny>>> {
+            let func = self.func.bind(py);
+            let hot = slot.hot.get();
+            if let Some(hot) = hot
+                && !self.is_current(py, hot)
+            {
+                return Ok(None);
+            }
+            if !slot.reprobe_due()
+                || kwargs.is_some_and(|kwargs| !kwargs.is_empty())
+                || hot.is_some_and(|hot| args.len() != hot.function.get().code.arg_count())
+                || !exact_i64s(args)
+            {
+                return func.call(args, kwargs).map(Some);
+            }
+            slot.reprobing();
+            let state = self.state.bind(py);
+            let Some(hot) = hot else {
+                // Parked during warmup: nothing is compiled yet. The state
+                // checks the arity and compiles at most once.
+                let spec = state.call_method1(intern!(py, "reprobe"), (args.len(),))?;
+                if spec.is_none() {
+                    return func.call(args, kwargs).map(Some);
+                }
+                return Ok(None);
+            };
+            match hot.function.get().try_call_tuple(args) {
+                Ok(Some(value)) => {
+                    state.call_method0(intern!(py, "reprobe_succeeded"))?;
+                    return Ok(Some(value.into_pyobject(py)?.into_any()));
+                }
+                Ok(None) => {}
+                Err(error) => self.native_failed(py, error)?,
+            }
+            func.call(args, kwargs).map(Some)
         }
 
         /// Report an error from the native attempt to the state, which
@@ -900,8 +1192,23 @@ mod _native {
         }
     }
 
+    /// Whether every argument is an exact `int` in the signed 64-bit range,
+    /// as the fast path requires. Runs no Python code.
+    fn exact_i64s(args: &Bound<'_, PyTuple>) -> bool {
+        args.iter_borrowed()
+            .all(|item| matches!(exact_i64_or_none(&item), Ok(Some(_))))
+    }
+
     /// Arguments that `try_call` passes without a heap allocation.
     const INLINE_ARGS: usize = 8;
+
+    /// Add one to a diagnostic counter. A load and a store, not a locked
+    /// read-modify-write: every caller holds the GIL.
+    #[inline]
+    fn bump(counter: &AtomicU64) {
+        let value = counter.load(Ordering::Relaxed);
+        counter.store(value.wrapping_add(1), Ordering::Relaxed);
+    }
 
     /// Compile a serialized program (see `src/program.rs`) for exactly
     /// `arg_count` arguments.
@@ -954,6 +1261,7 @@ mod _native {
         Ok(I64Function {
             code,
             try_calls: AtomicU64::new(0),
+            try_misses: AtomicU64::new(0),
         })
     }
 

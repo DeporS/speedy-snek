@@ -310,6 +310,7 @@ that are not part of the pyperf suite and do not update the baseline:
 | [`loops`](experiments/loops.md) | Warmed `while` loops run 20–30× faster than plain Python from 1,000 iterations up; the backedge budget is cheap, and a call that exhausts it is about 3% slower than plain Python. Analysis plus compilation takes about a millisecond per function. |
 | [`for_range`](experiments/for_range.md) | Warmed `for` loops over `range(n)` run as fast as the equivalent `while` loops (21–24× faster than plain Python at 10,000 iterations); the range guard costs under 10 µs once and nothing measurable on functions that do not use `range`. |
 | [`hot_slot`](experiments/hot_slot.md) | Keeping a compiled wrapper's specialization in a write-once Rust slot removes every Python attribute lookup from a warmed call: 42% fewer instructions for `a + b` (about half the time) and 25–36% fewer for the other compiled cases, guard misses and omitted defaults; a disabled wrapper executes 0.4% more, with no measurable slowdown. Adopted. |
+| [`miss_policy`](experiments/miss_policy.md) | Parking a wrapper whose calls do not fit its i64 specialization: warmed native calls execute 1–3 more instructions (≤0.2%); a float-only function is no longer compiled (its first nine calls take 26 µs instead of 15 ms); parked calls execute 3–10% fewer instructions than the old guard miss, and repeated overflow saves the most. Adopted. |
 
 `benchmarks/tests/test_wrapper_experiment.py` keeps the experiment's
 prototype honest against the production wrapper.
