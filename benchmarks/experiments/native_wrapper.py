@@ -32,10 +32,10 @@ Before anything is timed, every case is verified:
   a warmed call makes one native call and no Python call, a guard miss
   one of each, and every other fallback one Python call and no native
   call;
-- for ``native_wrapper``, a canary ``I64Function`` that returns a
-  constant is swapped into the specialization, and the wrapper must
-  return that constant: the direct Rust path really runs
-  ``spec.function``'s machine code.
+- for ``native_wrapper``, a second wrapper of the same function is
+  compiled to a canary ``I64Function`` that returns a constant, and it
+  must return that constant: the direct Rust path really runs the
+  compiled machine code.
 """
 
 from __future__ import annotations
@@ -55,14 +55,20 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import workloads  # noqa: E402
-from speedysnek import _native, snekit  # noqa: E402
+from speedysnek import _compiler, _native, snekit  # noqa: E402
+from speedysnek._compiler import CompiledI64  # noqa: E402
 from speedysnek._decorator import _JitState, _Status  # noqa: E402
 
 # --- The variants ---------------------------------------------------------
 
 
 def python_wrapper(func: Callable[..., Any]) -> Callable[..., Any]:
-    """The Python wrapper ``snekit`` returned before this experiment."""
+    """The Python wrapper ``snekit`` returned before this experiment.
+
+    Verbatim, except that it reads ``state._specialization``: the slot that
+    was then the plain ``specialization`` attribute, which is now a
+    property in front of it.
+    """
     if not callable(func):
         raise TypeError(f"snekit expected a callable, got {type(func).__name__}")
 
@@ -72,7 +78,7 @@ def python_wrapper(func: Callable[..., Any]) -> Callable[..., Any]:
     @functools.wraps(func)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         wrapper.call_count += 1
-        spec = state.specialization
+        spec = state._specialization
         if spec is None:
             if state.status is not cold:
                 return func(*args, **kwargs)
@@ -249,18 +255,26 @@ def verify(name: str, variant: str, case: Case, python: Case) -> None:
 
 
 def _verify_canary(where: str, case: Case) -> None:
-    spec = case.wrapper._jit_state.specialization
-    real = spec.function
-    canary = _native.compile_i64(
-        ((_native.OP_LOAD_CONST, 424242), (_native.OP_RETURN,)), real.arg_count
-    )
-    spec.function = canary
+    # The published specialization is immutable, so the canary is what a
+    # second wrapper of the same function compiles to.
+    real = _compiler.compile_i64
+
+    def compile_canary(instructions: Any, arg_count: int, **kwargs: Any) -> Any:
+        canary = _native.compile_i64(
+            ((_native.OP_LOAD_CONST, 424242), (_native.OP_RETURN,)), arg_count
+        )
+        return CompiledI64(canary, tuple(instructions))
+
+    _compiler.compile_i64 = compile_canary
     try:
-        with _frames(case.func.__code__) as frames:
-            result = case.call()
+        wrapper = _warm(snekit(case.func), *case.args)
     finally:
-        spec.function = real
-    if (result, frames[0], canary.try_calls) != (424242, 0, 1):
+        _compiler.compile_i64 = real
+    canary = wrapper._jit_state.specialization.function
+    before = canary.try_calls
+    with _frames(case.func.__code__) as frames:
+        result = wrapper(*case.args, **case.kwargs)
+    if (result, frames[0], canary.try_calls - before) != (424242, 0, 1):
         raise SetupError(f"{where}: the canary machine code did not run")
 
 

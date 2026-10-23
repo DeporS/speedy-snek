@@ -1148,6 +1148,39 @@ def test_a_global_shadowing_custom_builtins_after_compilation():
     assert path_of(wrapped, 3) == (3 + 4, "python")
 
 
+def test_the_hot_slot_holds_the_range_guard():
+    namespace = {}
+    wrapped = compiled_in(namespace)
+    state = wrapped._jit_state
+    assert state._hot.live
+    function = state.compiled.function
+    calls = function.try_calls
+    # The guard is checked before every native call, without reading the
+    # JIT state: a failed guard sends the call to the generic path, which
+    # disables the specialization exactly as before.
+    namespace["range"] = lambda n: RANGE(1)
+    assert path_of(wrapped, 5) == (0, "python")
+    assert function.try_calls == calls
+    assert state.disabled_reason is _DisabledReason.RANGE_CHANGED
+    assert state.specialization is None
+    assert not state._hot.live
+    # Restoring the builtin does not revive the slot.
+    del namespace["range"]
+    assert wrapped(5) == 10
+    assert function.try_calls == calls
+    assert not state._hot.live
+
+
+def test_a_range_change_between_two_hot_calls_is_noticed():
+    namespace = {}
+    wrapped = compiled_in(namespace)
+    for k in range(20):
+        assert path_of(wrapped, k) == (k * (k - 1) // 2, "native")
+    namespace["range"] = RANGE
+    assert path_of(wrapped, 5) == (10, "python")
+    assert not wrapped._jit_state._hot.live
+
+
 def test_code_and_range_invalidation_work_together():
     other = """
 def g(n):

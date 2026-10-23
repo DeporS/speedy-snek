@@ -1,6 +1,7 @@
 """Type stubs for the private Rust extension module."""
 
 from collections.abc import Callable
+from types import CodeType
 from typing import Any, final
 
 # Wire-format opcodes for ``compile_i64`` programs (see ``src/program.rs``).
@@ -116,6 +117,24 @@ class GuardedI64Function:
     def try_call(self, args: tuple[object, ...], /) -> int | None: ...
 
 @final
+class HotSlot:
+    """One wrapper's compiled specialization, held in Rust.
+
+    Write-once and one-way: ``publish`` succeeds at most once, and a
+    retired slot is never used again. Only a genuine ``I64Function`` or
+    ``GuardedI64Function`` is published; anything else leaves it empty.
+    """
+
+    def __init__(self) -> None: ...
+    def publish(
+        self, code: CodeType, function: I64Function | GuardedI64Function | object, /
+    ) -> None: ...
+    def retire(self) -> None: ...
+    @property
+    def live(self) -> bool:
+        """Published and not retired: whether calls can use the slot."""
+
+@final
 class NativeWrapper:
     """The callable ``@snekit`` returns; its per-call logic is in Rust.
 
@@ -130,7 +149,12 @@ class NativeWrapper:
     __annotate__: Callable[[int], dict[str, Any]] | None
     __annotations__: dict[str, Any]
     def __init__(
-        self, func: Callable[..., Any], state: object, cold: object, /
+        self,
+        func: Callable[..., Any],
+        state: object,
+        cold: object,
+        hot: HotSlot | None = None,
+        /,
     ) -> None: ...
     def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
     def __get__(self, instance: object, owner: type | None = None, /) -> Any: ...

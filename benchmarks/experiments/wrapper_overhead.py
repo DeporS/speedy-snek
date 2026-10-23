@@ -109,7 +109,7 @@ def _positional_source(count: int) -> str:
         f"    def wrapper({params}, /, *args, **kwargs):\n"
         "        wrapper.call_count += 1\n"
         f"        if {slots[-1]} is not _missing and not args and not kwargs:\n"
-        "            spec = state.specialization\n"
+        "            spec = state._specialization\n"
         "            if spec is None:\n"
         "                if state.status is not cold:\n"
         f"                    return func({names})\n"
@@ -131,7 +131,7 @@ def _positional_source(count: int) -> str:
         f"            return func({names})\n"
         + "".join(prefix)
         + "        args = given + args\n"
-        "        spec = state.specialization\n"
+        "        spec = state._specialization\n"
         "        if spec is None:\n"
         "            if state.status is not cold:\n"
         "                return func(*args, **kwargs)\n"
@@ -183,7 +183,7 @@ def no_arity_check(func: Callable[..., Any]) -> Callable[..., Any]:
     @functools.wraps(func)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         wrapper.call_count += 1
-        spec = state.specialization
+        spec = state._specialization
         if spec is None:
             if state.status is not cold:
                 return func(*args, **kwargs)
@@ -214,7 +214,7 @@ def dict_counter(func: Callable[..., Any]) -> Callable[..., Any]:
     @functools.wraps(func)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         counters["call_count"] += 1
-        spec = state.specialization
+        spec = state._specialization
         if spec is None:
             if state.status is not cold:
                 return func(*args, **kwargs)
@@ -244,7 +244,7 @@ def floor(func: Callable[..., Any]) -> Callable[..., Any]:
 
     @functools.wraps(func)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
-        spec = state.specialization
+        spec = state._specialization
         if spec is None:
             state.cold_call()
             return func(*args, **kwargs)
@@ -260,7 +260,7 @@ def _exact_source(count: int) -> str:
         "def _factory(func, state):\n"
         f"    def wrapper({names}, /):\n"
         "        wrapper.call_count += 1\n"
-        "        spec = state.specialization\n"
+        "        spec = state._specialization\n"
         "        if spec is None:\n"
         "            state.cold_call()\n"
         f"            return func({names})\n"

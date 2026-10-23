@@ -179,6 +179,23 @@ def test_wrappers_held_elsewhere_keep_working():
     assert wrapper._jit_state.status is _Status.COMPILED
 
 
+def test_bitten_wrappers_use_their_hot_slot_before_and_after_chill():
+    module = bitten_module()
+    wrapper = module.sum_squares
+    warm(wrapper, 100)
+    state = wrapper._jit_state
+    # Rebinding a module global changes nothing the range guard watches.
+    assert state._hot.live
+    function = state.compiled.function
+    calls = function.try_calls
+    assert wrapper(100) == 328350
+    chill(module, quiet=True)
+    assert state._hot.live
+    assert wrapper(100) == 328350
+    assert function.try_calls == calls + 2
+    assert state.status is _Status.COMPILED
+
+
 def test_chill_never_calls_candidates():
     calls = []
     module = bitten_module()
