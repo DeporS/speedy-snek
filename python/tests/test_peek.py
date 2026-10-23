@@ -249,14 +249,15 @@ def test_the_hot_slot_changes_nothing_peek_reports():
 
 
 def test_frontend_rejection():
+    # Called with an int, so that warmup does not park it.
     wrapper = snekit(greet)
     for _ in range(5):
-        wrapper("snek")
+        wrapper(1)
     finding = peek_one(wrapper)
     # Still warming up: nothing has been tried yet.
     assert finding.status == "cold"
     for _ in range(_WARMUP_CALLS):
-        wrapper("snek")
+        wrapper(1)
     finding = peek_one(wrapper)
     state = wrapper._jit_state
     assert finding.status == "disabled"
@@ -768,7 +769,7 @@ def test_rendered_compiled_finding():
         calls observed:   100
         warmup calls:     8
         compile attempts: 1
-        native attempts:  92
+        native attempts:  92 (92 ran natively, 0 fell back to Python)
         compiler:         Cranelift i64 specialization"""
     )
 
@@ -776,7 +777,7 @@ def test_rendered_compiled_finding():
 def test_rendered_disabled_and_not_bitten_findings():
     wrapper = snekit(greet)
     for _ in range(_WARMUP_CALLS + 1):
-        wrapper("snek")
+        wrapper(1)
     line = greet.__code__.co_firstlineno + 1
     assert peek(wrapper, quiet=True).render() == textwrap.dedent(
         f"""\
@@ -812,8 +813,9 @@ def test_rendered_module_report():
         module.sum_squares(10)
         module.shout("hi")
     module.clamp(1, 2)
+    fits = "0 of 8 warmup calls fit (one positional, exact 64-bit int per parameter)"
     expected = textwrap.dedent(
-        """\
+        f"""\
         🐍 Snek peeked at peek_sample.
 
         sum_squares
@@ -822,7 +824,7 @@ def test_rendered_module_report():
           calls observed:   10
           warmup calls:     8
           compile attempts: 1
-          native attempts:  2
+          native attempts:  2 (2 ran natively, 0 fell back to Python)
           compiler:         Cranelift i64 specialization
 
         clamp
@@ -832,20 +834,23 @@ def test_rendered_module_report():
           compile attempts: 0
 
         shout
-          status:           disabled
+          status:           parked
           calls observed:   10
           warmup calls:     8
-          compile attempts: 1
-          reason:           f-strings are not supported (line 35)
+          compile attempts: 0
+          reason:           calls have not matched the i64 specialization
+          detail:           {fits}
+          re-probe:         every 64 parked calls; next after 63 more calls
 
-        1 compiled, 1 cold, 1 disabled."""
+        1 compiled, 1 parked, 1 cold, 0 disabled."""
     )
     report = peek(module, quiet=True)
     assert report.render() == expected
     assert str(report) == expected
-    assert [len(report.compiled), len(report.cold), len(report.disabled)] == [1, 1, 1]
-    assert report.not_bitten == ()
-    assert repr(report) == "<PeekReport: 1 compiled, 1 cold, 1 disabled>"
+    counts = [len(report.compiled), len(report.parked), len(report.cold)]
+    assert counts == [1, 1, 1]
+    assert report.disabled == report.not_bitten == ()
+    assert repr(report) == "<PeekReport: 1 compiled, 1 parked, 1 cold>"
 
 
 def test_finding_repr_and_str():

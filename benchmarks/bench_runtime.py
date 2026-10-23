@@ -31,6 +31,13 @@ Benchmark names:
   undecorated.
 - ``fallback.<case>.fast_call``: for the guard-miss cases only, the
   wrapper's native fast call on a prebuilt tuple, returning ``None``.
+
+  Each fallback benchmark repeats one call, so it measures a steady state.
+  A guard-miss wrapper parks after ``_native.MISS_LIMIT`` misses in a row
+  (see ``speedysnek._decorator``), so ``fallback.<case>.snekit`` for those
+  cases is the parked path, with a re-probe every
+  ``_native.REPROBE_INTERVAL`` calls where the arguments fit the types.
+  ``experiments/miss_policy.py`` compares it with the old miss path.
 """
 
 from __future__ import annotations

@@ -1,9 +1,9 @@
 """``peek``: report what SpeedySnek did with a decorated function.
 
 ``peek`` is diagnostics only. It reads the state a ``@snekit`` wrapper
-already keeps (its ``call_count``, its ``_JitState`` and, once compiled,
-the native function's own attempt counter) and turns it into a small,
-stable report::
+already keeps (its ``call_count``, its ``_JitState``, its hot slot and,
+once compiled, the native function's own attempt and miss counters) and
+turns it into a small, stable report::
 
     import calculations
     import speedysnek as snek
@@ -35,7 +35,13 @@ from collections.abc import Iterable, Iterator
 from types import FunctionType, MethodType, ModuleType
 from typing import Any, TextIO
 
-from ._decorator import _WARMUP_CALLS, _DisabledReason, _JitState, _Status
+from ._decorator import (
+    _WARMUP_CALLS,
+    _DisabledReason,
+    _JitState,
+    _ParkedReason,
+    _Status,
+)
 from ._hunt import (
     _MODULE_DICT,
     _TYPE_NAME,
@@ -48,6 +54,7 @@ from ._nosnek import _is_opted_out
 
 COLD = "cold"
 COMPILED = "compiled"
+PARKED = "parked"
 DISABLED = "disabled"
 NOT_BITTEN = "not_bitten"
 
@@ -71,6 +78,8 @@ _DISABLED_SUMMARIES = {
     _DisabledReason.RANGE_CHANGED: "its range binding changed after compilation",
 }
 
+_PARKED_SUMMARY = "calls have not matched the i64 specialization"
+
 # The labels ``render`` uses, all padded to one width.
 _WIDTH = len("compile attempts: ")
 
@@ -89,8 +98,10 @@ class PeekFinding:
     - ``function``: the Python function the wrapper runs, read from its JIT
       state, not ``__wrapped__``; for a function that is not bitten, the
       function itself.
-    - ``status``: ``"cold"``, ``"compiled"``, ``"disabled"`` or
-      ``"not_bitten"``.
+    - ``status``: ``"cold"``, ``"compiled"``, ``"parked"``, ``"disabled"``
+      or ``"not_bitten"``. Parked means the function runs as Python for
+      now, because its calls did not fit the i64 specialization; unlike
+      disabled, a later call that fits re-probes it.
     - ``summary``: a short, human-readable explanation.
     - ``call_count``: the wrapper's ``call_count``: calls it has observed,
       raising ones included. Users can assign it, so it is not proof.
@@ -104,14 +115,21 @@ class PeekFinding:
       arguments and either returned a native result or fell back to Python
       (a non-``int`` argument, overflow, an exhausted loop budget), so this
       is not a count of native results. ``None`` before compilation.
+    - ``native_hits`` and ``native_misses``: of those attempts, the ones
+      that returned a native result and the ones that fell back; they add
+      up to ``native_attempts``. ``None`` before compilation.
+    - ``reprobe_remaining``: while parked, how many more parked calls run
+      before a call that fits re-probes; 0 when the next call that fits
+      will. ``None`` otherwise.
     - ``compiler``: what compilation produced, such as ``"Cranelift i64
       specialization"``; ``None`` if nothing was compiled.
     - ``reason``: when disabled, the stable reason code, such as
-      ``"rejected"`` or ``"code_changed"``; ``"opted_out"`` for a function
-      that is not bitten because it is marked with ``@nosnek``; ``None``
-      otherwise.
-    - ``detail``: when disabled, the underlying diagnostic message, where
-      there is one.
+      ``"rejected"`` or ``"code_changed"``; when parked,
+      ``"warmup_mismatch"`` or ``"repeated_misses"``; ``"opted_out"`` for a
+      function that is not bitten because it is marked with ``@nosnek``;
+      ``None`` otherwise.
+    - ``detail``: when disabled or parked, the underlying diagnostic
+      message, where there is one.
     - ``lineno``: the source line of a rejected instruction, where known.
     - ``rejection``: the frontend's ``Rejection`` when it rejected the
       function; ``compile_error`` and ``native_error``: the stored
@@ -130,8 +148,11 @@ class PeekFinding:
         "names",
         "native_attempts",
         "native_error",
+        "native_hits",
+        "native_misses",
         "reason",
         "rejection",
+        "reprobe_remaining",
         "status",
         "summary",
         "warmup_calls",
@@ -153,6 +174,9 @@ class PeekFinding:
         warmup_remaining: int | None = None,
         compile_attempts: int | None = None,
         native_attempts: int | None = None,
+        native_hits: int | None = None,
+        native_misses: int | None = None,
+        reprobe_remaining: int | None = None,
         compiler: str | None = None,
         reason: str | None = None,
         detail: str | None = None,
@@ -172,6 +196,9 @@ class PeekFinding:
         self.warmup_remaining = warmup_remaining
         self.compile_attempts = compile_attempts
         self.native_attempts = native_attempts
+        self.native_hits = native_hits
+        self.native_misses = native_misses
+        self.reprobe_remaining = reprobe_remaining
         self.compiler = compiler
         self.reason = reason
         self.detail = detail
@@ -199,13 +226,34 @@ class PeekFinding:
         if self.compile_attempts is not None:
             rows.append(("compile attempts", str(self.compile_attempts)))
         if self.native_attempts is not None:
-            rows.append(("native attempts", str(self.native_attempts)))
+            attempts = str(self.native_attempts)
+            if self.native_hits is not None and self.native_misses is not None:
+                attempts += (
+                    f" ({self.native_hits} ran natively, "
+                    f"{self.native_misses} fell back to Python)"
+                )
+            rows.append(("native attempts", attempts))
         if self.compiler is not None:
             compiler = self.compiler
-            if self.status != COMPILED:
+            if self.status == PARKED:
+                compiler += " (not used while parked)"
+            elif self.status != COMPILED:
                 compiler += " (no longer used)"
             rows.append(("compiler", compiler))
-        if self.status == DISABLED:
+        if self.status == PARKED:
+            rows.append(("reason", self.summary))
+            if self.detail is not None:
+                rows.append(("detail", self.detail))
+            if self.reprobe_remaining is not None:
+                interval = _reprobe_interval()
+                every = f"every {interval} parked calls" if interval else "periodically"
+                if self.reprobe_remaining:
+                    calls = "call" if self.reprobe_remaining == 1 else "calls"
+                    when = f"next after {self.reprobe_remaining} more {calls}"
+                else:
+                    when = "the next call that fits re-probes"
+                rows.append(("re-probe", f"{every}; {when}"))
+        elif self.status == DISABLED:
             reason = self.summary
             if self.lineno is not None:
                 reason += f" (line {self.lineno})"
@@ -258,6 +306,11 @@ class PeekReport:
         return self._with(COMPILED)
 
     @property
+    def parked(self) -> tuple[PeekFinding, ...]:
+        """The findings running as Python for now, until a re-probe."""
+        return self._with(PARKED)
+
+    @property
     def disabled(self) -> tuple[PeekFinding, ...]:
         """The findings that always run as Python from now on."""
         return self._with(DISABLED)
@@ -288,8 +341,8 @@ class PeekReport:
             lines += ["", finding.name]
             lines += [f"  {line}" for line in finding.render().splitlines()]
         counts = (
-            f"{len(self.compiled)} compiled, {len(self.cold)} cold, "
-            f"{len(self.disabled)} disabled."
+            f"{len(self.compiled)} compiled, {len(self.parked)} parked, "
+            f"{len(self.cold)} cold, {len(self.disabled)} disabled."
         )
         lines += ["", counts]
         return "\n".join(lines)
@@ -300,7 +353,7 @@ class PeekReport:
     def __repr__(self) -> str:
         counts = ", ".join(
             f"{len(self._with(status))} {status}"
-            for status in (COMPILED, COLD, DISABLED, NOT_BITTEN)
+            for status in (COMPILED, PARKED, COLD, DISABLED, NOT_BITTEN)
             if self._with(status)
         )
         return f"<PeekReport: {counts or 'empty'}>"
@@ -320,8 +373,9 @@ def peek(
 
     Pass a ``@snekit`` wrapper (including one installed by :func:`bite`, or
     a method bound from one) to get one finding: whether it is ``"cold"``
-    (warming up), ``"compiled"`` or ``"disabled"`` (and why), with the
-    counts its state holds. A plain Python function gets one
+    (warming up), ``"compiled"``, ``"parked"`` (running as Python for now,
+    because its calls did not fit, and why) or ``"disabled"`` (and why),
+    with the counts its state holds. A plain Python function gets one
     ``"not_bitten"`` finding; for one marked with :func:`speedysnek.nosnek`,
     its summary says so and its ``reason`` is ``"opted_out"``.
 
@@ -452,6 +506,8 @@ def _finding(
         status = COLD
     elif status is _Status.COMPILED:
         status = COMPILED
+    elif status is _Status.PARKED:
+        status = PARKED
     elif status is _Status.DISABLED:
         status = DISABLED
     else:
@@ -463,15 +519,19 @@ def _finding(
         warmup = min(warmup, _WARMUP_CALLS)
         if status == COLD:
             warmup_remaining = _WARMUP_CALLS - warmup
-    native_attempts = compiler = None
+    native_attempts = native_hits = native_misses = compiler = None
     # While another thread compiles, ``compiled`` is set just before the
     # status changes: only trust it once the wrapper has left ``COLD``.
     native_function = None if status == COLD else _native_function(state.compiled)
     if native_function is not None:
-        native_attempts = native_function.try_calls
+        # Read together: no call can run in between.
+        counts = native_function.try_counts
+        native_attempts, native_misses = counts
+        native_hits = native_attempts - native_misses
         compiler = _CRANELIFT_I64
 
     reason = detail = lineno = rejection = compile_error = native_error = None
+    reprobe_remaining = None
     if status == COLD:
         if warmup_remaining:
             calls = "call" if warmup_remaining == 1 else "calls"
@@ -480,6 +540,24 @@ def _finding(
             summary = "warmed up: the next call tries to compile it"
     elif status == COMPILED:
         summary = "compiled: calls run natively when their arguments fit"
+    elif status == PARKED:
+        summary = _PARKED_SUMMARY
+        parked = state.parked_reason
+        if type(parked) is _ParkedReason:
+            reason = parked.value
+        if parked is _ParkedReason.WARMUP:
+            fits = _count(state.warmup_fits)
+            if fits is not None:
+                fits = min(fits, _WARMUP_CALLS)
+                detail = (
+                    f"{fits} of {_WARMUP_CALLS} warmup calls fit (one positional, "
+                    "exact 64-bit int per parameter)"
+                )
+        elif parked is _ParkedReason.MISSES:
+            limit = _native_constant("MISS_LIMIT")
+            if limit is not None:
+                detail = f"{limit} calls in a row could not run natively"
+        reprobe_remaining = _reprobe_remaining(state)
     else:
         disabled = state.disabled_reason
         summary = "disabled"
@@ -527,6 +605,9 @@ def _finding(
         warmup_remaining=warmup_remaining,
         compile_attempts=_count(state.compile_attempts),
         native_attempts=_count(native_attempts),
+        native_hits=_count(native_hits),
+        native_misses=_count(native_misses),
+        reprobe_remaining=reprobe_remaining,
         compiler=compiler,
         reason=reason,
         detail=detail,
@@ -578,6 +659,28 @@ def _native_function(compiled: Any) -> Any:
         return None
     function = compiled._function
     return function if type(function) is native.I64Function else None
+
+
+def _native_constant(name: str) -> int | None:
+    """An ``int`` constant of the extension module, if it is loaded."""
+    native = sys.modules.get("speedysnek._native")
+    value = None if native is None else getattr(native, name, None)
+    return _count(value)
+
+
+def _reprobe_interval() -> int | None:
+    return _native_constant("REPROBE_INTERVAL")
+
+
+def _reprobe_remaining(state: _JitState) -> int | None:
+    """Parked calls left before a call that fits re-probes."""
+    native = sys.modules.get("speedysnek._native")
+    interval = _reprobe_interval()
+    hot = state._hot
+    if native is None or interval is None or type(hot) is not native.HotSlot:
+        return None
+    calls = _count(hot.parked_calls)
+    return None if calls is None else max(interval - calls, 0)
 
 
 def _rejection(rejection: Any) -> Any:

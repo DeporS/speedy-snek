@@ -116,7 +116,7 @@ def test_class_access_returns_the_wrapper_itself():
     assert Point.shifted(Point(1), 2) == 3
 
 
-def test_methods_count_calls_and_compile():
+def test_methods_count_calls_and_park():
     shifted = Point.__dict__["shifted"]
     before = shifted.call_count
     points = [Point(i) for i in range(3)]
@@ -124,14 +124,21 @@ def test_methods_count_calls_and_compile():
         for point in points:
             assert point.shifted(5) == 6
     assert shifted.call_count == before + 3 * (_WARMUP_CALLS + 2)
-    assert shifted._jit_state.status is _Status.COMPILED
-    # Bound calls pass ``self``, which is not an int: a guard miss.
-    calls = native_calls(shifted)
+    # Bound calls pass ``self``, which is not an int: they never fit, so
+    # the method is parked and makes no native attempt.
+    state = shifted._jit_state
+    assert state.status is _Status.PARKED
+    assert state.compiled is None
     assert points[0].shifted(5) == 6
-    assert native_calls(shifted) == calls + 1
-    # Through the class, with an int in ``self``'s place, it runs natively.
+    # Through the class, with an int in ``self``'s place, a re-probe
+    # compiles it and it runs natively.
+    while state._hot.parked_calls < _native.REPROBE_INTERVAL:
+        assert points[0].shifted(5) == 6
     assert Point.shifted(0, 41) == 42
-    assert native_calls(shifted) == calls + 2
+    assert state.status is _Status.COMPILED
+    assert native_calls(shifted) == 1
+    assert Point.shifted(0, 41) == 42
+    assert native_calls(shifted) == 2
 
 
 def test_decorator_combinations():
@@ -976,10 +983,20 @@ def test_publishing_rules():
     retired.retire()
     retired.publish(add.__code__, function)
     assert not retired.live
+    # Parking never revives a retired slot.
+    assert not hot.park()
+    assert not hot.unpark()
+    assert not hot.live
+    assert not hot.parked
     assert {name for name in dir(hot) if not name.startswith("_")} == {
         "live",
+        "misses",
+        "park",
+        "parked",
+        "parked_calls",
         "publish",
         "retire",
+        "unpark",
     }
 
 

@@ -139,20 +139,22 @@ status:           compiled
 calls observed:   100
 warmup calls:     8
 compile attempts: 1
-native attempts:  92
+native attempts:  92 (92 ran natively, 0 fell back to Python)
 compiler:         Cranelift i64 specialization
 ```
 
 A function is **cold** while it warms up, **compiled** once native code is
-in use, or **disabled** when it cannot be compiled or its compiled code
-was invalidated, with the reason. `snek.peek(calculations)` reports every
-wrapped function in the module.
+in use, **parked** when its calls do not fit the native code (it runs as
+regular Python for now, see [below](#parked-functions)), or **disabled**
+when it cannot be compiled or its compiled code was invalidated, with the
+reason. `snek.peek(calculations)` reports every wrapped function in the
+module.
 
 `peek()` only reads state the wrappers already keep: it calls, compiles
 and changes nothing. It reports state and observed counts, not a
 benchmark or a promise of speed. A native attempt is not a native result:
-a call can still fall back to Python. See [the peek guide](docs/peek.md)
-for every field and its limits.
+a call can still fall back to Python, and the report says how many did.
+See [the peek guide](docs/peek.md) for every field and its limits.
 
 ## Chill out
 
@@ -189,12 +191,37 @@ for aliases, repeat calls and `@nosnek`.
    through a Rust wrapper.
 4. **Fall back.** Unsupported inputs, integer overflow or an exhausted
    loop budget send that call back to Python with its original arguments.
+5. **Park.** When the calls clearly do not fit the native code, SpeedySnek
+   stops trying it, as described next.
 
 You do not need to choose integer types. The native path uses checked
 64-bit integers; values it cannot handle are computed by Python instead.
 
 Compilation currently happens once per decorated function. SpeedySnek does
 not yet measure whether the compiled version is faster before using it.
+
+### Parked functions
+
+Native code only helps calls that fit it: positional arguments, one per
+parameter, each an exact `int` within 64 bits. A function only ever
+called with floats, a method called on an instance (its first argument is
+`self`), keyword calls and calls that rely on a default never fit.
+Without a limit, each such call would pay for a native attempt and then run
+as Python anyway.
+
+So SpeedySnek **parks** a function when its calls do not fit: if fewer
+than half of the warmup calls fit, it is not compiled at all (and the
+compiler is not loaded), and compiled code that misses 32 calls in a row
+is set aside. A parked function runs as regular Python for now. It is not
+an error, and nothing is lost: after every 64 parked calls, the next call
+that fits re-probes. It compiles the function if that has not happened
+yet, or tries the compiled code again; if the call runs natively, the
+function is back to compiled. An occasional miss never parks anything.
+
+These decisions use only what each call shows (keywords, argument count,
+exact types and ranges, and whether native code ran), never timings, and
+they never change what a call returns or raises. `peek()` shows a parked
+function's reason and when it will re-probe.
 
 ## What works today
 

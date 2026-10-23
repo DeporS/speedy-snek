@@ -37,6 +37,12 @@ MAX_ARGS: int
 MAX_LOCALS: int
 MAX_JUMPS: int
 
+# The miss policy (see ``HotSlot``): a compiled wrapper parks after
+# ``MISS_LIMIT`` calls in a row that could not run natively, and a parked
+# one re-probes after ``REPROBE_INTERVAL`` parked calls.
+MISS_LIMIT: int
+REPROBE_INTERVAL: int
+
 # ``True`` when the extension was built with debug assertions, as by a plain
 # ``maturin develop``. Benchmarks record it; debug builds are not
 # representative.
@@ -63,6 +69,12 @@ class I64Function:
         """How many fast calls this function has handled, guard misses
         included: through ``try_call`` or directly from a ``NativeWrapper``.
         A diagnostic for tests and benchmarks."""
+    @property
+    def try_misses(self) -> int:
+        """How many of the ``try_calls`` returned no native result."""
+    @property
+    def try_counts(self) -> tuple[int, int]:
+        """``(try_calls, try_misses)``, read together."""
     def call(self, args: tuple[int, ...], /) -> tuple[int, int]:
         """Run the code; return ``(status, value)`` from the native ABI.
 
@@ -118,11 +130,14 @@ class GuardedI64Function:
 
 @final
 class HotSlot:
-    """One wrapper's compiled specialization, held in Rust.
+    """One wrapper's compiled specialization, held in Rust, and its miss
+    policy.
 
     Write-once and one-way: ``publish`` succeeds at most once, and a
     retired slot is never used again. Only a genuine ``I64Function`` or
     ``GuardedI64Function`` is published; anything else leaves it empty.
+    ``park`` and ``unpark`` switch an unretired slot between active and
+    parked; the ``_JitState`` calls them in step with its status.
     """
 
     def __init__(self) -> None: ...
@@ -130,9 +145,23 @@ class HotSlot:
         self, code: CodeType, function: I64Function | GuardedI64Function | object, /
     ) -> None: ...
     def retire(self) -> None: ...
+    def park(self) -> bool:
+        """Active to parked; whether it changed."""
+    def unpark(self) -> bool:
+        """Parked to active, with no misses counted; whether it changed."""
     @property
     def live(self) -> bool:
-        """Published and not retired: whether calls can use the slot."""
+        """Published, active and not retired: whether calls can use the
+        slot."""
+    @property
+    def parked(self) -> bool: ...
+    @property
+    def misses(self) -> int:
+        """While active, the calls in a row that could not run natively."""
+    @property
+    def parked_calls(self) -> int:
+        """While parked, the calls since parking or the last re-probe, at
+        most ``REPROBE_INTERVAL``."""
 
 @final
 class NativeWrapper:
