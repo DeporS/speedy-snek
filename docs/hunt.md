@@ -72,6 +72,15 @@ file. `str(report)` and `report.render()` give the same text.
 The frontend reports the first unsupported construct it meets, so fixing
 one reason can reveal the next.
 
+## Opting out with `@nosnek`
+
+A function marked with [`@snek.nosnek`](bite.md#opting-out-with-nosnek)
+is still listed, in its usual place, but as skipped with the reason
+`"opted_out"` and the summary `marked with @nosnek`. Its bytecode is not
+analyzed, and a module whose functions are all marked does not even load
+the frontend. The same applies when you pass a marked function to
+`hunt()` explicitly.
+
 Once the report looks right, [`snek.bite(my_module)`](bite.md) wraps the
 module's ready functions with `@snekit`, using the same rules and the same
 explanations. After the functions have been called for a while,

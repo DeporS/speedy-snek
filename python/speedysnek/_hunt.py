@@ -11,6 +11,9 @@ compiler::
 
     report = snek.hunt(my_calculations)
 
+Functions marked with ``@nosnek`` are reported as skipped, with the
+reason ``"opted_out"``, without being analyzed.
+
 "Ready" means only that the frontend accepts the function's bytecode. It
 says nothing about whether the native version would be faster, and the
 backend can still refuse a ready function (for example, one with too many
@@ -40,8 +43,12 @@ from types import (
 )
 from typing import Any, TextIO
 
+from ._nosnek import _is_opted_out
+
 READY = "ready"
 SKIPPED = "skipped"
+# The reason for a function marked with ``@nosnek``.
+OPTED_OUT = "opted_out"
 
 # Descriptors read directly, so no subclass or metaclass can intercept them.
 _MODULE_DICT = ModuleType.__dict__["__dict__"]
@@ -134,7 +141,8 @@ class HuntFinding:
       function's bytecode, ``"skipped"`` otherwise.
     - ``summary``: a short, human-readable explanation.
     - ``reason``: for a skipped function, the frontend's stable rejection
-      code, such as ``"unsupported_opcode"``; ``None`` when ready.
+      code, such as ``"unsupported_opcode"``, ``"not_a_function"``, or
+      ``"opted_out"`` for one marked with ``@nosnek``; ``None`` when ready.
     - ``detail``: for a skipped function, the frontend's exact rejection
       message; ``None`` when ready.
     - ``lineno``: the source line of the rejected instruction, where known.
@@ -245,7 +253,8 @@ def hunt(
     callable objects, builtins and names starting with ``_`` are left out.
     Explicit functions are reported in the order given; a callable that is
     not a Python function, such as a builtin or a class, is reported as
-    skipped.
+    skipped. A function marked with :func:`speedysnek.nosnek` is reported
+    as skipped, with the reason ``"opted_out"``, and is not analyzed.
 
     The report is printed to ``stream`` (``sys.stdout`` by default) unless
     ``quiet`` is true, and returned as a :class:`HuntReport`. Nothing is
@@ -257,7 +266,9 @@ def hunt(
     """
     candidates = _candidates(targets)
 
-    from ._frontend import analyze
+    analyze = None
+    if any(_needs_analysis(obj) for _, obj in candidates):
+        from ._frontend import analyze
 
     report = HuntReport(_inspect(name, obj, analyze) for name, obj in candidates)
     if not quiet:
@@ -339,6 +350,11 @@ def _name(obj: Any) -> str:
     return f"<{_TYPE_NAME.__get__(kind)} object>"
 
 
+def _needs_analysis(obj: Any) -> bool:
+    """Whether ``_inspect`` would hand ``obj`` to the frontend."""
+    return type(obj) is FunctionType and not _is_opted_out(obj)
+
+
 def _is_snekit_wrapper(kind: type) -> bool:
     # A wrapper exists only once ``@snekit`` has loaded the extension.
     native = sys.modules.get("speedysnek._native")
@@ -355,6 +371,8 @@ def _inspect(name: str, obj: Any, analyze: Any) -> HuntFinding:
             reason="not_a_function",
             detail=f"expected a Python function, got {_TYPE_NAME.__get__(type(obj))}",
         )
+    if _is_opted_out(obj):
+        return _opted_out(name, obj)
     analysis = analyze(obj)
     rejection = analysis.rejection
     if rejection is None:
@@ -367,6 +385,18 @@ def _inspect(name: str, obj: Any, analyze: Any) -> HuntFinding:
         reason=rejection.reason.value,
         detail=rejection.message,
         lineno=rejection.lineno,
+    )
+
+
+def _opted_out(name: str, function: FunctionType) -> HuntFinding:
+    """The finding for a function marked with ``@nosnek``; not analyzed."""
+    return HuntFinding(
+        name,
+        function,
+        SKIPPED,
+        "marked with @nosnek",
+        reason=OPTED_OUT,
+        detail="marked with @nosnek, so SpeedySnek leaves it as plain Python",
     )
 
 

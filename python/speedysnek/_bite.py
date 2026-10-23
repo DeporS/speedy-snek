@@ -12,7 +12,9 @@ It finds candidates with the same rules as ``hunt``, inspects them with
 the same frontend analysis, and replaces the module's public names for
 every ready function with one ``@snekit`` wrapper. Nothing is called or
 compiled: the wrapper warms up and compiles exactly as if the function had
-been decorated in its source.
+been decorated in its source. Functions marked with ``@nosnek`` are
+skipped without being analyzed or wrapped, and every name bound to them
+is left alone.
 
 ``bite`` changes the module's namespace only. Every public name in the
 module bound to a ready function, aliases included, is rebound to the same
@@ -42,8 +44,10 @@ from ._hunt import (
     HuntFinding,
     _inspect,
     _is_snekit_wrapper,
+    _opted_out,
     _write,
 )
+from ._nosnek import _is_opted_out
 
 BITTEN = "bitten"
 SKIPPED = "skipped"
@@ -70,7 +74,9 @@ class BiteFinding:
     - ``status``: ``"bitten"``, ``"skipped"`` or ``"already_bitten"``.
     - ``summary``: a short, human-readable explanation.
     - ``hunt``: the :class:`HuntFinding` for the function, or ``None`` for
-      an already bitten one, which is not inspected again.
+      an already bitten one, which is not inspected again. Its ``reason``
+      says why a function was skipped: ``"opted_out"`` for one marked with
+      ``@nosnek``, otherwise the frontend's rejection code.
     """
 
     __slots__ = ("function", "hunt", "name", "names", "status", "summary", "wrapper")
@@ -127,7 +133,7 @@ class BiteReport:
 
     @property
     def skipped(self) -> tuple[BiteFinding, ...]:
-        """The findings left unchanged because they cannot be compiled."""
+        """The findings left unchanged: not compilable, or marked @nosnek."""
         return self._with(SKIPPED)
 
     @property
@@ -237,6 +243,12 @@ def bite(
     name still holding the plain function is pointed at that existing
     wrapper. Calling ``bite`` twice changes nothing the second time.
 
+    A function marked with :func:`speedysnek.nosnek` is reported as
+    skipped, with the reason ``"opted_out"``: it is not analyzed or
+    wrapped, no name bound to it changes, and a ``@snekit`` wrapper of it
+    that already exists is left as it is. Skipping it never stops the
+    other functions from being bitten.
+
     The module is updated all at once or not at all: if any name to be
     replaced no longer holds its original function by the time the
     wrappers are ready, no name is replaced and the affected functions are
@@ -266,6 +278,10 @@ def bite(
     # Decide everything before changing anything.
     analyze = None
     for candidate in candidates:
+        if _is_opted_out(candidate.function):
+            # Left exactly as it is, wrappers and plain names alike.
+            candidate.hunt = _opted_out(candidate.names[0], candidate.function)
+            continue
         if candidate.wrappers:
             # Never wrap twice: plain aliases get the existing wrapper.
             candidate.status = ALREADY_BITTEN
@@ -388,6 +404,9 @@ def _finding(candidate: _Candidate, changed: list[_Candidate]) -> BiteFinding:
             summary += f" as {name}; {aliases} now point to it too"
     else:
         summary = candidate.hunt.summary
+        if candidate.wrappers and _is_opted_out(candidate.function):
+            name = candidate.wrappers[0][0]
+            summary += f"; its existing @snekit wrapper {name} is left as it is"
     if changed and status != SKIPPED and candidate.plain_names:
         # Planned, but not applied: nothing in the module was replaced.
         status, wrapper = SKIPPED, None

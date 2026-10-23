@@ -36,7 +36,15 @@ from types import FunctionType, MethodType, ModuleType
 from typing import Any, TextIO
 
 from ._decorator import _WARMUP_CALLS, _DisabledReason, _JitState, _Status
-from ._hunt import _MODULE_DICT, _TYPE_NAME, _explain, _is_snekit_wrapper, _write
+from ._hunt import (
+    _MODULE_DICT,
+    _TYPE_NAME,
+    OPTED_OUT,
+    _explain,
+    _is_snekit_wrapper,
+    _write,
+)
+from ._nosnek import _is_opted_out
 
 COLD = "cold"
 COMPILED = "compiled"
@@ -52,6 +60,7 @@ _EMPTY = "🐍 Snek found no bitten functions"
 _EXCEPTION_ARGS = BaseException.__dict__["args"]
 
 _NOT_BITTEN_SUMMARY = "not wrapped with @snekit; use snek.bite(module) or @snekit first"
+_OPTED_OUT_SUMMARY = "marked with @nosnek: SpeedySnek will not wrap it automatically"
 
 # Plain-English summaries of why a wrapper was disabled. Rejections and
 # errors get their own text, built from the stored diagnostic.
@@ -98,7 +107,9 @@ class PeekFinding:
     - ``compiler``: what compilation produced, such as ``"Cranelift i64
       specialization"``; ``None`` if nothing was compiled.
     - ``reason``: when disabled, the stable reason code, such as
-      ``"rejected"`` or ``"code_changed"``; ``None`` otherwise.
+      ``"rejected"`` or ``"code_changed"``; ``"opted_out"`` for a function
+      that is not bitten because it is marked with ``@nosnek``; ``None``
+      otherwise.
     - ``detail``: when disabled, the underlying diagnostic message, where
       there is one.
     - ``lineno``: the source line of a rejected instruction, where known.
@@ -311,13 +322,14 @@ def peek(
     a method bound from one) to get one finding: whether it is ``"cold"``
     (warming up), ``"compiled"`` or ``"disabled"`` (and why), with the
     counts its state holds. A plain Python function gets one
-    ``"not_bitten"`` finding.
+    ``"not_bitten"`` finding; for one marked with :func:`speedysnek.nosnek`,
+    its summary says so and its ``reason`` is ``"opted_out"``.
 
     Pass a module to get one finding per ``@snekit`` wrapper of the module's
     own functions under a public name, in definition order. Aliases of one
-    wrapper share a finding. Plain functions, imported wrappers, private
-    names, classes and callable objects are left out; a module without
-    wrappers gives an empty report.
+    wrapper share a finding. Plain functions (``@nosnek`` ones included),
+    imported wrappers, private names, classes and callable objects are
+    left out; a module without wrappers gives an empty report.
 
     The report is printed to ``stream`` (``sys.stdout`` by default) unless
     ``quiet`` is true, and returned as a :class:`PeekReport`. Nothing is
@@ -526,12 +538,18 @@ def _finding(
 
 
 def _not_bitten(function: FunctionType) -> PeekFinding:
+    reason = None
     summary = _NOT_BITTEN_SUMMARY
+    if _is_opted_out(function):
+        reason, summary = OPTED_OUT, _OPTED_OUT_SUMMARY
     holder = _module_wrapper_of(function)
     if holder is not None:
-        # A reference taken before ``bite``: the module has moved on.
+        # A reference taken before ``bite``, or a function marked after it
+        # was wrapped: the module has moved on.
         summary = f"not wrapped itself, but {holder} is its @snekit wrapper"
-    return PeekFinding(function.__name__, function, NOT_BITTEN, summary)
+        if reason is not None:
+            summary = f"marked with @nosnek, but {holder} is its @snekit wrapper"
+    return PeekFinding(function.__name__, function, NOT_BITTEN, summary, reason=reason)
 
 
 def _module_wrapper_of(function: FunctionType) -> str | None:

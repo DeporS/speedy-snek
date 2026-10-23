@@ -102,6 +102,23 @@ Nothing is compiled until a function has warmed up, and calls still fall
 back to Python whenever the native path does not apply. See
 [the bite guide](docs/bite.md) for aliases, repeat bites and the report.
 
+### Keep a function as plain Python
+
+Some functions you want to keep exactly as they are, whatever the snek
+thinks of them. Mark them with `@snek.nosnek`:
+
+```python
+@snek.nosnek
+def update_database():
+    ...
+```
+
+`hunt()` and `bite()` then list the function as skipped, "marked with
+@nosnek", and `bite()` never wraps it. The marker returns your function
+unchanged and adds nothing to its calls. You only need it for functions
+you deliberately want to keep out of automatic wrapping: functions the
+snek cannot compile are already left alone.
+
 ## Take a peek
 
 Want to know what the snek did with a function? Peek at it:

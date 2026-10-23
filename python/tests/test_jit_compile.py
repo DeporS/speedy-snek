@@ -1829,6 +1829,7 @@ def test_public_api_is_unchanged_after_compilation():
         "peek",
         "PeekReport",
         "PeekFinding",
+        "nosnek",
     ]
     public = {name for name in dir(speedysnek) if not name.startswith("_")}
     assert public == {
@@ -1843,6 +1844,7 @@ def test_public_api_is_unchanged_after_compilation():
         "peek",
         "PeekReport",
         "PeekFinding",
+        "nosnek",
     }
     for name in (
         "CompiledI64",
