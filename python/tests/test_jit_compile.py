@@ -1829,6 +1829,9 @@ def test_public_api_is_unchanged_after_compilation():
         "peek",
         "PeekReport",
         "PeekFinding",
+        "chill",
+        "ChillReport",
+        "ChillFinding",
         "nosnek",
     ]
     public = {name for name in dir(speedysnek) if not name.startswith("_")}
@@ -1844,6 +1847,9 @@ def test_public_api_is_unchanged_after_compilation():
         "peek",
         "PeekReport",
         "PeekFinding",
+        "chill",
+        "ChillReport",
+        "ChillFinding",
         "nosnek",
     }
     for name in (

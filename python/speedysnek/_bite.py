@@ -28,11 +28,15 @@ them replaced in one update. If any has changed, nothing is replaced. Like
 ``hunt``, ``bite`` reads the module through ``ModuleType``'s own
 ``__dict__`` descriptor and runs no user code. The native extension is
 loaded only when there is at least one function to wrap.
+
+``bite`` remembers the wrappers it installed, so that
+:func:`speedysnek.chill` can undo exactly those.
 """
 
 from __future__ import annotations
 
 import sys
+import weakref
 from collections.abc import Iterable, Iterator
 from types import FunctionType, ModuleType
 from typing import Any, TextIO
@@ -59,6 +63,11 @@ _EMPTY = "🐍 Snek found no functions to bite."
 
 # Builds each wrapper. A seam for tests; always ``snekit`` otherwise.
 _wrap = snekit
+
+# Every wrapper ``bite`` installed in a module, mapped to the function it
+# wraps, so that ``chill`` undoes only ``bite``'s own work. Weak, so it
+# never keeps a wrapper alive; the wrapper already holds its function.
+_INSTALLED: weakref.WeakKeyDictionary[Any, FunctionType] = weakref.WeakKeyDictionary()
 
 
 class BiteFinding:
@@ -315,6 +324,8 @@ def bite(
         # One update of the real namespace: no module hooks, and every
         # alias changes together.
         dict.update(namespace, updates)
+        for candidate in to_wrap:
+            _INSTALLED[candidate.wrapper] = candidate.function
 
     findings = [_finding(candidate, changed) for candidate in candidates]
     report = BiteReport(findings)
