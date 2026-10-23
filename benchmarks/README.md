@@ -181,7 +181,7 @@ around one run of the fast path that `fast_call` exposes:
 | Layer | Timed statement | What it includes |
 |---|---|---|
 | `python` | `f(a, b, c, d)` | The plain function: CPython call plus bytecode arithmetic. |
-| `snekit` | `f(a, b, c, d)` | The public wrapper, a Rust `NativeWrapper` (a Python closure in the committed baseline): argument tuple, `call_count`, state, `__code__`, keyword and arity checks, then the fast path, called directly in Rust. |
+| `snekit` | `f(a, b, c, d)` | The public wrapper, a Rust `NativeWrapper` (a Python closure in the committed baseline): argument tuple, `call_count`, the hot slot's `__code__` and range-guard checks (no Python attribute lookups), keyword and arity checks, then the fast path, called directly in Rust. |
 | `fast_call` | `fast_call(args)` | The specialization's bound `I64Function.try_call` on a **prebuilt** tuple: the same Rust fast path, called through Python. |
 
 The other two are the diagnostic path. `@snekit` no longer runs it; it is
@@ -309,6 +309,7 @@ that are not part of the pyperf suite and do not update the baseline:
 | [`native_wrapper`](experiments/native_wrapper.md) | Moving the wrapper's per-call logic into a PyO3 callable makes warmed calls 0.58–0.66× as long and guard misses about 0.55×, with no slower case; adopted. Lists the observable differences of a non-function wrapper. |
 | [`loops`](experiments/loops.md) | Warmed `while` loops run 20–30× faster than plain Python from 1,000 iterations up; the backedge budget is cheap, and a call that exhausts it is about 3% slower than plain Python. Analysis plus compilation takes about a millisecond per function. |
 | [`for_range`](experiments/for_range.md) | Warmed `for` loops over `range(n)` run as fast as the equivalent `while` loops (21–24× faster than plain Python at 10,000 iterations); the range guard costs under 10 µs once and nothing measurable on functions that do not use `range`. |
+| [`hot_slot`](experiments/hot_slot.md) | Keeping a compiled wrapper's specialization in a write-once Rust slot removes every Python attribute lookup from a warmed call: 42% fewer instructions for `a + b` (about half the time) and 25–36% fewer for the other compiled cases, guard misses and omitted defaults; a disabled wrapper executes 0.4% more, with no measurable slowdown. Adopted. |
 
 `benchmarks/tests/test_wrapper_experiment.py` keeps the experiment's
 prototype honest against the production wrapper.

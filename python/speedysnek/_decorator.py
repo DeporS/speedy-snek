@@ -53,14 +53,30 @@ The wrapper is a :class:`speedysnek._native.NativeWrapper`: the per-call
 logic runs in Rust, so a call through it enters no Python frame. It
 holds the original function and its ``_JitState``. Compilation and every
 state transition stay in Python: the wrapper only reads
-``state.specialization`` and ``state.status`` and calls the state's
+``state._specialization`` (the slot behind ``state.specialization``) and
+``state.status`` and calls the state's
 ``cold_call``, ``invalidate`` and ``native_failed`` methods, in the same
 places the earlier Python closure did. A warmed, eligible call runs no
-Python code at all::
+Python code at all.
+
+**The hot slot.** Reading those attributes on every call is most of a
+warmed call's cost, so ``snekit`` also gives the wrapper and its state one
+``_native.HotSlot``. Compilation publishes the specialization's code
+object, machine code and range guard into it, once, after the status is
+``COMPILED``; every later assignment to ``state.specialization``, on any
+path to ``DISABLED``, retires it for good first. While it is live, a call
+checks it without reading any attribute: the function's ``__code__`` is
+read through the C API, and the range guard is one atomic load. When the
+code object or the guard no longer match, the call takes the generic path,
+which reads the state and makes the transition exactly as before. A
+wrapper made without a slot, or a state whose specialization a test
+replaced, always takes the generic path::
 
     wrapper(*args)                      (NativeWrapper.__call__, in Rust)
-        -> check __code__, keywords and arity
-        -> check the range guard        (only for a for loop over range)
+        -> live hot slot: __code__ and the range guard still match?
+           otherwise the generic path reads the state's specialization
+           and checks __code__ and the range guard there
+        -> check keywords and arity
         -> spec.function's fast path    (the same Rust code as try_call)
             -> validate every argument once: exact int, in i64
             -> run the machine code, which checks every operation for overflow
@@ -139,34 +155,46 @@ class _Specialization:
     The wrapper reads ``_JitState.specialization`` once per call, so it
     either sees a complete specialization or none at all. Everything the
     hot path needs is resolved here, once.
+
+    It is immutable: the wrapper's hot slot holds a copy of the published
+    one. A test that needs another specialization assigns a new one to
+    ``_JitState.specialization``, which retires the slot.
     """
 
     __slots__ = ("arg_count", "code", "fast_call", "function", "guard", "native")
 
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError(f"_Specialization.{name} cannot be changed")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError(f"_Specialization.{name} cannot be deleted")
+
     def __init__(self, code: CodeType, native: Any, guard: Any = None) -> None:
-        self.code = code
+        # The class itself refuses assignments.
+        assign = object.__setattr__
+        assign(self, "code", code)
         # The ``CompiledI64``, kept for diagnostics; the wrapper never calls it.
-        self.native = native
-        self.arg_count = native.arg_count
+        assign(self, "native", native)
+        assign(self, "arg_count", native.arg_count)
         # The ``RangeGuard`` the native code depends on, or ``None``.
-        self.guard = guard
+        assign(self, "guard", guard)
         if guard is None:
             # The ``I64Function`` itself: the wrapper runs its fast path
             # directly, in Rust. Any other value (only test doubles use
             # one) makes the wrapper call ``fast_call`` instead.
-            self.function = native.function
+            assign(self, "function", native.function)
             # The bound ``I64Function.try_call``: ``fast_call(args)``
             # returns the result ``int``, or ``None`` for a guard miss. The
             # wrapper only calls it for a test double; benchmarks time it
             # as the fast path seen from Python.
-            self.fast_call = native.fast_call
+            assign(self, "fast_call", native.fast_call)
         else:
             from ._native import GuardedI64Function
 
             # The wrapper checks the guard, then runs the same fast path;
             # ``try_call`` also treats a failed guard as a guard miss.
-            self.function = GuardedI64Function(native.function, guard)
-            self.fast_call = self.function.try_call
+            assign(self, "function", GuardedI64Function(native.function, guard))
+            assign(self, "fast_call", self.function.try_call)
 
 
 class _JitState:
@@ -177,11 +205,21 @@ class _JitState:
     Invariant: ``specialization`` is not ``None`` exactly when ``status``
     is ``COMPILED``. ``compiled`` and ``compiled_code`` keep the last
     successful compilation for inspection even after it is invalidated.
+
+    ``_hot`` is the wrapper's ``_native.HotSlot``, or ``None`` for a state
+    used without a ``NativeWrapper``. The compilation that stores the
+    specialization publishes the same one into it, after setting
+    ``status`` to ``COMPILED``. Every later assignment to
+    ``specialization`` retires it first, for good: whether ``_disable``
+    makes it, on any path to ``DISABLED``, or a test does. So the slot is
+    live only while the wrapper would run exactly this specialization.
     """
 
     __slots__ = (
         "_func",
+        "_hot",
         "_lock",
+        "_specialization",
         "compile_attempts",
         "compile_error",
         "compiled",
@@ -189,16 +227,18 @@ class _JitState:
         "disabled_reason",
         "native_error",
         "rejection",
-        "specialization",
         "status",
         "warmup_calls",
     )
 
-    def __init__(self, func: Callable[..., Any]) -> None:
+    def __init__(self, func: Callable[..., Any], hot: Any = None) -> None:
         self._func = func
+        self._hot = hot
         self._lock = threading.Lock()
         self.status = _Status.COLD
-        self.specialization: _Specialization | None = None
+        # The wrapper's generic path reads this slot directly; see
+        # ``specialization``.
+        self._specialization: _Specialization | None = None
         self.warmup_calls = 0
         self.compile_attempts = 0
         self.rejection = None
@@ -207,6 +247,22 @@ class _JitState:
         self.compiled = None
         self.compiled_code: CodeType | None = None
         self.disabled_reason: _DisabledReason | None = None
+
+    @property
+    def specialization(self) -> _Specialization | None:
+        """The specialization a native call uses, or ``None``.
+
+        Assigning it retires the hot slot first, so that the wrapper reads
+        the new value. Only the compilation that publishes the slot stores
+        ``_specialization`` without retiring it.
+        """
+        return self._specialization
+
+    @specialization.setter
+    def specialization(self, value: _Specialization | None) -> None:
+        if self._hot is not None:
+            self._hot.retire()
+        self._specialization = value
 
     def cold_call(self) -> _Specialization | None:
         """Count one call while ``COLD``; compile once warmup is over.
@@ -221,7 +277,7 @@ class _JitState:
             # Another thread may have finished compiling while we waited.
             if self.status is _Status.COLD:
                 self._compile()
-        return self.specialization
+        return self._specialization
 
     def invalidate(self) -> None:
         """``__code__`` no longer matches the compiled code object."""
@@ -301,11 +357,17 @@ class _JitState:
 
         self.compiled = compiled
         self.compiled_code = code
+        specialization = _Specialization(code, compiled, guard)
         # Publish the complete specialization before changing the status.
-        self.specialization = _Specialization(code, compiled, guard)
+        # This is the one assignment that does not retire the hot slot.
+        self._specialization = specialization
         self.status = _Status.COMPILED
+        if self._hot is not None:
+            # Last: the slot is only ever live while ``COMPILED``.
+            self._hot.publish(code, specialization.function)
 
     def _disable(self, reason: _DisabledReason) -> None:
+        # Retires the hot slot first (see ``specialization``).
         self.specialization = None
         self.status = _Status.DISABLED
         self.disabled_reason = reason
@@ -343,10 +405,11 @@ def snekit[F: Callable[..., Any]](func: F) -> F:
     if not callable(func):
         raise TypeError(f"snekit expected a callable, got {type(func).__name__}")
     # Loads the extension module, but not the compiler.
-    from ._native import NativeWrapper
+    from ._native import HotSlot, NativeWrapper
 
-    state = _JitState(func)
-    wrapper = NativeWrapper(func, state, _Status.COLD)
+    hot = HotSlot()
+    state = _JitState(func, hot)
+    wrapper = NativeWrapper(func, state, _Status.COLD, hot)
     functools.update_wrapper(wrapper, func)
     # Private diagnostics only; the wrapper holds ``state`` itself.
     wrapper._jit_state = state

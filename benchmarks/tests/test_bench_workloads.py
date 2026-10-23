@@ -1,6 +1,7 @@
 """Correctness of the benchmark workloads. No timing is asserted anywhere."""
 
 import re
+from types import SimpleNamespace
 
 import pytest
 
@@ -190,11 +191,16 @@ def test_call_path_rejects_the_diagnostic_path():
         return a + b
 
     workloads.warm_up(add, 1, 2)
-    compiled = add._jit_state.compiled
+    state = add._jit_state
+    compiled = state.compiled
     # Simulate a decorator that calls CompiledI64.__call__ again: without an
     # ``I64Function``, the wrapper calls ``fast_call``.
-    add._jit_state.specialization.function = None
-    add._jit_state.specialization.fast_call = lambda args: compiled(*args)
+    state.specialization = SimpleNamespace(
+        code=state.compiled_code,
+        arg_count=compiled.arg_count,
+        function=None,
+        fast_call=lambda args: compiled(*args),
+    )
     with pytest.raises(BenchmarkSetupError, match="CompiledI64"):
         call_path(add, 1, 2)
 

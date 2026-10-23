@@ -20,7 +20,7 @@ import subprocess
 import sys
 import threading
 import time
-from types import BuiltinMethodType
+from types import BuiltinMethodType, SimpleNamespace
 
 import pytest
 
@@ -1492,8 +1492,12 @@ def test_real_native_errors_disable_and_fall_back():
     add = compiled(make_add(), 1, 2)
     state = state_of(add)
     real = state.specialization
-    real.function = None  # Make the wrapper use ``fast_call``.
-    real.fast_call = lambda args: state.compiled._function.try_call(list(args))
+    state.specialization = SimpleNamespace(
+        code=real.code,
+        arg_count=real.arg_count,
+        function=None,  # Make the wrapper use ``fast_call``.
+        fast_call=lambda args: state.compiled._function.try_call(list(args)),
+    )
     assert add(1, 2) == 3
     assert state.disabled_reason is _DisabledReason.NATIVE_ERROR
     assert isinstance(state.native_error, TypeError)
@@ -1547,6 +1551,13 @@ def test_warmed_calls_never_enter_compiled_i64(monkeypatch):
     assert state_of(add).status is _Status.COMPILED
 
 
+def canary(arg_count):
+    """An ``I64Function`` that ignores its arguments and returns 424242."""
+    return _native.compile_i64(
+        ((_native.OP_LOAD_CONST, 424242), (_native.OP_RETURN,)), arg_count
+    )
+
+
 def test_the_wrapper_runs_the_specializations_function_directly():
     add = compiled(make_add(), 1, 2)
     state = state_of(add)
@@ -1558,19 +1569,57 @@ def test_the_wrapper_runs_the_specializations_function_directly():
     assert type(spec.fast_call) is BuiltinMethodType
     assert spec.fast_call.__self__ is spec.function
     assert spec.fast_call.__name__ == "try_call"
-    # A canary function that returns a constant proves that the wrapper
-    # runs exactly ``spec.function``'s machine code, with no Python frame.
-    canary = _native.compile_i64(
-        ((_native.OP_LOAD_CONST, 424242), (_native.OP_RETURN,)), 2
+    # A canary function that returns a constant proves that the generic
+    # path runs exactly ``spec.function``'s machine code, with no Python
+    # frame. Replacing the specialization retires the hot slot.
+    function = canary(2)
+    replacement = SimpleNamespace(
+        code=spec.code, arg_count=2, function=function, fast_call=None
     )
-    spec.function = canary
+    state.specialization = replacement
+    assert not state._hot.live
     with recording() as calls:
         results = [add(i, i) for i in range(5)] + [add(0.5, 1)]
     assert results == [424242] * 5 + [1.5]
-    assert canary.try_calls == 6
+    assert function.try_calls == 6
     assert calls[add.__wrapped__.__code__] == 1
     assert calls["I64Function.try_call"] == 0
-    assert state.specialization is spec
+    assert state.specialization is replacement
+    assert state.status is _Status.COMPILED
+
+
+def test_the_hot_slot_runs_the_compiled_machine_code(monkeypatch):
+    # The canary is what compilation produced, so the hot slot holds it.
+    functions = []
+
+    def compile_canary(instructions, arg_count, **kwargs):
+        functions.append(canary(arg_count))
+        return CompiledI64(functions[-1], tuple(instructions))
+
+    monkeypatch.setattr(_compiler, "compile_i64", compile_canary)
+    add = compiled(make_add(), 1, 2)
+    state = state_of(add)
+    assert state._hot.live
+    assert state.specialization.function is functions[0]
+    with recording() as calls:
+        results = [add(i, i) for i in range(5)] + [add(0.5, 1)]
+    assert results == [424242] * 5 + [1.5]
+    # The compiling call ran it once, through the generic path.
+    assert functions[0].try_calls == 1 + 6
+    assert calls[add.__wrapped__.__code__] == 1
+    assert calls["I64Function.try_call"] == 0
+
+
+def test_the_published_specialization_is_immutable():
+    add = compiled(make_add(), 1, 2)
+    spec = state_of(add).specialization
+    for name in _Specialization.__slots__:
+        with pytest.raises(AttributeError, match="cannot be changed"):
+            setattr(spec, name, None)
+        with pytest.raises(AttributeError, match="cannot be deleted"):
+            delattr(spec, name)
+    assert state_of(add)._hot.live
+    assert assert_native(add, 3, 4) == 7
 
 
 @pytest.mark.parametrize("phase", ["cold", "compiled", "disabled"])

@@ -1,5 +1,6 @@
 """Tests for ``speedysnek.peek``, the read-only JIT diagnostics report."""
 
+import functools
 import io
 import subprocess
 import sys
@@ -10,7 +11,7 @@ import pytest
 
 import speedysnek as snek
 from speedysnek import PeekFinding, PeekReport, bite, peek, snekit
-from speedysnek._decorator import _WARMUP_CALLS, _DisabledReason, _Status
+from speedysnek._decorator import _WARMUP_CALLS, _DisabledReason, _JitState, _Status
 from speedysnek._native import NativeWrapper
 
 # Ready and rejected functions, a private function, a class, a callable
@@ -217,6 +218,31 @@ def test_a_call_with_another_arity_is_no_native_attempt():
     before = peek_one(wrapper).native_attempts
     assert wrapper(5) == 6
     assert peek_one(wrapper).native_attempts == before
+
+
+def test_the_hot_slot_changes_nothing_peek_reports():
+    def without_hot_slot(func):
+        # ``snekit`` before the hot slot: every call takes the generic path.
+        state = _JitState(func)
+        wrapper = NativeWrapper(func, state, _Status.COLD)
+        functools.update_wrapper(wrapper, func)
+        wrapper._jit_state = state
+        return wrapper
+
+    def with_default(a, b=1):
+        return a * b - a
+
+    fields = [name for name in PeekFinding.__slots__ if name != "wrapper"]
+    hot, generic = snekit(with_default), without_hot_slot(with_default)
+    calls = [(1, 2)] * _WARMUP_CALLS + [(1, 2), (3, 4), (5,), (1.5, 2), (2**62, 4)]
+    for args in calls + [(7, 8)] * 5:
+        assert hot(*args) == generic(*args)
+        found = peek_one(hot), peek_one(generic)
+        assert [getattr(found[0], name) for name in fields] == [
+            getattr(found[1], name) for name in fields
+        ]
+    assert hot._jit_state._hot.live
+    assert peek_one(hot).native_attempts == 9
 
 
 # --- Disabled ------------------------------------------------------------------

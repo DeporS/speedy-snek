@@ -9,13 +9,16 @@ deliberate decision.
 """
 
 import abc
+import contextlib
 import copy
 import functools
 import gc
 import inspect
 import pickle
+import random
 import sys
 import threading
+import time
 import traceback
 import types
 import typing
@@ -23,9 +26,16 @@ import weakref
 
 import pytest
 
-from speedysnek import _native, snekit
-from speedysnek._compiler import CompiledI64
-from speedysnek._decorator import _WARMUP_CALLS, _Status
+from speedysnek import _compiler, _native, snekit
+from speedysnek._compiler import CompiledI64, compile_i64
+from speedysnek._decorator import (
+    _WARMUP_CALLS,
+    _DisabledReason,
+    _JitState,
+    _Specialization,
+    _Status,
+)
+from speedysnek._frontend import analyze
 
 
 @snekit
@@ -578,3 +588,532 @@ def test_profilers_see_no_wrapper_frame():
         sys.setprofile(None)
     names = {name for event, name in events if event == "call"}
     assert names == {"add"}
+
+
+# --- The hot slot ----------------------------------------------------------
+#
+# Once compiled, a wrapper keeps its specialization in a Rust ``HotSlot``,
+# and a call that can use it reads no attribute of the JIT state. These
+# tests pin that warmed calls use it, that it changes nothing observable,
+# and that it is retired whenever the specialization stops being usable.
+
+
+class Poison:
+    """Stands in for ``state.specialization``: reading it fails the test."""
+
+    def __getattribute__(self, name):
+        raise AssertionError(f"the generic path read specialization.{name}")
+
+
+@contextlib.contextmanager
+def generic_path_forbidden(f):
+    """Make every call that reads the state's specialization fail.
+
+    Stores ``_specialization`` directly: assigning ``specialization`` would
+    retire the slot.
+    """
+    state = f._jit_state
+    real = state._specialization
+    state._specialization = Poison()
+    try:
+        yield
+    finally:
+        state._specialization = real
+
+
+@contextlib.contextmanager
+def python_frames(f):
+    """Count the frames of ``f``'s original function entered meanwhile."""
+    code = f.__wrapped__.__code__
+    count = [0]
+
+    def profiler(frame, event, arg):
+        if event == "call" and frame.f_code is code:
+            count[0] += 1
+
+    previous = sys.getprofile()
+    sys.setprofile(profiler)
+    try:
+        yield count
+    finally:
+        sys.setprofile(previous)
+
+
+def generic_wrapper(func):
+    """``snekit(func)`` without a hot slot: every call takes the generic
+    path, the dispatch ``snekit`` used before the slot existed."""
+    state = _JitState(func)
+    wrapper = _native.NativeWrapper(func, state, _Status.COLD)
+    functools.update_wrapper(wrapper, func)
+    wrapper._jit_state = state
+    return wrapper
+
+
+def copy_function(func):
+    return types.FunctionType(
+        func.__code__, func.__globals__, func.__name__, func.__defaults__
+    )
+
+
+def test_compilation_publishes_the_hot_slot():
+    add = make_add()
+    state = add._jit_state
+    assert type(state._hot) is _native.HotSlot
+    for _ in range(_WARMUP_CALLS):
+        add(1, 2)
+        assert not state._hot.live
+    add(1, 2)  # Compiles.
+    assert state.status is _Status.COMPILED
+    assert state._hot.live
+
+
+def test_a_cold_call_runs_no_state_code_but_cold_call():
+    # Retiring the slot hooks only the assignment to ``specialization``:
+    # counting a warmup call runs no Python code besides ``cold_call``.
+    add = make_add()
+    add(1, 2)
+    decorator = _JitState.cold_call.__code__.co_filename
+    names = []
+
+    def profiler(frame, event, arg):
+        if event == "call" and frame.f_code.co_filename == decorator:
+            names.append(frame.f_code.co_name)
+
+    sys.setprofile(profiler)
+    try:
+        add(1, 2)
+    finally:
+        sys.setprofile(None)
+    assert names == ["cold_call"]
+
+
+def test_warmed_calls_use_the_hot_slot():
+    add = warmed(make_add(), 1, 2)
+    calls, count = native_calls(add), add.call_count
+    with generic_path_forbidden(add), python_frames(add) as frames:
+        results = [add(i, -3) for i in range(100)]
+    assert results == [i - 3 for i in range(100)]
+    assert all(type(result) is int for result in results)
+    assert frames[0] == 0
+    assert native_calls(add) == calls + 100
+    assert add.call_count == count + 100
+    assert add._jit_state.status is _Status.COMPILED
+    assert add._jit_state._hot.live
+
+
+class MyInt(int):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        ((1.5, 2), 3.5),
+        ((True, 2), 3),
+        ((MyInt(1), 2), 3),
+        ((2**63, 1), 2**63 + 1),
+        ((2**62, 2**62), 2**63),  # Overflow.
+        ((-(2**63), -1), -(2**63) - 1),  # Overflow.
+        (("a", "b"), "ab"),
+    ],
+)
+def test_guard_misses_in_the_hot_slot_fall_back_once(args, expected):
+    add = warmed(make_add(), 1, 2)
+    calls = native_calls(add)
+    with generic_path_forbidden(add), python_frames(add) as frames:
+        result = add(*args)
+    assert result == expected
+    assert type(result) is type(expected)
+    assert frames[0] == 1
+    assert native_calls(add) == calls + 1
+    assert add._jit_state.status is _Status.COMPILED
+    assert add._jit_state._hot.live
+    # The next call runs natively again.
+    with generic_path_forbidden(add):
+        assert add(20, 22) == 42
+    assert native_calls(add) == calls + 2
+
+
+@pytest.mark.parametrize(
+    ("args", "kwargs"),
+    [((), {}), ((1,), {}), ((1, 2, 3), {}), ((1, 2), {"c": 3}), ((1,), {"a": 2})],
+)
+def test_invalid_calls_in_the_hot_slot_raise_the_originals_type_error(args, kwargs):
+    add = warmed(make_add(), 1, 2)
+    with pytest.raises(TypeError) as expected:
+        add.__wrapped__(*args, **kwargs)
+    count, calls = add.call_count, native_calls(add)
+    with generic_path_forbidden(add), pytest.raises(TypeError) as actual:
+        add(*args, **kwargs)
+    assert str(actual.value) == str(expected.value)
+    assert actual.value.__context__ is None
+    assert add.call_count == count + 1
+    assert native_calls(add) == calls
+    assert add._jit_state._hot.live
+
+
+@pytest.mark.parametrize(
+    ("args", "kwargs"),
+    [((1,), {"b": 2}), ((), {"a": 1, "b": 2}), ((), {"b": 2, "a": 1})],
+)
+def test_keyword_calls_never_reach_native_code(args, kwargs):
+    add = warmed(make_add(), 1, 2)
+    calls = native_calls(add)
+    with generic_path_forbidden(add), python_frames(add) as frames:
+        assert add(*args, **kwargs) == 3
+    assert frames[0] == 1
+    assert native_calls(add) == calls
+    # An empty keyword dict is a positional call.
+    with generic_path_forbidden(add):
+        assert add(1, 2, **{}) == 3
+    assert native_calls(add) == calls + 1
+
+
+def test_defaults_in_the_hot_slot():
+    @snekit
+    def f(a, b=4):
+        return a * b + a - b
+
+    warmed(f, 3, 4)
+    calls = native_calls(f)
+    with generic_path_forbidden(f), python_frames(f) as frames:
+        # An omitted default: another arity, so no native call.
+        assert f(3) == 11
+        assert f(3, 5) == 13
+        assert f(3, b=5) == 13
+        f.__wrapped__.__defaults__ = (10,)
+        assert f(3) == 23
+    assert frames[0] == 3
+    assert native_calls(f) == calls + 1
+
+
+def test_replacing_code_after_compilation_retires_the_slot():
+    add = warmed(make_add(), 1, 2)
+    state = add._jit_state
+    original = add.__wrapped__.__code__
+    calls = native_calls(add)
+    add.__wrapped__.__code__ = (lambda a, b: a * b).__code__
+    # The first call after the change already runs the new code.
+    with python_frames(add) as frames:
+        assert add(6, 7) == 42
+    assert frames[0] == 1
+    assert native_calls(add) == calls
+    assert state.status is _Status.DISABLED
+    assert state.disabled_reason is _DisabledReason.CODE_CHANGED
+    assert not state._hot.live
+    # Restoring the compiled code object does not revive the slot.
+    add.__wrapped__.__code__ = original
+    for _ in range(5):
+        assert add(6, 7) == 13
+    assert native_calls(add) == calls
+    assert not state._hot.live
+
+
+def test_replacing_code_with_another_signature_retires_the_slot():
+    add = warmed(make_add(), 1, 2)
+    add.__wrapped__.__code__ = (lambda a, b, c: a + b + c).__code__
+    with pytest.raises(TypeError, match="missing 1 required positional"):
+        add(1, 2)
+    assert add(1, 2, 3) == 6
+    assert add._jit_state.disabled_reason is _DisabledReason.CODE_CHANGED
+    assert not add._jit_state._hot.live
+
+
+def test_replacing_code_before_compilation_publishes_the_new_code():
+    add = make_add()
+    for _ in range(_WARMUP_CALLS):
+        add(1, 2)
+    multiply = (lambda a, b: a * b).__code__
+    add.__wrapped__.__code__ = multiply
+    assert add(6, 7) == 42  # Compiles the new code.
+    state = add._jit_state
+    assert state.compiled_code is multiply
+    assert state._hot.live
+    calls = native_calls(add)
+    with generic_path_forbidden(add):
+        assert add(5, 7) == 35
+    assert native_calls(add) == calls + 1
+
+
+RANGE_SOURCE = "def f(a, b):\n    for i in range(a):\n        b += i\n    return b"
+
+
+def _disabled(reason, monkeypatch):
+    """A wrapper disabled for ``reason``, through the real transition."""
+    reasons = _DisabledReason
+    namespace = {}
+    if reason in (reasons.RANGE_UNGUARDED, reasons.RANGE_CHANGED):
+        if reason is reasons.RANGE_UNGUARDED:
+            namespace["range"] = lambda n: range(n)
+        exec(RANGE_SOURCE, namespace)
+    else:
+        bodies = {reasons.REJECTED: "a / b", reasons.UNSUPPORTED: "a + 10**30"}
+        exec(f"def f(a, b):\n    return {bodies.get(reason, 'a + b')}", namespace)
+    f = snekit(namespace["f"])
+    if reason in (reasons.COMPILER_ERROR, reasons.INTERRUPTED):
+        error = RuntimeError if reason is reasons.COMPILER_ERROR else KeyboardInterrupt
+
+        def broken(*args, **kwargs):
+            raise error
+
+        monkeypatch.setattr(_compiler, "compile_i64", broken)
+    elif reason in (reasons.CODE_CHANGED, reasons.RANGE_CHANGED, reasons.NATIVE_ERROR):
+        warmed(f, 1, 2)
+        assert f._jit_state._hot.live
+        if reason is reasons.CODE_CHANGED:
+            # An equal code object, but not the one that was compiled.
+            f.__wrapped__.__code__ = f.__wrapped__.__code__.replace()
+        elif reason is reasons.RANGE_CHANGED:
+            namespace["range"] = range
+        else:
+            # What the wrapper does when a native call raises; a genuine
+            # ``I64Function`` cannot be made to raise from Python.
+            f._jit_state.native_failed(RuntimeError("native bug"))
+    for _ in range(_WARMUP_CALLS + 1):
+        try:
+            f(1, 2)
+        except KeyboardInterrupt:
+            assert reason is reasons.INTERRUPTED
+    monkeypatch.undo()
+    return f
+
+
+@pytest.mark.parametrize("reason", list(_DisabledReason), ids=lambda r: r.value)
+def test_every_disabled_reason_retires_the_slot(reason, monkeypatch):
+    f = _disabled(reason, monkeypatch)
+    state = f._jit_state
+    assert state.status is _Status.DISABLED
+    assert state.disabled_reason is reason
+    assert not state._hot.live
+    calls = native_calls(f)
+    with python_frames(f) as frames:
+        f(1, 2)
+    assert frames[0] == 1
+    assert native_calls(f) == calls
+
+
+class BrokenNative:
+    """A test double for a ``CompiledI64`` whose fast call raises."""
+
+    arg_count = 2
+    function = None
+
+    def __init__(self):
+        self.calls = 0
+
+    def fast_call(self, args):
+        self.calls += 1
+        raise RuntimeError("native bug")
+
+
+def test_an_injected_specialization_retires_the_slot():
+    add = warmed(make_add(), 1, 2)
+    state = add._jit_state
+    broken = BrokenNative()
+    state.specialization = _Specialization(state.compiled_code, broken)
+    assert not state._hot.live
+    assert add(1, 2) == 3
+    assert broken.calls == 1
+    assert state.disabled_reason is _DisabledReason.NATIVE_ERROR
+
+
+def test_a_wrapper_without_a_slot_takes_the_generic_path():
+    def add(a, b):
+        return a + b
+
+    wrapper = warmed(generic_wrapper(add), 1, 2)
+    assert wrapper._jit_state._hot is None
+    calls = native_calls(wrapper)
+    assert wrapper(20, 22) == 42
+    assert native_calls(wrapper) == calls + 1
+    with generic_path_forbidden(wrapper), pytest.raises(AssertionError, match="read"):
+        wrapper(1, 2)
+
+
+def test_a_slot_is_never_used_for_a_callable_that_is_not_a_function():
+    def add(a, b):
+        return a + b
+
+    function = compile_i64(analyze(add).instructions).function
+    hot = _native.HotSlot()
+    hot.publish(add.__code__, function)
+    assert hot.live
+
+    class Forged:
+        __code__ = add.__code__
+
+        def __call__(self, a, b):
+            return "python"
+
+    forged = Forged()
+    wrapper = _native.NativeWrapper(forged, _JitState(forged), _Status.COLD, hot)
+    assert wrapper(1, 2) == "python"
+    assert function.try_calls == 0
+
+
+def test_publishing_rules():
+    def add(a, b):
+        return a + b
+
+    function = compile_i64(analyze(add).instructions).function
+    # Only a genuine native function is published.
+    for double in (None, BrokenNative(), function.try_call):
+        hot = _native.HotSlot()
+        hot.publish(add.__code__, double)
+        assert not hot.live
+        hot.publish(add.__code__, function)
+        assert hot.live
+    with pytest.raises(TypeError, match="code object"):
+        _native.HotSlot().publish(add, function)
+    # Write-once.
+    with pytest.raises(RuntimeError, match="already published"):
+        hot.publish(add.__code__, function)
+    # One-way and idempotent: a retired slot is never live again.
+    hot.retire()
+    hot.retire()
+    assert not hot.live
+    retired = _native.HotSlot()
+    retired.retire()
+    retired.publish(add.__code__, function)
+    assert not retired.live
+    assert {name for name in dir(hot) if not name.startswith("_")} == {
+        "live",
+        "publish",
+        "retire",
+    }
+
+
+def _outcome(f, *args, **kwargs):
+    calls = native_calls(f)
+    with python_frames(f) as frames:
+        try:
+            result = ("ok", type(f(*args, **kwargs)), f.__wrapped__(*args, **kwargs))
+        except Exception as error:
+            result = ("raise", type(error), str(error))
+    state = f._jit_state
+    return (
+        result,
+        frames[0],
+        native_calls(f) - calls,
+        f.call_count,
+        state.status,
+        state.disabled_reason,
+        state.compile_attempts,
+        state.warmup_calls,
+    )
+
+
+def test_the_hot_slot_matches_the_generic_path_call_by_call():
+    def f(a, b=3):
+        return a * b - (a + b)
+
+    hot, generic = snekit(copy_function(f)), generic_wrapper(copy_function(f))
+    calls = [((1, 2), {})] * (_WARMUP_CALLS + 1)
+    calls += [
+        ((5, 7), {}),
+        ((5,), {}),
+        ((5,), {"b": 7}),
+        ((1.5, 2), {}),
+        ((True, 2), {}),
+        ((2**40, 2**40), {}),
+        ((2**63, 1), {}),
+        ((-(2**63), 2), {}),
+        (("x", 2), {}),
+        ((), {}),
+        ((1, 2, 3), {}),
+        ((1,), {"c": 2}),
+        ((-4, -9), {}),
+    ]
+    for args, kwargs in calls:
+        assert _outcome(hot, *args, **kwargs) == _outcome(generic, *args, **kwargs)
+    assert hot._jit_state._hot.live
+    hot.__wrapped__.__code__ = generic.__wrapped__.__code__ = (
+        lambda a, b=3: a - b
+    ).__code__
+    for args, kwargs in calls[-6:]:
+        assert _outcome(hot, *args, **kwargs) == _outcome(generic, *args, **kwargs)
+    assert not hot._jit_state._hot.live
+
+
+def _wait_for(condition):
+    deadline = time.monotonic() + 30
+    while not condition():
+        assert time.monotonic() < deadline
+        time.sleep(0.001)
+
+
+def test_hot_slot_calls_from_several_threads():
+    @snekit
+    def f(a, b):
+        return (a + 2) * b - 1000
+
+    warmed(f, 1, 2)
+    f.call_count = 0
+    replaced, stop = threading.Event(), threading.Event()
+    counts, errors = [0] * 4, []
+
+    def worker(index):
+        rng = random.Random(index)
+        while not stop.is_set():
+            a, b = rng.randint(-(2**20), 2**20), rng.randint(-(2**20), 2**20)
+            args = rng.choice([(a, b), (float(a), b), (2**62, b | 1)])
+            after = replaced.is_set()
+            result = f(*args)
+            counts[index] += 1
+            new = args[0] - args[1]
+            old = (args[0] + 2) * args[1] - 1000
+            # Once the new code is visible, no call may run the old one.
+            if result != new and (after or result != old):
+                errors.append((after, args, result))
+
+    workers = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+    for thread in workers:
+        thread.start()
+    _wait_for(lambda: min(counts) > 500)
+    native = native_calls(f)
+    assert f._jit_state._hot.live
+    f.__wrapped__.__code__ = (lambda a, b: a - b).__code__
+    replaced.set()
+    _wait_for(lambda: min(counts) > 1000)
+    stop.set()
+    for thread in workers:
+        thread.join()
+    assert errors == []
+    assert native > 0
+    assert f.call_count == sum(counts)
+    assert f._jit_state.disabled_reason is _DisabledReason.CODE_CHANGED
+    assert not f._jit_state._hot.live
+
+
+def test_the_hot_slot_releases_the_machine_code_with_the_wrapper():
+    # The reference count of an ``I64Function`` that only a local holds.
+    lone = _native.compile_i64(((_native.OP_LOAD_CONST, 1), (_native.OP_RETURN,)), 0)
+    alone = sys.getrefcount(lone)
+    add = warmed(make_add(), 1, 2)
+    hot = add._jit_state._hot
+    function = add._jit_state.compiled.function
+    # Nothing in the slot can lead back to it, so it needs no GC support.
+    assert not gc.is_tracked(hot)
+    del add
+    gc.collect()
+    # Still held by the slot, which is still alive.
+    assert hot.live
+    assert sys.getrefcount(function) == alone + 1
+    del hot
+    assert sys.getrefcount(function) == alone
+
+
+def test_a_module_level_range_function_is_collected():
+    # The wrapper is reachable from its own function's globals: a cycle.
+    namespace = {}
+    exec(
+        "def f(n):\n    t = 0\n    for i in range(n):\n        t += i\n    return t",
+        namespace,
+    )
+    wrapper = warmed(snekit(namespace["f"]), 4)
+    namespace["f"] = wrapper
+    assert wrapper._jit_state._hot.live
+    ref = weakref.ref(wrapper)
+    del wrapper, namespace
+    gc.collect()
+    assert ref() is None

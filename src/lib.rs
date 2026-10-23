@@ -18,7 +18,9 @@ mod program;
 ///   specialization cannot handle, without raising.
 ///
 /// `NativeWrapper` is the object `@snekit` returns. It runs the fast path's
-/// Rust code directly, without calling `try_call` through Python.
+/// Rust code directly, without calling `try_call` through Python. Once its
+/// function is compiled, a `HotSlot` holds the specialization in Rust, so
+/// a warmed call reads no Python attribute at all.
 ///
 /// A function with a `for` loop over `range` is compiled to a program that
 /// no longer mentions `range`. `RangeGuard` proves that the function's
@@ -28,8 +30,8 @@ mod program;
 #[pymodule]
 mod _native {
     use std::ffi::c_int;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
 
     use pyo3::create_exception;
     use pyo3::exceptions::{
@@ -318,6 +320,112 @@ mod _native {
         }
     }
 
+    /// One wrapper's compiled specialization, held in Rust so that a warmed
+    /// call reads no Python attribute (see `speedysnek._decorator`).
+    ///
+    /// `snekit` gives one empty slot to both the `NativeWrapper` and its
+    /// `_JitState`. The state publishes its specialization into it once,
+    /// after the specialization is complete and the status is `COMPILED`,
+    /// and retires it whenever `state.specialization` is assigned again:
+    /// on every transition to `DISABLED`, and when a test replaces the
+    /// specialization. Both happen with the GIL held.
+    ///
+    /// - Write-once: `publish` succeeds at most once, and what it stored is
+    ///   never changed or dropped before the slot itself.
+    /// - One-way: once retired, the slot is never used again.
+    /// - Only a genuine `I64Function` or `GuardedI64Function` is published.
+    ///   Anything else (only test doubles use another `function`) leaves
+    ///   the slot empty, and the wrapper keeps reading the state.
+    ///
+    /// Reading it costs two atomic loads and takes no lock. It holds strong
+    /// references to everything a native call uses, and the wrapper holds
+    /// the slot, so nothing is freed while a call runs.
+    ///
+    /// It is not tracked by the garbage collector: a code object, an
+    /// `I64Function` and a `RangeGuard` are not either, so no reference
+    /// cycle the collector could break runs through the slot.
+    #[pyclass(frozen, module = "speedysnek._native")]
+    struct HotSlot {
+        hot: OnceLock<Hot>,
+        retired: AtomicBool,
+    }
+
+    /// What a published `HotSlot` holds.
+    struct Hot {
+        /// The code object that was compiled. A call may only use the slot
+        /// while it is still the function's `__code__`.
+        code: Py<PyAny>,
+        function: Py<I64Function>,
+        /// The `RangeGuard` the machine code depends on, if any.
+        guard: Option<Py<RangeGuard>>,
+    }
+
+    #[pymethods]
+    impl HotSlot {
+        #[new]
+        fn new() -> Self {
+            HotSlot {
+                hot: OnceLock::new(),
+                retired: AtomicBool::new(false),
+            }
+        }
+
+        /// Publish `function`, compiled from `code`: the specialization's
+        /// `function`, an `I64Function` or a `GuardedI64Function`. Any other
+        /// value leaves the slot empty. Raises `RuntimeError` if the slot
+        /// was already published.
+        #[pyo3(signature = (code, function, /))]
+        fn publish(&self, code: &Bound<'_, PyAny>, function: &Bound<'_, PyAny>) -> PyResult<()> {
+            // SAFETY: `code` is a live object and the GIL is held (`Bound`).
+            if unsafe { ffi::PyCode_Check(code.as_ptr()) } == 0 {
+                return Err(PyTypeError::new_err("code must be a code object"));
+            }
+            let (function, guard) = if let Ok(function) = function.cast_exact::<I64Function>() {
+                (function.clone().unbind(), None)
+            } else if let Ok(guarded) = function.cast_exact::<GuardedI64Function>() {
+                let guarded = guarded.get();
+                let py = function.py();
+                (
+                    guarded.function.clone_ref(py),
+                    Some(guarded.guard.clone_ref(py)),
+                )
+            } else {
+                return Ok(());
+            };
+            let hot = Hot {
+                code: code.clone().unbind(),
+                function,
+                guard,
+            };
+            self.hot
+                .set(hot)
+                .map_err(|_| PyRuntimeError::new_err("the hot slot is already published"))
+        }
+
+        /// Stop every later call from using the slot. Idempotent.
+        fn retire(&self) {
+            self.retired.store(true, Ordering::Release);
+        }
+
+        /// Whether calls can use the slot: published and not retired. A
+        /// diagnostic for tests.
+        #[getter]
+        fn live(&self) -> bool {
+            self.get().is_some()
+        }
+    }
+
+    impl HotSlot {
+        /// The published specialization, unless the slot is retired.
+        #[inline]
+        fn get(&self) -> Option<&Hot> {
+            if self.retired.load(Ordering::Acquire) {
+                return None;
+            }
+            self.hot.get()
+        }
+    }
+
     /// `types.MethodType`, used to bind a `NativeWrapper` like a function.
     static METHOD_TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 
@@ -328,10 +436,15 @@ mod _native {
     ///
     /// It runs the decorator's per-call logic without a Python frame.
     /// Compilation and every state transition stay in the Python
-    /// `_JitState`; this object only reads `state.specialization` and
-    /// `state.status` and calls the state's `cold_call`, `invalidate`,
-    /// `binding_changed` and `native_failed` methods. It binds as a method
-    /// like a function.
+    /// `_JitState`; this object only reads `state._specialization` (the
+    /// slot behind its `specialization` property) and `state.status` and
+    /// calls the state's `cold_call`, `invalidate`, `binding_changed` and
+    /// `native_failed` methods. It binds as a method like a function.
+    ///
+    /// While its `HotSlot` is live, a call that can use the slot reads none
+    /// of the state's attributes: the slot holds the same specialization,
+    /// and every call that would make the state change goes to the generic
+    /// path, which makes the change exactly as before.
     ///
     /// Metadata copied by `functools.update_wrapper` lives in the instance
     /// `__dict__`, except `__annotate__` and `__annotations__`, which behave
@@ -352,6 +465,12 @@ mod _native {
         state: Py<PyAny>,
         /// `_Status.COLD`.
         cold: Py<PyAny>,
+        /// The slot the state publishes into; `None` for a wrapper made
+        /// without one, which always takes the generic path.
+        hot: Option<Py<HotSlot>>,
+        /// Whether `func` is a Python function (`FunctionType`, which
+        /// cannot be subclassed). Only then can a call use the slot.
+        plain_function: bool,
         calls: AtomicI64,
         count_base: Mutex<Option<Py<PyAny>>>,
         annotations: Mutex<Annotations>,
@@ -367,11 +486,22 @@ mod _native {
     #[pymethods]
     impl NativeWrapper {
         #[new]
-        fn new(func: Py<PyAny>, state: Py<PyAny>, cold: Py<PyAny>) -> Self {
+        #[pyo3(signature = (func, state, cold, hot = None, /))]
+        fn new(
+            func: Py<PyAny>,
+            state: Py<PyAny>,
+            cold: Py<PyAny>,
+            hot: Option<Py<HotSlot>>,
+        ) -> Self {
+            // SAFETY: `func` is a live object; constructing a pyclass holds
+            // the GIL. `PyFunction_Check` only compares the type pointer.
+            let plain_function = unsafe { ffi::PyFunction_Check(func.as_ptr()) } != 0;
             NativeWrapper {
                 func,
                 state,
                 cold,
+                hot,
+                plain_function,
                 calls: AtomicI64::new(0),
                 count_base: Mutex::new(None),
                 annotations: Mutex::default(),
@@ -420,8 +550,10 @@ mod _native {
             Ok(())
         }
 
-        /// The same logic, line for line, as the Python closure `@snekit`
-        /// returned before (kept in `benchmarks/experiments/native_wrapper.py`).
+        /// The hot slot first, when the call may use it. Otherwise the
+        /// generic path: the same logic, line for line, as the Python
+        /// closure `@snekit` returned before (kept in
+        /// `benchmarks/experiments/native_wrapper.py`).
         #[pyo3(signature = (*args, **kwargs))]
         fn __call__<'py>(
             &self,
@@ -434,8 +566,27 @@ mod _native {
                 self.carry(py)?;
             }
             let func = self.func.bind(py);
+            if let Some(hot) = self.hot_specialization(py) {
+                // The slot holds exactly `state.specialization`, so each
+                // outcome below is the generic path's for the same call.
+                if kwargs.is_some_and(|kwargs| !kwargs.is_empty()) {
+                    return func.call(args, kwargs);
+                }
+                let function = hot.function.get();
+                // As in the generic path, a call with another arity (an
+                // omitted default) makes no native call at all.
+                if args.len() != function.code.arg_count() {
+                    return func.call(args, kwargs);
+                }
+                match function.try_call_tuple(args) {
+                    Ok(Some(value)) => return Ok(value.into_pyobject(py)?.into_any()),
+                    Ok(None) => {}
+                    Err(error) => self.native_failed(py, error)?,
+                }
+                return func.call(args, kwargs);
+            }
             let state = self.state.bind(py);
-            let mut spec = state.getattr(intern!(py, "specialization"))?;
+            let mut spec = state.getattr(intern!(py, "_specialization"))?;
             if spec.is_none() {
                 if !state.getattr(intern!(py, "status"))?.is(&self.cold) {
                     return func.call(args, kwargs);
@@ -457,13 +608,7 @@ mod _native {
                     Ok(Native::BindingChanged) => {
                         state.call_method0(intern!(py, "binding_changed"))?;
                     }
-                    // Unexpected: disable, then fall back.
-                    Err(error) if error.is_instance_of::<PyException>(py) => {
-                        state
-                            .call_method1(intern!(py, "native_failed"), (error.into_value(py),))?;
-                    }
-                    // A BaseException such as KeyboardInterrupt propagates.
-                    Err(error) => return Err(error),
+                    Err(error) => self.native_failed(py, error)?,
                 }
             }
             // No exception is being handled here, so an exception raised by
@@ -592,6 +737,7 @@ mod _native {
             visit.call(&self.func)?;
             visit.call(&self.state)?;
             visit.call(&self.cold)?;
+            visit.call(&self.hot)?;
             // Never contended: these locks are only taken with the GIL held,
             // and never across a call into Python.
             if let Ok(count_base) = self.count_base.try_lock() {
@@ -606,6 +752,48 @@ mod _native {
     }
 
     impl NativeWrapper {
+        /// The specialization in the hot slot, if this call may use it: the
+        /// slot is live, and the function's current `__code__` and `range`
+        /// binding are still the ones compiled for. Reads no Python
+        /// attribute. `None` sends the call to the generic path, which
+        /// makes the state transition a stale `__code__` or a failed range
+        /// guard calls for.
+        #[inline]
+        fn hot_specialization(&self, _py: Python<'_>) -> Option<&Hot> {
+            if !self.plain_function {
+                return None;
+            }
+            let hot = self.hot.as_ref()?.get().get()?;
+            // SAFETY: `func` is a `FunctionType` (checked when the wrapper
+            // was made; it is never replaced), it is alive because `self`
+            // owns it, and `_py` proves the GIL is held. `PyFunction_GetCode`
+            // returns a borrowed reference, which is only compared, never
+            // dereferenced. It cannot fail for a function.
+            let code = unsafe { ffi::PyFunction_GetCode(self.func.as_ptr()) };
+            if code != hot.code.as_ptr() {
+                return None;
+            }
+            if let Some(guard) = &hot.guard
+                && !guard.get().guard.valid()
+            {
+                return None;
+            }
+            Some(hot)
+        }
+
+        /// Report an error from the native attempt to the state, which
+        /// disables the specialization; the call then falls back. A
+        /// `BaseException` such as `KeyboardInterrupt` propagates instead.
+        fn native_failed(&self, py: Python<'_>, error: PyErr) -> PyResult<()> {
+            if !error.is_instance_of::<PyException>(py) {
+                return Err(error);
+            }
+            self.state
+                .bind(py)
+                .call_method1(intern!(py, "native_failed"), (error.into_value(py),))?;
+            Ok(())
+        }
+
         /// Record the 2**64 that an increment from `i64::MAX` just lost.
         ///
         /// Only exact-`int` arithmetic happens between the wrap and the new
