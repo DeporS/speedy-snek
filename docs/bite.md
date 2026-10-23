@@ -189,3 +189,6 @@ Once the bitten functions have been called for a while,
 [`snek.peek(my_module)`](peek.md) shows what the JIT did with each one:
 still warming up, compiled, or disabled and why. It reads state only;
 it calls and changes nothing.
+
+To undo a bite, [`snek.chill(my_module)`](chill.md) points the module's
+names back at the original functions.

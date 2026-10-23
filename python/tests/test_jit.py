@@ -21,6 +21,9 @@ def test_public_api():
         "peek",
         "PeekReport",
         "PeekFinding",
+        "chill",
+        "ChillReport",
+        "ChillFinding",
         "nosnek",
     ]
     assert speedysnek.snekit is snekit

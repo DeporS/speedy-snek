@@ -1722,6 +1722,9 @@ def test_backend_is_private():
         "peek",
         "PeekReport",
         "PeekFinding",
+        "chill",
+        "ChillReport",
+        "ChillFinding",
         "nosnek",
     ]
     for name in ("compile_i64", "CompiledI64", "NativeGuardFailure", "I64Function"):

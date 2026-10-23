@@ -9,9 +9,11 @@ functions the compiler currently understands, as a :class:`HuntReport` of
 to the ready functions of one module and reports what it did, as a
 :class:`BiteReport` of :class:`BiteFinding` objects; :func:`peek`, which
 reports what the JIT has done with wrapped functions so far, as a
-:class:`PeekReport` of :class:`PeekFinding` objects; and :func:`nosnek`,
-which marks a function that ``hunt`` and ``bite`` must leave as plain
-Python. Everything else, including the native (Rust)
+:class:`PeekReport` of :class:`PeekFinding` objects; :func:`chill`,
+which restores the plain functions behind the wrappers ``bite`` installed
+in one module, as a :class:`ChillReport` of :class:`ChillFinding`
+objects; and :func:`nosnek`, which marks a function that ``hunt`` and
+``bite`` must leave as plain Python. Everything else, including the native (Rust)
 ``speedysnek._native`` module, is private.
 The compilation modules are imported lazily, the first time a decorated
 function becomes hot, and the bytecode frontend the first time it is
@@ -19,6 +21,7 @@ needed.
 """
 
 from ._bite import BiteFinding, BiteReport, bite
+from ._chill import ChillFinding, ChillReport, chill
 from ._decorator import jit, snekit
 from ._hunt import HuntFinding, HuntReport, hunt
 from ._nosnek import nosnek
@@ -36,5 +39,8 @@ __all__ = [
     "peek",
     "PeekReport",
     "PeekFinding",
+    "chill",
+    "ChillReport",
+    "ChillFinding",
     "nosnek",
 ]

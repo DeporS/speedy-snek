@@ -154,6 +154,32 @@ benchmark or a promise of speed. A native attempt is not a native result:
 a call can still fall back to Python. See [the peek guide](docs/peek.md)
 for every field and its limits.
 
+## Chill out
+
+Changed your mind? `chill()` undoes a bite:
+
+```python
+snek.bite(calculations)
+...
+snek.chill(calculations)
+```
+
+```text
+🐍 Snek cooled down.
+
+sum_squares    chilled    restored plain Python function
+format_report  unchanged  not wrapped with @snekit
+
+1 function chilled, 1 unchanged.
+```
+
+Every public name in that module that holds a wrapper `bite()` installed
+points at the original Python function again, aliases included. Only that
+module's names change: a wrapper you already hold a reference to elsewhere
+keeps working, with its counts and compiled code. `chill()` is not a way to
+cancel code that is already running. See [the chill guide](docs/chill.md)
+for aliases, repeat calls and `@nosnek`.
+
 ## How it works
 
 1. **Warm up.** The first eight calls run the original function.
@@ -258,6 +284,7 @@ For implementation details and development:
 - [Hunting](docs/hunt.md) — the `snek.hunt()` discovery report.
 - [Biting](docs/bite.md) — applying `@snekit` to a module with `snek.bite()`.
 - [Peeking](docs/peek.md) — what the JIT did with each function, with `snek.peek()`.
+- [Chilling](docs/chill.md) — undoing a bite with `snek.chill()`.
 - [Rust implementation](src) — native wrapper, guards and code generation.
 - [Loop design](docs/loops.md) — execution limits and fallback behavior.
 - [Range support](docs/for-range.md) — lowering and builtin binding checks.
