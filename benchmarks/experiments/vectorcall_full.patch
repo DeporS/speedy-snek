@@ -1,0 +1,469 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 4a4b5d5..a34e456 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -112,6 +112,8 @@ mod _native {
+             "UnguardableBinding",
+             m.py().get_type::<UnguardableBinding>(),
+         )?;
++        enable_vectorcall(m.py())?;
++        m.add("VECTORCALL", 2)?;
+         Ok(())
+     }
+ 
+@@ -236,13 +238,23 @@ mod _native {
+         /// The body of `try_call`, shared with `NativeWrapper`, which calls
+         /// it directly instead of through the Python method.
+         fn try_call_tuple(&self, args: &Bound<'_, PyTuple>) -> PyResult<Option<i64>> {
++            self.try_call_items(args.len(), args.iter_borrowed())
++        }
++
++        /// PROTOTYPE: `try_call_tuple` over any sequence of borrowed items.
++        #[inline(always)]
++        fn try_call_items<'a, 'py>(
++            &self,
++            len: usize,
++            items: impl Iterator<Item = Borrowed<'a, 'py, PyAny>>,
++        ) -> PyResult<Option<i64>> {
+             // Not locked read-modify-writes: callers hold the GIL, which
+             // serializes them, and these counters are only for diagnostics.
+             // Misses are counted where they return, so that a native
+             // result pays for nothing but `try_calls`.
+             bump(&self.try_calls);
+             let arg_count = self.code.arg_count();
+-            if args.len() != arg_count {
++            if len != arg_count {
+                 return self.miss();
+             }
+             // Typical functions have a few arguments; avoid a heap
+@@ -255,7 +267,7 @@ mod _native {
+                 heap.resize(arg_count, 0);
+                 &mut heap[..]
+             };
+-            for (slot, item) in values.iter_mut().zip(args.iter_borrowed()) {
++            for (slot, item) in values.iter_mut().zip(items) {
+                 match exact_i64_or_none(&item) {
+                     Ok(Some(value)) => *slot = value,
+                     Ok(None) => return self.miss(),
+@@ -636,6 +648,8 @@ mod _native {
+     /// wrapped `calls` without its carry.
+     #[pyclass(frozen, dict, weakref, module = "speedysnek._native")]
+     struct NativeWrapper {
++        /// PROTOTYPE: read by CPython through `tp_vectorcall_offset`.
++        vectorcall: Option<ffi::vectorcallfunc>,
+         func: Py<PyAny>,
+         state: Py<PyAny>,
+         /// `_Status.COLD`.
+@@ -672,6 +686,7 @@ mod _native {
+             // the GIL. `PyFunction_Check` only compares the type pointer.
+             let plain_function = unsafe { ffi::PyFunction_Check(func.as_ptr()) } != 0;
+             NativeWrapper {
++                vectorcall: Some(native_wrapper_vectorcall),
+                 func,
+                 state,
+                 cold,
+@@ -736,65 +751,7 @@ mod _native {
+             args: &Bound<'py, PyTuple>,
+             kwargs: Option<&Bound<'py, PyDict>>,
+         ) -> PyResult<Bound<'py, PyAny>> {
+-            // Counted first, so calls that raise are counted too.
+-            if self.calls.fetch_add(1, Ordering::Relaxed) == i64::MAX {
+-                self.carry(py)?;
+-            }
+-            let func = self.func.bind(py);
+-            if let Some(slot) = self.slot() {
+-                match slot.mode.load(Ordering::Acquire) {
+-                    ACTIVE => {
+-                        if let Some(hot) = slot.hot.get()
+-                            && self.is_current(py, hot)
+-                        {
+-                            return self.hot_call(py, slot, hot, args, kwargs);
+-                        }
+-                    }
+-                    PARKED => {
+-                        if let Some(result) = self.parked_call(py, slot, args, kwargs)? {
+-                            return Ok(result);
+-                        }
+-                    }
+-                    _ => {}
+-                }
+-            }
+-            let state = self.state.bind(py);
+-            let mut spec = state.getattr(intern!(py, "_specialization"))?;
+-            if spec.is_none() {
+-                if !state.getattr(intern!(py, "status"))?.is(&self.cold) {
+-                    return func.call(args, kwargs);
+-                }
+-                // Warmup profile: could this call have run natively? Its
+-                // positional count when it could (the state checks it
+-                // against the function's arity), -1 when it could not.
+-                let fits = if kwargs.is_none_or(|kwargs| kwargs.is_empty()) && exact_i64s(args) {
+-                    args.len() as isize
+-                } else {
+-                    -1
+-                };
+-                spec = state.call_method1(intern!(py, "cold_call"), (fits,))?;
+-                if spec.is_none() {
+-                    return func.call(args, kwargs);
+-                }
+-            }
+-            let code = spec.getattr(intern!(py, "code"))?;
+-            if !func.getattr(intern!(py, "__code__"))?.is(&code) {
+-                // Never run machine code compiled from a stale code object.
+-                state.call_method0(intern!(py, "invalidate"))?;
+-            } else if kwargs.is_none_or(|kwargs| kwargs.is_empty()) {
+-                match native_call(&spec, args) {
+-                    Ok(Native::Result(result)) => return Ok(result),
+-                    Ok(Native::Miss) => {}
+-                    // `range` may no longer be the builtin: never again.
+-                    Ok(Native::BindingChanged) => {
+-                        state.call_method0(intern!(py, "binding_changed"))?;
+-                    }
+-                    Err(error) => self.native_failed(py, error)?,
+-                }
+-            }
+-            // No exception is being handled here, so an exception raised by
+-            // `func` gets no `__context__` from the native attempt.
+-            func.call(args, kwargs)
++            self.dispatch(py, &TupleArgs { args, kwargs })
+         }
+ 
+         /// Bind like a function: `MethodType(self, instance)`, or `self`
+@@ -933,6 +890,74 @@ mod _native {
+     }
+ 
+     impl NativeWrapper {
++        /// PROTOTYPE: the body `__call__` had, over either call protocol.
++        #[inline(always)]
++        fn dispatch<'py>(
++            &self,
++            py: Python<'py>,
++            args: &impl CallArgs<'py>,
++        ) -> PyResult<Bound<'py, PyAny>> {
++            // Counted first, so calls that raise are counted too.
++            if self.calls.fetch_add(1, Ordering::Relaxed) == i64::MAX {
++                self.carry(py)?;
++            }
++            let func = self.func.bind(py);
++            if let Some(slot) = self.slot() {
++                match slot.mode.load(Ordering::Acquire) {
++                    ACTIVE => {
++                        if let Some(hot) = slot.hot.get()
++                            && self.is_current(py, hot)
++                        {
++                            return self.hot_call(py, slot, hot, args);
++                        }
++                    }
++                    PARKED => {
++                        if let Some(result) = self.parked_call(py, slot, args)? {
++                            return Ok(result);
++                        }
++                    }
++                    _ => {}
++                }
++            }
++            let state = self.state.bind(py);
++            let mut spec = state.getattr(intern!(py, "_specialization"))?;
++            if spec.is_none() {
++                if !state.getattr(intern!(py, "status"))?.is(&self.cold) {
++                    return args.call(func);
++                }
++                // Warmup profile: could this call have run natively? Its
++                // positional count when it could (the state checks it
++                // against the function's arity), -1 when it could not.
++                let fits = if !args.keywords() && args.exact_i64s() {
++                    args.positional() as isize
++                } else {
++                    -1
++                };
++                spec = state.call_method1(intern!(py, "cold_call"), (fits,))?;
++                if spec.is_none() {
++                    return args.call(func);
++                }
++            }
++            let code = spec.getattr(intern!(py, "code"))?;
++            if !func.getattr(intern!(py, "__code__"))?.is(&code) {
++                // Never run machine code compiled from a stale code object.
++                state.call_method0(intern!(py, "invalidate"))?;
++            } else if !args.keywords() {
++                match native_call(&spec, args) {
++                    Ok(Native::Result(result)) => return Ok(result),
++                    Ok(Native::Miss) => {}
++                    // `range` may no longer be the builtin: never again.
++                    Ok(Native::BindingChanged) => {
++                        state.call_method0(intern!(py, "binding_changed"))?;
++                    }
++                    Err(error) => self.native_failed(py, error)?,
++                }
++            }
++            // No exception is being handled here, so an exception raised by
++            // `func` gets no `__context__` from the native attempt.
++            args.call(func)
++        }
++
+         /// The hot slot, if this wrapper may use one: it has a slot and
+         /// wraps a Python function.
+         #[inline(always)]
+@@ -973,20 +998,17 @@ mod _native {
+             py: Python<'py>,
+             slot: &HotSlot,
+             hot: &Hot,
+-            args: &Bound<'py, PyTuple>,
+-            kwargs: Option<&Bound<'py, PyDict>>,
++            args: &impl CallArgs<'py>,
+         ) -> PyResult<Bound<'py, PyAny>> {
+             let func = self.func.bind(py);
+             let function = hot.function.get();
+             // As in the generic path, a call with keywords or another
+             // arity (an omitted default) makes no native call at all.
+-            if kwargs.is_some_and(|kwargs| !kwargs.is_empty())
+-                || args.len() != function.code.arg_count()
+-            {
++            if args.keywords() || args.positional() != function.code.arg_count() {
+                 self.missed(py, slot)?;
+-                return func.call(args, kwargs);
++                return args.call(func);
+             }
+-            match function.try_call_tuple(args) {
++            match args.try_native(function) {
+                 Ok(Some(value)) => {
+                     slot.hit();
+                     return Ok(value.into_pyobject(py)?.into_any());
+@@ -994,7 +1016,7 @@ mod _native {
+                 Ok(None) => self.missed(py, slot)?,
+                 Err(error) => self.native_failed(py, error)?,
+             }
+-            func.call(args, kwargs)
++            args.call(func)
+         }
+ 
+         /// Count a call that could not run natively; on the `MISS_LIMIT`th
+@@ -1034,8 +1056,7 @@ mod _native {
+             &self,
+             py: Python<'py>,
+             slot: &HotSlot,
+-            args: &Bound<'py, PyTuple>,
+-            kwargs: Option<&Bound<'py, PyDict>>,
++            args: &impl CallArgs<'py>,
+         ) -> PyResult<Option<Bound<'py, PyAny>>> {
+             let func = self.func.bind(py);
+             let hot = slot.hot.get();
+@@ -1045,24 +1066,24 @@ mod _native {
+                 return Ok(None);
+             }
+             if !slot.reprobe_due()
+-                || kwargs.is_some_and(|kwargs| !kwargs.is_empty())
+-                || hot.is_some_and(|hot| args.len() != hot.function.get().code.arg_count())
+-                || !exact_i64s(args)
++                || args.keywords()
++                || hot.is_some_and(|hot| args.positional() != hot.function.get().code.arg_count())
++                || !args.exact_i64s()
+             {
+-                return func.call(args, kwargs).map(Some);
++                return args.call(func).map(Some);
+             }
+             slot.reprobing();
+             let state = self.state.bind(py);
+             let Some(hot) = hot else {
+                 // Parked during warmup: nothing is compiled yet. The state
+                 // checks the arity and compiles at most once.
+-                let spec = state.call_method1(intern!(py, "reprobe"), (args.len(),))?;
++                let spec = state.call_method1(intern!(py, "reprobe"), (args.positional(),))?;
+                 if spec.is_none() {
+-                    return func.call(args, kwargs).map(Some);
++                    return args.call(func).map(Some);
+                 }
+                 return Ok(None);
+             };
+-            match hot.function.get().try_call_tuple(args) {
++            match args.try_native(hot.function.get()) {
+                 Ok(Some(value)) => {
+                     state.call_method0(intern!(py, "reprobe_succeeded"))?;
+                     return Ok(Some(value.into_pyobject(py)?.into_any()));
+@@ -1070,7 +1091,7 @@ mod _native {
+                 Ok(None) => {}
+                 Err(error) => self.native_failed(py, error)?,
+             }
+-            func.call(args, kwargs).map(Some)
++            args.call(func).map(Some)
+         }
+ 
+         /// Report an error from the native attempt to the state, which
+@@ -1134,6 +1155,142 @@ mod _native {
+         }
+     }
+ 
++    /// PROTOTYPE: one call's arguments, from `tp_call` or vectorcall.
++    trait CallArgs<'py> {
++        fn positional(&self) -> usize;
++        fn keywords(&self) -> bool;
++        fn exact_i64s(&self) -> bool;
++        fn try_native(&self, function: &I64Function) -> PyResult<Option<i64>>;
++        fn call(&self, func: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>>;
++        fn tuple(&self) -> PyResult<Bound<'py, PyTuple>>;
++    }
++
++    struct TupleArgs<'a, 'py> {
++        args: &'a Bound<'py, PyTuple>,
++        kwargs: Option<&'a Bound<'py, PyDict>>,
++    }
++
++    impl<'py> CallArgs<'py> for TupleArgs<'_, 'py> {
++        #[inline(always)]
++        fn positional(&self) -> usize {
++            self.args.len()
++        }
++        #[inline(always)]
++        fn keywords(&self) -> bool {
++            self.kwargs.is_some_and(|kwargs| !kwargs.is_empty())
++        }
++        fn exact_i64s(&self) -> bool {
++            exact_i64s(self.args)
++        }
++        #[inline(always)]
++        fn try_native(&self, function: &I64Function) -> PyResult<Option<i64>> {
++            function.try_call_tuple(self.args)
++        }
++        fn call(&self, func: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
++            func.call(self.args, self.kwargs)
++        }
++        fn tuple(&self) -> PyResult<Bound<'py, PyTuple>> {
++            Ok(self.args.clone())
++        }
++    }
++
++    /// A vectorcall's arguments: `nargs` positional ones, then one per
++    /// name in `kwnames`.
++    struct VectorArgs<'py> {
++        py: Python<'py>,
++        args: *const *mut ffi::PyObject,
++        nargsf: usize,
++        nargs: usize,
++        kwnames: *mut ffi::PyObject,
++    }
++
++    impl<'py> VectorArgs<'py> {
++        #[inline(always)]
++        fn items(&self) -> impl ExactSizeIterator<Item = Borrowed<'_, 'py, PyAny>> {
++            // SAFETY: CPython passes `nargs` live borrowed references.
++            (0..self.nargs).map(|i| unsafe { Borrowed::from_ptr(self.py, *self.args.add(i)) })
++        }
++    }
++
++    impl<'py> CallArgs<'py> for VectorArgs<'py> {
++        #[inline(always)]
++        fn positional(&self) -> usize {
++            self.nargs
++        }
++        #[inline(always)]
++        fn keywords(&self) -> bool {
++            !self.kwnames.is_null() && unsafe { ffi::PyTuple_GET_SIZE(self.kwnames) } != 0
++        }
++        fn exact_i64s(&self) -> bool {
++            self.items()
++                .all(|item| matches!(exact_i64_or_none(&item), Ok(Some(_))))
++        }
++        #[inline(always)]
++        fn try_native(&self, function: &I64Function) -> PyResult<Option<i64>> {
++            function.try_call_items(self.nargs, self.items())
++        }
++        fn call(&self, func: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
++            // SAFETY: forwards the caller's arguments unchanged.
++            unsafe {
++                Bound::from_owned_ptr_or_err(
++                    self.py,
++                    ffi::PyObject_Vectorcall(func.as_ptr(), self.args, self.nargsf, self.kwnames),
++                )
++            }
++        }
++        fn tuple(&self) -> PyResult<Bound<'py, PyTuple>> {
++            PyTuple::new(self.py, self.items())
++        }
++    }
++
++    /// PROTOTYPE ONLY: turn on vectorcall for `NativeWrapper` by writing
++    /// `tp_vectorcall_offset` and `Py_TPFLAGS_HAVE_VECTORCALL` into the
++    /// type PyO3 created. PyO3 0.29 has no supported way to do this.
++    fn enable_vectorcall(py: Python<'_>) -> PyResult<()> {
++        let probe = Bound::new(py, NativeWrapper::new(py.None(), py.None(), py.None(), None))?;
++        let offset = (&probe.get().vectorcall as *const _ as isize) - (probe.as_ptr() as isize);
++        let ty = py.get_type::<NativeWrapper>();
++        // SAFETY: prototype; see above.
++        unsafe {
++            let tp = ty.as_type_ptr();
++            (*tp).tp_vectorcall_offset = offset;
++            (*tp).tp_flags |= ffi::Py_TPFLAGS_HAVE_VECTORCALL;
++            ffi::PyType_Modified(tp);
++        }
++        Ok(())
++    }
++
++    /// PROTOTYPE: the vectorcall entry point; every call takes it.
++    unsafe extern "C" fn native_wrapper_vectorcall(
++        callable: *mut ffi::PyObject,
++        args: *const *mut ffi::PyObject,
++        nargsf: usize,
++        kwnames: *mut ffi::PyObject,
++    ) -> *mut ffi::PyObject {
++        let nargs = unsafe { ffi::PyVectorcall_NARGS(nargsf) } as usize;
++        // PROTOTYPE v3: `Python::attach` counts the call as attached, as
++        // PyO3's own trampolines do, so a `Py<T>` dropped meanwhile is
++        // released at once instead of queued in the reference pool.
++        Python::attach(|py| {
++        let wrapper = unsafe { Borrowed::from_ptr(py, callable).cast_unchecked::<NativeWrapper>() };
++        let vector = VectorArgs { py, args, nargsf, nargs, kwnames };
++        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++            wrapper.get().dispatch(py, &vector)
++        }));
++        match outcome {
++            Ok(Ok(result)) => result.into_ptr(),
++            Ok(Err(error)) => {
++                error.restore(py);
++                std::ptr::null_mut()
++            }
++            Err(_) => {
++                pyo3::panic::PanicException::new_err("panic in vectorcall").restore(py);
++                std::ptr::null_mut()
++            }
++        }
++        })
++    }
++
+     /// What a native attempt did.
+     enum Native<'py> {
+         /// The native code ran and returned this.
+@@ -1157,7 +1314,7 @@ mod _native {
+     /// contract.
+     fn native_call<'py>(
+         spec: &Bound<'py, PyAny>,
+-        args: &Bound<'py, PyTuple>,
++        args: &impl CallArgs<'py>,
+     ) -> PyResult<Native<'py>> {
+         let py = spec.py();
+         let function = spec.getattr(intern!(py, "function"))?;
+@@ -1171,10 +1328,10 @@ mod _native {
+             // Borrowed from `guarded`, which `function` keeps alive.
+             guarded.function.get()
+         } else {
+-            if args.len() != spec.getattr(intern!(py, "arg_count"))?.extract::<usize>()? {
++            if args.positional() != spec.getattr(intern!(py, "arg_count"))?.extract::<usize>()? {
+                 return Ok(Native::Miss);
+             }
+-            let result = spec.getattr(intern!(py, "fast_call"))?.call1((args,))?;
++            let result = spec.getattr(intern!(py, "fast_call"))?.call1((args.tuple()?,))?;
+             return Ok(if result.is_none() {
+                 Native::Miss
+             } else {
+@@ -1183,10 +1340,10 @@ mod _native {
+         };
+         // As in the Python wrapper, a call with another arity (an omitted
+         // default) makes no native call at all.
+-        if args.len() != function.code.arg_count() {
++        if args.positional() != function.code.arg_count() {
+             return Ok(Native::Miss);
+         }
+-        match function.try_call_tuple(args)? {
++        match args.try_native(function)? {
+             Some(value) => Ok(Native::Result(value.into_pyobject(py)?.into_any())),
+             None => Ok(Native::Miss),
+         }

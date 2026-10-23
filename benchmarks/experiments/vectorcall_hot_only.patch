@@ -1,0 +1,246 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 4a4b5d5..a122aca 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -112,6 +112,8 @@ mod _native {
+             "UnguardableBinding",
+             m.py().get_type::<UnguardableBinding>(),
+         )?;
++        enable_vectorcall(m.py())?;
++        m.add("VECTORCALL", true)?;
+         Ok(())
+     }
+ 
+@@ -236,13 +238,23 @@ mod _native {
+         /// The body of `try_call`, shared with `NativeWrapper`, which calls
+         /// it directly instead of through the Python method.
+         fn try_call_tuple(&self, args: &Bound<'_, PyTuple>) -> PyResult<Option<i64>> {
++            self.try_call_items(args.len(), args.iter_borrowed())
++        }
++
++        /// PROTOTYPE: `try_call_tuple` over any sequence of borrowed items.
++        #[inline(always)]
++        fn try_call_items<'a, 'py>(
++            &self,
++            len: usize,
++            items: impl Iterator<Item = Borrowed<'a, 'py, PyAny>>,
++        ) -> PyResult<Option<i64>> {
+             // Not locked read-modify-writes: callers hold the GIL, which
+             // serializes them, and these counters are only for diagnostics.
+             // Misses are counted where they return, so that a native
+             // result pays for nothing but `try_calls`.
+             bump(&self.try_calls);
+             let arg_count = self.code.arg_count();
+-            if args.len() != arg_count {
++            if len != arg_count {
+                 return self.miss();
+             }
+             // Typical functions have a few arguments; avoid a heap
+@@ -255,7 +267,7 @@ mod _native {
+                 heap.resize(arg_count, 0);
+                 &mut heap[..]
+             };
+-            for (slot, item) in values.iter_mut().zip(args.iter_borrowed()) {
++            for (slot, item) in values.iter_mut().zip(items) {
+                 match exact_i64_or_none(&item) {
+                     Ok(Some(value)) => *slot = value,
+                     Ok(None) => return self.miss(),
+@@ -636,6 +648,9 @@ mod _native {
+     /// wrapped `calls` without its carry.
+     #[pyclass(frozen, dict, weakref, module = "speedysnek._native")]
+     struct NativeWrapper {
++        /// PROTOTYPE: the vectorcall entry point CPython reads through
++        /// `tp_vectorcall_offset`.
++        vectorcall: Option<ffi::vectorcallfunc>,
+         func: Py<PyAny>,
+         state: Py<PyAny>,
+         /// `_Status.COLD`.
+@@ -672,6 +687,7 @@ mod _native {
+             // the GIL. `PyFunction_Check` only compares the type pointer.
+             let plain_function = unsafe { ffi::PyFunction_Check(func.as_ptr()) } != 0;
+             NativeWrapper {
++                vectorcall: Some(native_wrapper_vectorcall),
+                 func,
+                 state,
+                 cold,
+@@ -933,6 +949,66 @@ mod _native {
+     }
+ 
+     impl NativeWrapper {
++        /// PROTOTYPE: a positional vectorcall that the live slot handles.
++        /// `None` (before anything is counted) sends it to `tp_call`.
++        #[inline(always)]
++        fn vector_hot<'py>(
++            &self,
++            py: Python<'py>,
++            args: &[*mut ffi::PyObject],
++        ) -> Option<PyResult<Bound<'py, PyAny>>> {
++            let slot = self.slot()?;
++            let hot = slot.get()?;
++            if !self.is_current(py, hot) {
++                return None;
++            }
++            let function = hot.function.get();
++            if args.len() != function.code.arg_count() {
++                return None;
++            }
++            if self.calls.fetch_add(1, Ordering::Relaxed) == i64::MAX
++                && let Err(error) = self.carry(py)
++            {
++                return Some(Err(error));
++            }
++            Some(self.vector_hot_call(py, slot, function, args))
++        }
++
++        #[inline(always)]
++        fn vector_hot_call<'py>(
++            &self,
++            py: Python<'py>,
++            slot: &HotSlot,
++            function: &I64Function,
++            args: &[*mut ffi::PyObject],
++        ) -> PyResult<Bound<'py, PyAny>> {
++            // SAFETY: CPython passes `args.len()` live borrowed references.
++            let items = args
++                .iter()
++                .map(|&item| unsafe { Borrowed::from_ptr(py, item) });
++            match function.try_call_items(args.len(), items) {
++                Ok(Some(value)) => {
++                    slot.hit();
++                    return Ok(value.into_pyobject(py)?.into_any());
++                }
++                Ok(None) => self.missed(py, slot)?,
++                Err(error) => self.native_failed(py, error)?,
++            }
++            // SAFETY: `func` is alive, `args` holds `args.len()` borrowed
++            // references, and no keyword names are passed.
++            unsafe {
++                Bound::from_owned_ptr_or_err(
++                    py,
++                    ffi::PyObject_Vectorcall(
++                        self.func.as_ptr(),
++                        args.as_ptr(),
++                        args.len(),
++                        std::ptr::null_mut(),
++                    ),
++                )
++            }
++        }
++
+         /// The hot slot, if this wrapper may use one: it has a slot and
+         /// wraps a Python function.
+         #[inline(always)]
+@@ -1134,6 +1210,113 @@ mod _native {
+         }
+     }
+ 
++    /// PROTOTYPE ONLY: turn on vectorcall for `NativeWrapper` by writing
++    /// `tp_vectorcall_offset` and `Py_TPFLAGS_HAVE_VECTORCALL` into the
++    /// type PyO3 created. PyO3 0.29 has no supported way to do this.
++    fn enable_vectorcall(py: Python<'_>) -> PyResult<()> {
++        let probe = Bound::new(py, NativeWrapper::new(py.None(), py.None(), py.None(), None))?;
++        let offset = (&probe.get().vectorcall as *const _ as isize) - (probe.as_ptr() as isize);
++        let ty = py.get_type::<NativeWrapper>();
++        // SAFETY: prototype; see above.
++        unsafe {
++            let tp = ty.as_type_ptr();
++            (*tp).tp_vectorcall_offset = offset;
++            (*tp).tp_flags |= ffi::Py_TPFLAGS_HAVE_VECTORCALL;
++            ffi::PyType_Modified(tp);
++        }
++        Ok(())
++    }
++
++    /// PROTOTYPE: the vectorcall entry point. A positional call that the
++    /// live slot can take runs without an argument tuple; every other call
++    /// builds `tp_call`'s tuple and dict and runs the unchanged `__call__`.
++    unsafe extern "C" fn native_wrapper_vectorcall(
++        callable: *mut ffi::PyObject,
++        args: *const *mut ffi::PyObject,
++        nargsf: usize,
++        kwnames: *mut ffi::PyObject,
++    ) -> *mut ffi::PyObject {
++        let nargs = unsafe { ffi::PyVectorcall_NARGS(nargsf) } as usize;
++        let positional = kwnames.is_null() || unsafe { ffi::PyTuple_GET_SIZE(kwnames) } == 0;
++        if positional {
++            let py = unsafe { Python::assume_attached() };
++            let wrapper = unsafe { Borrowed::from_ptr(py, callable).cast_unchecked::<NativeWrapper>() };
++            let args = if nargs == 0 {
++                &[][..]
++            } else {
++                unsafe { std::slice::from_raw_parts(args, nargs) }
++            };
++            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++                wrapper.get().vector_hot(py, args)
++            }));
++            match outcome {
++                Ok(Some(Ok(result))) => return result.into_ptr(),
++                Ok(Some(Err(error))) => {
++                    error.restore(py);
++                    return std::ptr::null_mut();
++                }
++                Ok(None) => {}
++                Err(_) => {
++                    pyo3::panic::PanicException::new_err("panic in vectorcall").restore(py);
++                    return std::ptr::null_mut();
++                }
++            }
++        }
++        unsafe { tp_call_fallback(callable, args, nargs, kwnames) }
++    }
++
++    /// `_PyObject_MakeTpCall`, by hand: `tp_call` with a tuple and dict.
++    #[cold]
++    #[inline(never)]
++    unsafe fn tp_call_fallback(
++        callable: *mut ffi::PyObject,
++        args: *const *mut ffi::PyObject,
++        nargs: usize,
++        kwnames: *mut ffi::PyObject,
++    ) -> *mut ffi::PyObject {
++        unsafe {
++            let tuple = ffi::PyTuple_New(nargs as ffi::Py_ssize_t);
++            if tuple.is_null() {
++                return std::ptr::null_mut();
++            }
++            for i in 0..nargs {
++                let item = *args.add(i);
++                ffi::Py_INCREF(item);
++                ffi::PyTuple_SET_ITEM(tuple, i as ffi::Py_ssize_t, item);
++            }
++            let mut kwargs = std::ptr::null_mut();
++            if !kwnames.is_null() && ffi::PyTuple_GET_SIZE(kwnames) > 0 {
++                kwargs = ffi::PyDict_New();
++                if kwargs.is_null() {
++                    ffi::Py_DECREF(tuple);
++                    return std::ptr::null_mut();
++                }
++                for j in 0..ffi::PyTuple_GET_SIZE(kwnames) {
++                    let name = ffi::PyTuple_GET_ITEM(kwnames, j);
++                    let value = *args.add(nargs + j as usize);
++                    if ffi::PyDict_SetItem(kwargs, name, value) < 0 {
++                        ffi::Py_DECREF(tuple);
++                        ffi::Py_DECREF(kwargs);
++                        return std::ptr::null_mut();
++                    }
++                }
++            }
++            let result = if ffi::Py_EnterRecursiveCall(c" while calling a Python object".as_ptr()) != 0 {
++                std::ptr::null_mut()
++            } else {
++                let call = (*ffi::Py_TYPE(callable)).tp_call.unwrap();
++                let result = call(callable, tuple, kwargs);
++                ffi::Py_LeaveRecursiveCall();
++                result
++            };
++            ffi::Py_DECREF(tuple);
++            if !kwargs.is_null() {
++                ffi::Py_DECREF(kwargs);
++            }
++            result
++        }
++    }
++
+     /// What a native attempt did.
+     enum Native<'py> {
+         /// The native code ran and returned this.
