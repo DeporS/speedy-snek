@@ -15,6 +15,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import time
 import types
 
 import pytest
@@ -637,6 +638,210 @@ def test_replacing_code_while_parked_during_warmup_compiles_the_new_code():
     assert path(add, 7, 2) == "native"
     assert add(7, 2) == 5
     assert state.compiled_code is add.__wrapped__.__code__
+
+
+# --- __code__ replaced during a transition --------------------------------
+#
+# The miss policy's transitions call into the state, which runs Python code
+# and takes its lock: another thread can run while a call waits for the
+# GIL there, or for the lock. These tests replace ``__code__`` at each such
+# point and make a call that starts after the replacement, either on this
+# thread (where no lock is held) or on another thread (which then waits for
+# the lock). That call must not run the old machine code, and the state
+# must end up disabled with ``CODE_CHANGED``, whatever the slot was doing.
+
+
+def _new_code(f):
+    f.__wrapped__.__code__ = (lambda a, b: a - b).__code__
+
+
+def _disabled_by_the_new_code(f):
+    state = state_of(f)
+    assert state.status is _Status.DISABLED
+    assert state.disabled_reason is _DisabledReason.CODE_CHANGED
+    assert state.parked_reason is None
+    assert not state._hot.live and not state._hot.parked
+    assert path(f, 7, 2) == "python"
+    assert f(7, 2) == 5
+
+
+class _SlotProxy:
+    """Stands in for a state's hot slot, to run ``hook`` while the state
+    flips it, with the state's lock held. The wrapper keeps the real slot."""
+
+    def __init__(self, slot, hook, before):
+        self._slot, self._hook, self._before = slot, hook, before
+
+    def __getattr__(self, name):
+        return getattr(self._slot, name)
+
+    def _flip(self, flip):
+        if self._before:
+            self._hook()
+        flipped = flip()
+        if not self._before:
+            self._hook()
+        return flipped
+
+    def park(self):
+        return self._flip(self._slot.park)
+
+    def unpark(self):
+        return self._flip(self._slot.unpark)
+
+
+def _call_from_another_thread(f, args, outcomes):
+    """Replace the code, then call ``f`` on another thread, and give it time
+    to run until it waits for the state's lock."""
+    _new_code(f)
+
+    def call():
+        before = attempts(f)
+        result = f(*args)
+        outcomes.append((result, attempts(f) - before))
+
+    thread = threading.Thread(target=call)
+    thread.start()
+    thread.join(0.05)
+    return thread
+
+
+def test_code_replaced_before_the_miss_limit_parks(monkeypatch):
+    f = make_pair()
+    warm(f, 3, 4)
+    real = _JitState.repeated_misses
+    seen = []
+
+    def interleaved(self):
+        _new_code(f)
+        # A call that starts here, before the state takes its lock.
+        seen.append(path(f, 2, 3))
+        real(self)
+
+    monkeypatch.setattr(_JitState, "repeated_misses", interleaved)
+    for _ in range(MISS_LIMIT):
+        f(1.5, 2)
+    assert seen == ["python"]
+    _disabled_by_the_new_code(f)
+
+
+@pytest.mark.parametrize("before", [True, False], ids=["before_flip", "after_flip"])
+def test_code_replaced_while_the_slot_parks(before):
+    f = make_pair()
+    state = warm(f, 3, 4)
+    outcomes, threads = [], []
+    hook = lambda: threads.append(_call_from_another_thread(f, (2, 3), outcomes))  # noqa: E731
+    state._hot = _SlotProxy(state._hot, hook, before)
+    for _ in range(MISS_LIMIT):
+        f(1.5, 2)
+    threads[0].join()
+    # The other thread's call ran the new code, without a native attempt.
+    assert outcomes == [(-1, 0)]
+    state._hot = state._hot._slot
+    _disabled_by_the_new_code(f)
+
+
+def test_code_replaced_before_a_successful_reprobe_unparks(monkeypatch):
+    f = make_pair()
+    park_compiled(f, 1.5, 2)
+    until_reprobe(f, 1.5, 2)
+    real = _JitState.reprobe_succeeded
+    seen = []
+
+    def interleaved(self):
+        _new_code(f)
+        seen.append(path(f, 2, 3))
+        # The state is disabled by now: unparking must not revive it.
+        real(self)
+
+    monkeypatch.setattr(_JitState, "reprobe_succeeded", interleaved)
+    # This call started before the replacement, so it may still return the
+    # old code's result.
+    assert f(2, 3) == 2 * 3 + 2 - 3
+    assert seen == ["python"]
+    _disabled_by_the_new_code(f)
+
+
+@pytest.mark.parametrize("before", [True, False], ids=["before_flip", "after_flip"])
+def test_code_replaced_while_a_reprobe_unparks(before):
+    f = make_pair()
+    state = park_compiled(f, 1.5, 2)
+    until_reprobe(f, 1.5, 2)
+    outcomes, threads = [], []
+    hook = lambda: threads.append(_call_from_another_thread(f, (2, 3), outcomes))  # noqa: E731
+    state._hot = _SlotProxy(state._hot, hook, before)
+    assert f(2, 3) == 2 * 3 + 2 - 3
+    threads[0].join()
+    assert outcomes == [(-1, 0)]
+    state._hot = state._hot._slot
+    _disabled_by_the_new_code(f)
+
+
+def test_code_replaced_while_a_reprobe_compiles(monkeypatch):
+    from speedysnek import _compiler
+
+    add = make_add()
+    warm(add, 1.5, 2)
+    until_reprobe(add, 1.5, 2)
+    real = _compiler.compile_i64
+    outcomes, threads = [], []
+
+    def compile_i64(*args, **kwargs):
+        threads.append(_call_from_another_thread(add, (7, 2), outcomes))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(_compiler, "compile_i64", compile_i64)
+    # The re-probe compiles the old code, notices the replacement, and runs
+    # the new code instead.
+    assert add(7, 2) == 5
+    threads[0].join()
+    assert outcomes == [(5, 0)]
+    state = state_of(add)
+    assert state.status is _Status.DISABLED
+    assert state.disabled_reason is _DisabledReason.CODE_CHANGED
+    assert state.specialization is None and not state._hot.live
+    assert state.compiled is None
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_code_replaced_while_threads_park_and_unpark(seed):
+    f = make_pair()
+    warm(f, 3, 4)
+    original = f.__wrapped__.__code__
+    stop = threading.Event()
+    late, errors = [0] * 4, []
+
+    def worker(index):
+        rng = random.Random(seed * 10 + index)
+        i = 0
+        while not stop.is_set():
+            # Runs of misses park the slot; runs of ints re-probe and
+            # unpark it.
+            phase = (i // (MISS_LIMIT + 8)) % 3
+            i += 1
+            n = rng.randint(-1000, 1000)
+            args = [(n, 3), (n + 0.5, 3), (2**62, 2**62)][phase]
+            after = f.__wrapped__.__code__ is not original
+            result = f(*args)
+            late[index] += after
+            new = args[0] - args[1]
+            if after and (result != new or type(result) is not type(new)):
+                errors.append((args, result))
+
+    workers = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+    for thread in workers:
+        thread.start()
+    time.sleep(random.Random(seed).uniform(0.005, 0.05))
+    _new_code(f)
+    deadline = time.monotonic() + 30
+    while min(late) < 200:
+        assert time.monotonic() < deadline
+        time.sleep(0.001)
+    stop.set()
+    for thread in workers:
+        thread.join()
+    assert errors == []
+    _disabled_by_the_new_code(f)
 
 
 RANGE_SOURCE = """
