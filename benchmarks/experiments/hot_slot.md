@@ -180,6 +180,34 @@ The cold row is a wrapper kept cold for good, as in the pyperf suite's
 `fallback.cold`, counted with a separate script with 20,000 and 40,000
 calls.
 
+### pyperf cross-check
+
+The existing suite, `bench_runtime.py --fast` for the `python` and
+`snekit` runtime layers and every fallback case, two runs per build
+alternating `main` and this branch on CPU 3, compared with
+`pyperf compare_to`. The standard deviations were 10–25%, so this only
+confirms the direction:
+
+| benchmark | `main` | this branch | |
+|---|---|---|---|
+| `runtime.ops_001.snekit` | 181 ns | 94.0 ns | 1.93× faster |
+| `runtime.ops_005.snekit` | 171 ns | 104 ns | 1.66× faster |
+| `runtime.ops_020.snekit` | 194 ns | 114 ns | 1.70× faster |
+| `runtime.ops_050.snekit` | 195 ns | 127 ns | 1.54× faster |
+| `runtime.ops_100.snekit` | 238 ns | 149 ns | 1.60× faster |
+| `runtime.ops_250.snekit` | 348 ns | 249 ns | 1.39× faster |
+| `fallback.float_args.snekit` | 173 ns | 97.2 ns | 1.78× faster |
+| `fallback.big_int_args.snekit` | 250 ns | 162 ns | 1.55× faster |
+| `fallback.overflow.snekit` | 251 ns | 180 ns | 1.39× faster |
+| `fallback.keyword_args.snekit` | 279 ns | 244 ns | 1.14× faster |
+| `fallback.default_args.snekit` | 148 ns | 92.1 ns | 1.61× faster |
+| `fallback.disabled.snekit` | 123 ns | 120 ns | not significant |
+| `fallback.cold.snekit` | 180 ns | 169 ns | not significant |
+
+Three plain-Python rows, whose code is identical on both builds, also
+came out "significantly" 1.13–1.26× faster. That is the noise floor of
+this run.
+
 What the rows show:
 
 - **Warmed calls.** Every compiled case saves about 800 instructions and
